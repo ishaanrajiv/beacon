@@ -1,0 +1,69 @@
+# A made-up assistant that asks before it acts, runs scheduled tasks and keeps reminders.
+source = "assistant"
+name = "Assistant"
+icon = "sparkles"
+
+[kinds."assistant.approval"]
+class = "action"
+push = "normal"
+description = "The assistant wants to do something that needs your yes."
+title = "Approval needed"
+body = "{question}"
+facts = { thread = "string" }
+slots = { question = 140 }
+open = "/assistant/threads/{thread}"
+context = true
+actions = ["dismiss"]
+
+[kinds."assistant.question"]
+class = "action"
+push = "normal"
+description = "The assistant is waiting on an answer from you."
+title = "The assistant has a question"
+body = "{question}"
+facts = { thread = "string" }
+slots = { question = 140 }
+open = "/assistant/threads/{thread}"
+context = true
+actions = ["dismiss"]
+preview = "A question for you"
+
+[kinds."assistant.reminder"]
+class = "action"
+push = "normal"
+description = "A reminder you asked for."
+title = "Reminder"
+body = "{text}"
+slots = { text = 150 }
+time_bound = true
+throttle = "none"
+actions = ["done", "snooze"]
+
+[kinds."assistant.task_result"]
+class = "update"
+push = "normal"
+description = "A task you scheduled finished."
+title = "{task} finished"
+body = "{summary}"
+facts = { task_id = "string" }
+slots = { task = 28, summary = 150 }
+open = "/assistant/tasks/{task_id}"
+time_bound = true
+preview = "A task finished"
+actions = [{ id = "open_task", label = "Open task", url = "/assistant/tasks/{task_id}" }]
+
+[kinds."assistant.unavailable"]
+class = "alert"
+push = "normal"
+description = "The assistant can't reach the tools it runs on."
+title = "The assistant is offline"
+body = "{cause}. Messages wait until it is back."
+slots = { cause = 80 }
+actions = ["acknowledge", "dismiss"]
+
+[kinds."assistant.decided"]
+class = "record"
+description = "An approval was answered."
+title = "Approval answered"
+body = "{answer} after {waited}."
+facts = { answer = "string", waited = "duration" }

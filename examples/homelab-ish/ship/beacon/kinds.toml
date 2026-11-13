@@ -1,0 +1,48 @@
+# A made-up deploy pipeline: pull requests, deploys and their failures.
+source = "ship"
+name = "Deploys"
+icon = "ship"
+
+[kinds."ship.pr_ready"]
+class = "update"
+push = "normal"
+description = "A pull request passed its checks and is ready to merge."
+title = "PR #{number} is ready"
+body = "{summary}"
+facts = { number = "int" }
+slots = { summary = 140 }
+open = "/code/pulls/{number}"
+preview = "Pull request ready"
+actions = [{ id = "review", label = "Review", url = "/code/pulls/{number}/review" }]
+
+[kinds."ship.deployed"]
+class = "update"
+push = "silent"
+description = "A new version of an app is running."
+title = "{app} is deployed"
+body = "{summary}"
+facts = { app = "string" }
+slots = { summary = 120 }
+open = "/apps/{app}"
+preview = "Deploy finished"
+
+[kinds."ship.failed"]
+class = "alert"
+push = "urgent"
+one_off = true
+description = "A deploy failed; nothing reports its recovery, so acknowledging closes it."
+title = "Deploy of {app} failed"
+body = "{cause}. The previous version is still running."
+facts = { app = "string" }
+slots = { cause = 100 }
+open = "/apps/{app}"
+actions = ["acknowledge", "dismiss"]
+preview = "Deploy failed"
+
+[kinds."ship.drift"]
+class = "update"
+push = "none"
+description = "Merged work that isn't deployed yet."
+title = "{count} changes wait to deploy"
+body = "The oldest was merged {oldest}."
+facts = { count = "int", oldest = "time" }
