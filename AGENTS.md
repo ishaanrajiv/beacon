@@ -13,8 +13,9 @@ before every commit.
 | `crates/store` | SQLite: items, alerts, silences, presence, devices, the registry, push attempts. Each method applies a core transition and records its decision in one transaction; `crates/store/README.md` maps routes and jobs to methods. |
 | `crates/server` | The HTTP/1.1 server on `std::net`, the API routes, the background jobs. |
 | `crates/apns` | Apple push: provider tokens, HTTP/2, payloads, retries. The only crate with reqwest, ring and base64. |
-| `crates/codegen` | `beacon gen`: typed emitters for Python and TypeScript. |
-| `crates/cli` | The `beacon` binary. |
+| `crates/codegen` | `beacon gen`: typed emitters for Python and TypeScript. Each generated file is a client below plus one function per kind. |
+| `crates/cli` | The `beacon` binary: check, gen, publish, send, resolve, snapshot, silence; `serve` once the server lands. |
+| `clients/python`, `clients/node` | The stdlib clients every generated file copies between its `runtime` markers, with their suites against a fake Beacon. `tests/gen/` holds files generated from `examples/`. |
 | `crates/core/builtin/` | The kinds Beacon owns: `beacon.*` and what Trail's webhook becomes, `trail.*`. |
 | `spec/` | The contracts: declarations, API, delivery, Apple push, config, clients. |
 | `examples/homelab-ish/` | Made-up services' `kinds.toml` files; the tests load them. |
@@ -51,11 +52,13 @@ before every commit.
 ## Commands
 
 ```sh
-scripts/check                 # format, lint, tests, allowed dependencies, nothing private, release build
-scripts/check --fast          # the same without the release build
+scripts/check                 # format, lint, tests, allowed dependencies, nothing private, client suites, release build
+scripts/check --fast          # Rust only: no client suites, no pyright/tsc over generated code, no release build
 cargo test -p beacon-core     # declarations, templates, rendering, the decision, the lifecycles
 cargo test -p beacon-store    # the store against SQLite, with a fake clock
+cargo test -p beacon-codegen  # generated code; runs pyright and tsc through npx when it is on PATH
+BEACON_BLESS=1 cargo test -p beacon-codegen   # rewrite clients/*/tests/gen after changing a client or the generator
 ```
 
-The `beacon` command (`spec/clients.md`) and the server are not built yet; `crates/core` and
-`crates/store` are the crates with code.
+`beacon serve` says it is not built yet until `crates/server` provides `beacon_server::run`
+(`crates/cli/src/serve.rs` is the one place to wire it).

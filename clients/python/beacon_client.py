@@ -1,0 +1,312 @@
+# Beacon's Python client: standard library only, Python 3.10+ (spec/clients.md).
+#
+# `beacon gen --lang python` copies everything between the two `runtime` markers below into each
+# generated file, so a service needs no package: the generated file is this client plus one typed
+# function per declared kind. Used on its own, `send`, `entry` and `snapshot` at the end of this
+# file take any kind by name, unchecked until Beacon answers.
+from __future__ import annotations
+
+# --- runtime start ---
+import json
+import os
+import secrets
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Literal, Mapping, Sequence, cast
+
+DEFAULT_URL = "http://127.0.0.1:8300"
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_MS = timedelta(milliseconds=1)
+
+
+class BeaconError(Exception):
+    """A call that wasn't `ok`, raised only in strict mode (`BEACON_STRICT=1` or `configure(strict=True)`)."""
+
+
+@dataclass(frozen=True)
+class Sent:
+    """What Beacon answered. `ok` is true for a 2xx; otherwise `problem` says what went wrong."""
+
+    ok: bool
+    status: int
+    outcome: str | None
+    item: int | None
+    problem: str | None
+
+
+@dataclass(frozen=True)
+class Entry:
+    """One firing entry of a snapshot. Make it with a kind's `_entry` function."""
+
+    kind: str
+    body: Mapping[str, object]
+
+
+@dataclass
+class _Settings:
+    url: str | None = None
+    token: str | None = None
+    strict: bool | None = None
+    disabled: bool | None = None
+
+
+_settings = _Settings()
+
+
+def configure(
+    *,
+    url: str | None = None,
+    token: str | None = None,
+    strict: bool | None = None,
+    disabled: bool | None = None,
+) -> None:
+    """Overrides `BEACON_URL`, `BEACON_TOKEN`, `BEACON_STRICT` and `BEACON_DISABLED`. None keeps the current choice."""
+    if url is not None:
+        _settings.url = url
+    if token is not None:
+        _settings.token = token
+    if strict is not None:
+        _settings.strict = strict
+    if disabled is not None:
+        _settings.disabled = disabled
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+class _Runtime:
+    """Sends events and snapshots: one request per call, retried after 1 s and 3 s."""
+
+    retry_delays = (1.0, 3.0)
+    timeout = 5.0
+
+    def url(self) -> str:
+        url = _settings.url or os.environ.get("BEACON_URL") or DEFAULT_URL
+        return url.rstrip("/")
+
+    def token(self) -> str | None:
+        return _settings.token or os.environ.get("BEACON_TOKEN") or None
+
+    def strict(self) -> bool:
+        return _settings.strict if _settings.strict is not None else _env_flag("BEACON_STRICT")
+
+    def disabled(self) -> bool:
+        return _settings.disabled if _settings.disabled is not None else _env_flag("BEACON_DISABLED")
+
+    def time_ms(self, value: int | datetime | None) -> int | None:
+        if value is None or isinstance(value, int):
+            return value
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise TypeError("a time must say its zone: use datetime.now(timezone.utc), not datetime.now()")
+        return (value - _EPOCH) // _MS
+
+    def duration_ms(self, value: int | timedelta | None) -> int | None:
+        if value is None or isinstance(value, int):
+            return value
+        return value // _MS
+
+    def present(self, values: Mapping[str, object]) -> dict[str, object]:
+        """The values that were given: an optional fact left out is not sent."""
+        return {name: value for name, value in values.items() if value is not None}
+
+    def event_body(
+        self,
+        kind: str,
+        *,
+        key: str,
+        facts: Mapping[str, object] | None,
+        slots: Mapping[str, str] | None,
+        labels: Mapping[str, str] | None,
+        context: str | None,
+        url: str | None,
+    ) -> dict[str, object]:
+        body: dict[str, object] = {"kind": kind, "key": key}
+        if facts is not None:
+            body["facts"] = dict(facts)
+        if slots is not None:
+            body["slots"] = dict(slots)
+        if labels:
+            body["labels"] = dict(labels)
+        if context is not None:
+            body["context"] = context
+        if url is not None:
+            body["url"] = url
+        return body
+
+    def event(
+        self,
+        kind: str,
+        *,
+        key: str = "",
+        facts: Mapping[str, object] | None = None,
+        slots: Mapping[str, str] | None = None,
+        labels: Mapping[str, str] | None = None,
+        context: str | None = None,
+        url: str | None = None,
+        state: Literal["resolved"] | None = None,
+    ) -> Sent:
+        body = self.event_body(kind, key=key, facts=facts, slots=slots, labels=labels, context=context, url=url)
+        if state is not None:
+            body["state"] = state
+        return self.post("/v1/events", body)
+
+    def entry(
+        self,
+        kind: str,
+        *,
+        key: str = "",
+        facts: Mapping[str, object] | None = None,
+        slots: Mapping[str, str] | None = None,
+        labels: Mapping[str, str] | None = None,
+        context: str | None = None,
+        url: str | None = None,
+    ) -> Entry:
+        body = self.event_body(kind, key=key, facts=facts, slots=slots, labels=labels, context=context, url=url)
+        return Entry(kind=kind, body=body)
+
+    def snapshot(
+        self,
+        source: str,
+        firing: Sequence[Entry],
+        *,
+        kinds: Sequence[str] | None = None,
+        stale_after: str | None = None,
+        reason: str | None = None,
+    ) -> Sent:
+        body: dict[str, object] = {"source": source, "observed": reason is None}
+        if reason is not None:
+            body["reason"] = reason
+        else:
+            body["firing"] = [dict(entry.body) for entry in firing]
+        if kinds is not None:
+            body["kinds"] = list(kinds)
+        if stale_after is not None:
+            body["stale_after"] = stale_after
+        body["sent_at"] = int(time.time() * 1000)
+        return self.post("/v1/snapshots", body)
+
+    def post(self, path: str, body: Mapping[str, object]) -> Sent:
+        if self.disabled():
+            return Sent(ok=True, status=0, outcome=None, item=None, problem=None)
+        sent = self.attempt_all(path, json.dumps(body).encode())
+        if not sent.ok and self.strict():
+            raise BeaconError(sent.problem or f"Beacon answered {sent.status}")
+        return sent
+
+    def attempt_all(self, path: str, data: bytes) -> Sent:
+        key = secrets.token_hex(16)
+        delays = list(self.retry_delays)
+        while True:
+            sent = self.attempt(path, data, key)
+            retry = sent.status == 0 or sent.status in (408, 429) or sent.status >= 500
+            if not retry or not delays:
+                return sent
+            time.sleep(delays.pop(0))
+
+    def attempt(self, path: str, data: bytes, key: str) -> Sent:
+        url = self.url()
+        headers = {"Content-Type": "application/json", "Idempotency-Key": key}
+        token = self.token()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        request = urllib.request.Request(url + path, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                return self.answer(response.status, response.read())
+        except urllib.error.HTTPError as error:
+            return self.answer(error.code, error.read())
+        except (OSError, ValueError) as error:
+            problem = f"{url}: no answer from Beacon: {error}\n  fix: check Beacon is running and BEACON_URL points at it"
+            return Sent(ok=False, status=0, outcome=None, item=None, problem=problem)
+
+    def object(self, value: object) -> Mapping[str, object]:
+        """A JSON object as a mapping; anything else as an empty one."""
+        return cast("dict[str, object]", value) if isinstance(value, dict) else {}
+
+    def answer(self, status: int, raw: bytes) -> Sent:
+        try:
+            parsed: object = json.loads(raw.decode() or "null")
+        except ValueError:
+            parsed = None
+        answer = self.object(parsed)
+        if 200 <= status < 300:
+            outcome = answer.get("outcome")
+            item = self.object(answer.get("item")).get("id")
+            return Sent(
+                ok=True,
+                status=status,
+                outcome=outcome if isinstance(outcome, str) else None,
+                item=item if isinstance(item, int) else None,
+                problem=None,
+            )
+        return Sent(ok=False, status=status, outcome=None, item=None, problem=self.problem(status, answer, raw))
+
+    def problem(self, status: int, answer: Mapping[str, object], raw: bytes) -> str:
+        error = self.object(answer.get("error"))
+        if error:
+            at, message, fix = (str(error.get(name) or "") for name in ("at", "message", "fix"))
+            text = f"{at}: {message}" if at else message
+            return f"{text}\n  fix: {fix}" if fix else text
+        return f"Beacon answered {status}: {raw[:300].decode(errors='replace')}"
+
+
+_beacon = _Runtime()
+# --- runtime end ---
+
+
+def send(
+    kind: str,
+    *,
+    key: str = "",
+    facts: Mapping[str, object] | None = None,
+    slots: Mapping[str, str] | None = None,
+    labels: Mapping[str, str] | None = None,
+    context: str | None = None,
+    url: str | None = None,
+    resolve: bool = False,
+) -> Sent:
+    """One `POST /v1/events` for any kind. Prefer the typed functions `beacon gen` writes."""
+    return _beacon.event(
+        kind,
+        key=key,
+        facts=facts,
+        slots=slots,
+        labels=labels,
+        context=context,
+        url=url,
+        state="resolved" if resolve else None,
+    )
+
+
+def entry(
+    kind: str,
+    *,
+    key: str = "",
+    facts: Mapping[str, object] | None = None,
+    slots: Mapping[str, str] | None = None,
+    labels: Mapping[str, str] | None = None,
+    context: str | None = None,
+    url: str | None = None,
+) -> Entry:
+    """One firing entry for `snapshot`."""
+    return _beacon.entry(kind, key=key, facts=facts, slots=slots, labels=labels, context=context, url=url)
+
+
+def snapshot(
+    source: str,
+    firing: Sequence[Entry],
+    *,
+    kinds: Sequence[str] | None = None,
+    stale_after: str | None = None,
+) -> Sent:
+    """One `POST /v1/snapshots`: everything of `source` that is open now."""
+    return _beacon.snapshot(source, firing, kinds=kinds, stale_after=stale_after)
+
+
+def unobserved(source: str, reason: str, *, stale_after: str | None = None) -> Sent:
+    """Says `source` couldn't see what it watches; its alerts are muted until its next snapshot."""
+    return _beacon.snapshot(source, [], stale_after=stale_after, reason=reason)

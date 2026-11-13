@@ -15,3 +15,10 @@ name = "beacon"
 path = "src/main.rs"
 
 [dependencies]
+beacon-core.workspace = true
+beacon-codegen.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+lexopt.workspace = true
+jiff.workspace = true
+getrandom.workspace = true

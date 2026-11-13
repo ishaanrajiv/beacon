@@ -2,16 +2,19 @@
 # Everything that has to hold before a commit. CI runs the same steps it can.
 #
 #   scripts/check          the full check
-#   scripts/check --fast   Rust only: format, lint, tests, dependencies, nothing private
+#   scripts/check --fast   Rust only: format, lint, tests, dependencies, nothing private; skips the
+#                          client suites, the type checks of generated code and the release build
 #
 # Each step that fails says what to run to fix it. The full check will grow the steps Trail's has
-# (generated emitters, client suites, binary size, idle memory, end to end) as those crates land.
+# (binary size, idle memory, end to end) as those crates land.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"   # keep builds off every core
 
 fast=0
 [ "${1:-}" = "--fast" ] && fast=1
+# crates/codegen's tests run pyright and tsc (through npx) over generated code; --fast skips them.
+[ "$fast" = 1 ] && export BEACON_SKIP_TYPECHECK=1
 
 # The dependency list. Raising it is a decision: say why in the commit.
 ALLOWED="serde serde_json toml rusqlite ureq jiff getrandom lexopt reqwest ring base64"
@@ -72,7 +75,14 @@ step "dependencies" "Beacon keeps a short dependency list on purpose; do it with
   dependencies
 step "nothing private" "replace the address with an example one (127.0.0.1, example.com)" private_names
 
+# The clients each generated file copies (spec/clients.md): their suites run against a fake Beacon,
+# and they and the committed generated files type-check strictly. Node 22.18+ runs the .ts tests.
+python_client() { (cd clients/python && python3 -m unittest discover -s tests && npx --yes pyright@1.1.414); }
+node_client() { (cd clients/node && node --test tests/ && npx --yes -p typescript@5 tsc -p .); }
+
 if [ "$fast" = 0 ]; then
+  step "python client" "run \`python3 -m unittest discover -s tests\` and \`npx pyright@1.1.414\` in clients/python; after changing the client or the generator, \`BEACON_BLESS=1 cargo test -p beacon-codegen\` rewrites tests/gen" python_client
+  step "node client" "run \`node --test tests/\` and \`npx -p typescript@5 tsc -p .\` in clients/node; after changing the client or the generator, \`BEACON_BLESS=1 cargo test -p beacon-codegen\` rewrites tests/gen" node_client
   step "release build" "the release profile must build: see what \`cargo build --release\` reports" \
     cargo build --release --workspace --locked
 fi

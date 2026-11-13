@@ -1,0 +1,13 @@
+{
+  "name": "beacon-client",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Send events and snapshots to Beacon. No dependencies; `beacon gen --lang typescript` copies it into each generated file.",
+  "type": "module",
+  "license": "MIT OR Apache-2.0",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "test": "node --test tests/",
+    "typecheck": "npx -y -p typescript@5 tsc --noEmit"
+  }
+}
