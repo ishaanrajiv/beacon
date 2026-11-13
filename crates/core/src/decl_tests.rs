@@ -350,3 +350,56 @@ fn every_problem_has_a_place_and_a_fix() {
         assert!(!problem.fix.is_empty(), "{problem:?}");
     }
 }
+
+#[test]
+fn categories_are_checked() {
+    let ok = example_kind(&format!("{ACTION}\ncategories = [\"APPROVAL\", \"APPROVAL_2\"]"));
+    assert_eq!(ok.categories, ["APPROVAL", "APPROVAL_2"]);
+    assert_eq!(push_category("backup.thing", &ok, None), "APPROVAL");
+    assert_eq!(
+        push_category("backup.thing", &ok, Some("APPROVAL_2")),
+        "APPROVAL_2"
+    );
+    let plain = example_kind(ACTION);
+    assert!(plain.categories.is_empty());
+    assert_eq!(push_category("backup.thing", &plain, None), "backup.thing");
+    for (fields, expected) in [
+        (
+            format!("{ACTION}\ncategories = [\"approval\"]"),
+            "is not a category name",
+        ),
+        (
+            format!("{ACTION}\ncategories = [\"9X\"]"),
+            "is not a category name",
+        ),
+        (
+            format!("{ACTION}\ncategories = [\"{}\"]", "A".repeat(41)),
+            "is not a category name",
+        ),
+        (
+            format!("{ACTION}\ncategories = [\"A\", \"B\", \"C\", \"D\", \"E\"]"),
+            "at most 4",
+        ),
+        (format!("{ACTION}\ncategories = [\"A\", \"A\"]"), "listed twice"),
+        (
+            format!("{ACTION}\ncategories = [1]"),
+            "a category must be a string",
+        ),
+        (format!("{ACTION}\ncategories = \"A\""), "must be a list"),
+        (format!("{RECORD}\ncategories = [\"A\"]"), "a record never pushes"),
+        (format!("{ACTION}\ncategoris = [\"A\"]"), "categories"),
+        (
+            format!("{UPDATE}\nslots = {{ category = 20 }}\nbody = \"{{category}}\""),
+            "category",
+        ),
+    ] {
+        let found = problems(&one_kind(&fields));
+        assert!(found.contains(expected), "{fields}: {found}");
+    }
+    assert!(is_category(&"A".repeat(40)));
+}
+
+fn example_kind(fields: &str) -> Kind {
+    let decl = parse(&one_kind(fields), &Check::default()).unwrap_or_else(|p| panic!("{p:?}"));
+    decl.kinds["backup.thing"].clone()
+}
