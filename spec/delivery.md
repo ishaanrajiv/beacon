@@ -3,8 +3,8 @@
 How Beacon decides, for each notification, whether and when it reaches the phone; and how alerts
 and actions move through their states. Everything here is a pure function of the item, the
 stored state, presence and a clock, so every rule is tested with a fake clock. The decision and
-the state machines live in `crates/core` (next to be written); the server runs them and the jobs
-that wake them.
+the state machines live in `crates/core` (`delivery.rs`, `lifecycle.rs`, `quiet.rs`); `crates/store`
+runs them in the transaction that caused them, and the server runs the jobs that wake them.
 
 ## The numbers
 
@@ -74,7 +74,8 @@ those triggers.
    - trigger `repeat` → skip this repeat (it is not held);
    - otherwise → hold, `quiet_hours`, until the next `quiet_hours.end`.
 7. **Throttled?** *Skipped for `repeat`, `woke` and `caught_up`.* A push for the same `(kind, key)`
-   was sent within the kind's `throttle` → suppress, `throttled`. A kind with `throttle = "none"`
+   was sent (decided `send`, whether or not Apple has taken it yet) within the kind's `throttle` →
+   suppress, `throttled`. A kind with `throttle = "none"`
    is never throttled.
 8. **Send.** With `push = false` in beacon.toml → suppress, `push_off` (everything above is still
    decided and recorded, so the decisions can be compared before push is turned on). Otherwise →
@@ -124,7 +125,7 @@ stop).
 | — (no item, or the last resolved `flap_window` or more ago) | fire | `open` | A new item. `openings = 1`. `seen = false`. Repeats scheduled from now. Decide (`opened`). |
 | `resolved`, within `flap_window` of resolving | fire | `open` | The same item reopens: `times.opened` now, `times.resolved`, `acknowledged` and `dismissed` cleared, `seen = false`, text back to the firing text, repeats rescheduled. Count the openings within the window; more than `flap_openings` (3) → flapping (below). Decide (`reopened`). |
 | `open`, `dismissed` | fire | unchanged | Facts, slots, text and labels updated. No push. |
-| `open`, `dismissed` | resolve (an event, or absent from its source's snapshot) | `resolved` | `times.resolved` now. Text becomes the recovery text, with `{lasted}` from `times.opened` to now. `seen = false`. A held push is suppressed (`closed`). Repeats cancelled. If the item's push was `sent` and it isn't flapping, a **recovery** push: the recovery text, same collapse id, `passive`, no category. It is not subject to silences, quiet hours, presence or throttle; only to `push = false`. |
+| `open`, `dismissed` | resolve (an event, or absent from its source's snapshot) | `resolved` | `times.resolved` now. Text becomes the recovery text, with `{lasted}` from `times.opened` to now. `seen = false`. A held push is suppressed (`closed`). Repeats cancelled. If the item's push was `sent` and it isn't flapping, a **recovery** push: the recovery text, same collapse id, `passive`, no category; the item's `push.status` follows it (`queued`, then `sent`). It is not subject to silences, quiet hours, presence or throttle; only to `push = false` (suppressed, `push_off`). |
 | `resolved` | resolve | unchanged | Nothing (`outcome: "ignored"`). |
 | `open`, `dismissed` | acknowledge | unchanged | `acknowledged` now. Repeats cancelled. A one-off alert resolves instead (no recovery text: it keeps its own). |
 | `open` | dismiss | `dismissed` | Leaves Needs you; stays in Alerts. Repeats cancelled. A held push is suppressed (`closed`). A one-off alert resolves instead. |
@@ -140,7 +141,10 @@ stop).
 - **Repeats.** While an alert is `open`, not acknowledged, not flapping, and its kind declares
   `repeat`, the next repeat is due `repeat[n]` after the previous push (the first after it opened).
   A due repeat is decided with trigger `repeat`; whether it sends or not, `repeats_sent` goes up and
-  the next is scheduled, until the list runs out.
+  the next is scheduled, until the list runs out. A repeat that doesn't send (muted, skipped in
+  quiet hours) leaves the item's `push` as it was: the last push it sent still stands. Becoming
+  flapping cancels the next repeat; settling while open and unacknowledged schedules it again,
+  `repeat[repeats_sent]` from then.
 - **One-off** alerts (`one_off = true`) have no recovery: acknowledge or dismiss resolves them, as
   does an event with `state: "resolved"`.
 - The plan's "pending" is not a state: an alert waiting to push is `open` with `push.status: held`.
@@ -219,7 +223,7 @@ A source is **observed** until it says otherwise or goes quiet:
 
 ## The budget
 
-Beacon counts the pushes sent for actions and updates (not alerts) each local day. The send that
+Beacon counts the pushes sent (decided `send`) for actions and updates (not alerts) each local day. The send that
 makes the count `delivery.budget + 1` (the 6th) records one `beacon.budget` update for that day:
 fact `count`, fact `source_name` and slot `kind_title` naming the kind with the most such pushes
 that day (on a tie, the one that pushed last) by its source's name and its latest item's title. Its
@@ -252,4 +256,5 @@ runs at start, in time order, except that a push more than `apns.give_up` (1 h) 
 Deleted with their history and push attempts, once a day: alerts and actions closed (resolved,
 done, dismissed) more than `retention` (90 days) ago, and updates and records made more than
 `retention` ago. Open items are kept however old. Silences that ended more than 7 days ago,
-Idempotency-Keys older than `idempotency`, and devices' presence older than a day are deleted too.
+Idempotency-Keys older than `idempotency`, devices' presence older than a day, and budget counts
+older than 7 days are deleted too.

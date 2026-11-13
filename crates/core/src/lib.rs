@@ -7,15 +7,23 @@
 //! - [`render`]: an event's facts and slots checked against its kind and rendered to text.
 //! - [`builtin`]: the kinds Beacon owns (`beacon.*`, `trail.*`).
 //! - [`ids`]: the collapse ids pushes carry.
+//! - [`delivery`]: the delivery decision, silences, presence, the catch-up and the budget.
+//! - [`lifecycle`]: the alert and action state machines.
+//! - [`quiet`]: quiet hours and the local day, in the configured timezone.
+//! - [`item`]: the item as the API sends it.
 //! - [`duration`], [`names`], [`problem`]: the small pieces the rest share.
 
 pub mod builtin;
 pub mod decl;
+pub mod delivery;
 pub mod duration;
 pub mod ids;
+pub mod item;
+pub mod lifecycle;
 pub mod model;
 pub mod names;
 pub mod problem;
+pub mod quiet;
 pub mod render;
 pub mod template;
 
