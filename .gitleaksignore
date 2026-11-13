@@ -1,0 +1,5 @@
+# False positives, checked 2026-11-13: PEM marker strings in key-parsing code and tests that generate keys at run time, and a dummy token in a config test. No key material is committed.
+61905fd878299dd1a47bc6534ae3e37d62d0e01e:crates/apns/src/lib.rs:private-key:74
+a36dcd52d246ab534ffe426a0e09c4d889974fe5:crates/apns/src/lib.rs:private-key:75
+a36dcd52d246ab534ffe426a0e09c4d889974fe5:crates/apns/src/token.rs:private-key:139
+82d3c49d65beba639e754e6fa7f130086b5e5894:crates/core/src/config.rs:generic-api-key:734
