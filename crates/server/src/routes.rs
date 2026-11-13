@@ -45,6 +45,13 @@ const IDEMPOTENCY: Param = p(
 pub static ROUTES: &[Route] = &[
     Route {
         method: "GET",
+        path: "/",
+        summary: "The same as GET /v1, so a proxy's check of the bare prefix gets an answer.",
+        access: Access::Read,
+        params: &[],
+    },
+    Route {
+        method: "GET",
         path: "/v1",
         summary: "This list.",
         access: Access::Read,

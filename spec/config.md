@@ -9,6 +9,7 @@ and a unit (`90s`, `10m`, `2h`, `7d`). The parser will be `crates/core/src/confi
 listen = "127.0.0.1:8210"       # address and port. Loopback by default: put a proxy in front to reach it from elsewhere.
 data_dir = "./beacon-data"      # the SQLite database, beacon.db
 devices_db = "./beacon-data/devices.db"   # the devices and their push tokens; default data_dir/devices.db
+readable_db = false                       # true: beacon.db mode 644, readable by other local users
 timezone = "UTC"                # IANA name: quiet hours, the catch-up, the budget's day, and how times render
 push = true                     # false: decide and record everything, send nothing (push.reason "push_off")
 origins = []                    # Origin values a browser may send mutations from, beside the request's own host
@@ -98,7 +99,9 @@ works.
 ## Storage
 
 `data_dir/beacon.db`: SQLite in write-ahead-log mode with `synchronous = FULL`, so an accepted
-event survives a power cut. The folder is created with mode 700 and the databases 600. Back it up
+event survives a power cut. The folder is created with mode 700 and the databases 600. With
+`readable_db = true`, `beacon.db` and its log files are 644 and a folder Beacon creates is 755, so
+another local user can read it; `devices_db` stays 600 either way. The mode is set on every start. Back it up
 like any SQLite file (`sqlite3 beacon.db ".backup copy.db"`, or copy it while Beacon is stopped).
 
 `devices_db` (default `data_dir/devices.db`): the registered devices and their APNs tokens, and

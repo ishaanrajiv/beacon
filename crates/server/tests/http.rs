@@ -1150,3 +1150,28 @@ fn the_job_thread_sends_a_push_without_being_asked_and_stops() {
     let Lab { server, .. } = lab;
     server.stop();
 }
+
+#[test]
+fn the_bare_prefix_answers_like_v1() {
+    let lab = start();
+    let root = lab.get("/");
+    assert_eq!(root.status, 200);
+    assert_eq!(root.json, lab.get("/v1").json);
+}
+
+#[cfg(unix)]
+#[test]
+fn readable_db_opens_beacon_db_but_never_the_devices() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |lab: &Lab, name: &str| {
+        let path = lab._dir.0.join("data").join(name);
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    };
+    let private = start_with("", false);
+    assert_eq!(mode(&private, "beacon.db"), 0o600);
+    assert_eq!(mode(&private, "devices.db"), 0o600);
+    let readable = start_with("readable_db = true", false);
+    assert_eq!(mode(&readable, "beacon.db"), 0o644);
+    assert_eq!(mode(&readable, "beacon.db-wal"), 0o644);
+    assert_eq!(mode(&readable, "devices.db"), 0o600);
+}

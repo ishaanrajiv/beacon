@@ -79,10 +79,12 @@ Beacon has one user. Its rules keep other web pages and other machines from acti
 ## Routes
 
 `GET /v1` returns them as `{"version": "0.1.0", "routes": [{"method", "path", "summary", "access", "params": [{"name", "in", "summary"}]}]}`,
-where `in` is `path`, `query` or `header`.
+where `in` is `path`, `query` or `header`. `GET /` answers the same, so a reverse proxy's check of
+the bare prefix (`/beacon/`) gets a `200` rather than a `404`.
 
 | Method | Path | Access | Summary |
 |---|---|---|---|
+| `GET` | `/` | read | The same as GET /v1, so a proxy's check of the bare prefix gets an answer. |
 | `GET` | `/v1` | read | This list. |
 | `GET` | `/v1/health` | read | Whether Beacon is up, and whether it can push. |
 | `GET` | `/v1/registry` | read | Every source: name, icon, kind count, whether it is observed. |

@@ -23,6 +23,9 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// `devices_db`: the devices and their push tokens. Default `data_dir/devices.db`.
     pub devices_db: PathBuf,
+    /// `readable_db`: beacon.db (no push tokens) readable by other users, mode 644, so a local
+    /// assistant or report can open it read-only. devices.db stays 600 either way. Default false.
+    pub readable_db: bool,
     /// `timezone`, as written.
     pub timezone: String,
     /// `origins`: Origin values a browser may send mutations from, beside the request's own host.
@@ -70,6 +73,7 @@ impl Default for Config {
             listen: DEFAULT_LISTEN.into(),
             data_dir: PathBuf::from("./beacon-data"),
             devices_db: PathBuf::from("./beacon-data/devices.db"),
+            readable_db: false,
             timezone: "UTC".into(),
             origins: Vec::new(),
             banned_words: Vec::new(),
@@ -86,10 +90,11 @@ impl Default for Config {
     }
 }
 
-const TOP: [&str; 18] = [
+const TOP: [&str; 19] = [
     "listen",
     "data_dir",
     "devices_db",
+    "readable_db",
     "timezone",
     "push",
     "origins",
@@ -190,6 +195,9 @@ pub fn parse(text: &str) -> Result<Config, Vec<Problem>> {
         Some(path) => PathBuf::from(path),
         None => c.data_dir.join("devices.db"),
     };
+    if let Some(readable) = r.boolean(&table, "", "readable_db") {
+        c.readable_db = readable;
+    }
     if let Some(zone) = r.string(&table, "", "timezone") {
         match TimeZone::get(&zone) {
             Ok(tz) => {

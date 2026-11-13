@@ -109,16 +109,20 @@ impl App {
             transport,
             ..
         } = options;
-        prepare_dir(&config.data_dir)?;
+        let (db_mode, dir_mode) = if config.readable_db {
+            (0o644, 0o755)
+        } else {
+            (0o600, 0o700)
+        };
+        prepare_dir(&config.data_dir, dir_mode)?;
         if let Some(parent) = config.devices_db.parent()
             && !parent.as_os_str().is_empty()
         {
-            prepare_dir(parent)?;
+            prepare_dir(parent, 0o700)?;
         }
         let db = config.data_dir.join("beacon.db");
-        for file in [&db, &config.devices_db] {
-            private_file(file);
-        }
+        db_file(&db, db_mode);
+        db_file(&config.devices_db, 0o600);
         let store = Store::open_with_devices(&db, &config.devices_db, config.settings.clone())
             .map_err(|e| e.problems)?;
         store.set_trail_open(&config.trail_open).map_err(|e| e.problems)?;
@@ -195,15 +199,17 @@ impl App {
     }
 }
 
-/// Creates a data folder (mode 700, `spec/config.md`, "Storage").
-fn prepare_dir(dir: &Path) -> Result<(), Vec<Problem>> {
+/// Creates a data folder (mode 700, or 755 with `readable_db`; `spec/config.md`, "Storage").
+fn prepare_dir(dir: &Path, mode: u32) -> Result<(), Vec<Problem>> {
     if dir.is_dir() {
         return Ok(());
     }
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, mode);
+    #[cfg(not(unix))]
+    let _ = mode;
     builder.create(dir).map_err(|e| {
         vec![Problem::new(
             "data_dir",
@@ -213,25 +219,26 @@ fn prepare_dir(dir: &Path) -> Result<(), Vec<Problem>> {
     })
 }
 
-/// A database file is readable by Beacon's user only (mode 600): made so before SQLite opens it,
-/// so SQLite gives its log and shared-memory files the same mode.
-fn private_file(path: &Path) {
+/// A database file at `mode`: 600 (Beacon's user only), or 644 for beacon.db with `readable_db`.
+/// Set before SQLite opens it, so SQLite gives its log and shared-memory files the same mode, and
+/// set again on every start, so changing `readable_db` takes effect on a restart.
+fn db_file(path: &Path, mode: u32) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let _ = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .mode(0o600)
+            .mode(mode)
             .open(path);
         for suffix in ["", "-wal", "-shm"] {
             let mut name = path.as_os_str().to_owned();
             name.push(suffix);
-            let _ = std::fs::set_permissions(&name, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(&name, std::fs::Permissions::from_mode(mode));
         }
     }
     #[cfg(not(unix))]
-    let _ = path;
+    let _ = (path, mode);
 }
 
 /// A running server.
