@@ -53,6 +53,10 @@ fn fields(kind: &Kind) -> String {
     if kind.open.is_some() {
         fields.push("url?: string".to_string());
     }
+    if !kind.categories.is_empty() {
+        let names: Vec<String> = kind.categories.iter().map(|c| quote(c)).collect();
+        fields.push(format!("category?: {}", names.join(" | ")));
+    }
     if fields.is_empty() {
         "Common".to_string()
     } else {
@@ -85,6 +89,9 @@ fn options(kind: &Kind) -> Vec<String> {
     }
     if kind.open.is_some() {
         options.push("url: args.url".to_string());
+    }
+    if !kind.categories.is_empty() {
+        options.push("category: args.category".to_string());
     }
     options
 }

@@ -56,6 +56,10 @@ fn parameters(kind: &Kind) -> Vec<String> {
     if kind.open.is_some() {
         params.push("url: str | None = None".to_string());
     }
+    if !kind.categories.is_empty() {
+        let names: Vec<String> = kind.categories.iter().map(|c| quote(c)).collect();
+        params.push(format!("category: Literal[{}] | None = None", names.join(", ")));
+    }
     params
 }
 
@@ -84,6 +88,9 @@ fn arguments(kind: &Kind) -> Vec<String> {
     }
     if kind.open.is_some() {
         args.push("url=url".to_string());
+    }
+    if !kind.categories.is_empty() {
+        args.push("category=category".to_string());
     }
     args
 }

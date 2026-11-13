@@ -7,7 +7,7 @@ use beacon_core::problem::closest;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The address Beacon listens on when nothing says otherwise (`spec/config.md`, `listen`).
-pub const DEFAULT_URL: &str = "http://127.0.0.1:8300";
+pub const DEFAULT_URL: &str = "http://127.0.0.1:8210";
 
 #[derive(Debug, Default)]
 pub struct Args {

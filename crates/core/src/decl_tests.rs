@@ -42,7 +42,7 @@ fn the_examples_pass() {
     assert_eq!(backup.name, "Backups");
     assert_eq!(backup.icon, Icon::Archive);
     assert_eq!(backup.kinds.len(), 4);
-    assert_eq!(example("assistant").kinds.len(), 6);
+    assert_eq!(example("assistant").kinds.len(), 7);
     assert_eq!(example("ship").kinds.len(), 4);
 }
 
