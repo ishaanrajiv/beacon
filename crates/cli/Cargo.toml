@@ -1,0 +1,17 @@
+[package]
+name = "beacon"
+description = "The beacon command: serve, send, snapshot, silence, check, publish, gen."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "beacon"
+path = "src/main.rs"
+
+[dependencies]

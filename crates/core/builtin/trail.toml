@@ -1,0 +1,46 @@
+# What Trail's alert webhook becomes (POST /v1/trail, spec/api.md). Trail's rules write their own
+# title and body, so these kinds carry them in slots. The server sets each kind's link from
+# [trail] open in beacon.toml.
+source = "trail"
+name = "Monitoring"
+icon = "gauge"
+
+[kinds."trail.severe"]
+class = "alert"
+push = "urgent"
+description = "A Trail metric rule of severity severe is firing."
+title = "{title}"
+body = "{body}"
+slots = { title = 40, body = 150 }
+preview = "Monitoring alert"
+actions = ["acknowledge", "dismiss", "silence_1h"]
+recovered = "Back to normal"
+recovered_body = "{title} · lasted {lasted}"
+
+[kinds."trail.severe_notice"]
+class = "alert"
+push = "urgent"
+one_off = true
+description = "A Trail event rule of severity severe matched an event."
+title = "{title}"
+body = "{body}"
+slots = { title = 40, body = 150 }
+preview = "Monitoring alert"
+actions = ["acknowledge", "dismiss"]
+
+[kinds."trail.warning"]
+class = "update"
+push = "silent"
+description = "A Trail rule of severity warning started firing, or matched an event."
+title = "{title}"
+body = "{body}"
+slots = { title = 40, body = 150 }
+preview = "Monitoring warning"
+actions = ["silence_1h"]
+
+[kinds."trail.info"]
+class = "record"
+description = "A Trail rule of severity info started firing, or matched an event."
+title = "{title}"
+body = "{body}"
+slots = { title = 40, body = 150 }

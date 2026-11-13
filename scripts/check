@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# Everything that has to hold before a commit. CI runs the same steps it can.
+#
+#   scripts/check          the full check
+#   scripts/check --fast   Rust only: format, lint, tests, dependencies, nothing private
+#
+# Each step that fails says what to run to fix it. The full check will grow the steps Trail's has
+# (generated emitters, client suites, binary size, idle memory, end to end) as those crates land.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"   # keep builds off every core
+
+fast=0
+[ "${1:-}" = "--fast" ] && fast=1
+
+# The dependency list. Raising it is a decision: say why in the commit.
+ALLOWED="serde serde_json toml rusqlite ureq jiff getrandom lexopt reqwest ring base64"
+APNS_ONLY="reqwest ring base64"   # Apple push needs HTTP/2 and ES256; nothing else may use them
+APNS_CRATE="beacon-apns"
+
+failed=0
+step() {  # step <name> <fix> <command...>
+  local name="$1" fix="$2"; shift 2
+  local log; log="$(mktemp)"
+  if "$@" > "$log" 2>&1; then
+    printf 'ok    %s\n' "$name"
+  else
+    printf 'FAIL  %s\n' "$name"
+    tail -n 40 "$log" | sed 's/^/      /'
+    printf '      fix: %s\n' "$fix"
+    failed=1
+  fi
+  rm -f "$log"
+}
+
+dependencies() {
+  cargo metadata --format-version 1 --locked | ALLOWED="$ALLOWED" APNS_ONLY="$APNS_ONLY" APNS_CRATE="$APNS_CRATE" python3 -c '
+import json, os, sys
+meta = json.load(sys.stdin)
+allowed = set(os.environ["ALLOWED"].split())
+apns_only = set(os.environ["APNS_ONLY"].split())
+members = set(meta["workspace_members"])
+ours = {p["name"] for p in meta["packages"] if p["id"] in members}
+bad = []
+for package in meta["packages"]:
+    if package["id"] not in members:
+        continue
+    for dep in package["dependencies"]:
+        name = dep["name"]
+        if name in ours:
+            continue
+        if name not in allowed:
+            bad.append(package["name"] + " uses " + name + ", which is not on the allow-list")
+        elif name in apns_only and package["name"] != os.environ["APNS_CRATE"]:
+            bad.append(package["name"] + " uses " + name + ", which only " + os.environ["APNS_CRATE"] + " may")
+if bad:
+    sys.exit("; ".join(bad))
+'
+}
+
+private_names() {
+  # Nothing private in the repository: no addresses that are not examples.
+  ! git grep -nIE '\b(10|192\.168|172\.(1[6-9]|2[0-9]|3[01])|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7]))\.[0-9]+\.[0-9]+\b' -- . ':!scripts/check'
+}
+
+step "format" "run \`cargo fmt --all\`" cargo fmt --all --check
+step "lint" "fix what clippy reports; do not silence it without a reason beside the allow" \
+  cargo clippy --workspace --all-targets --locked -- -D warnings
+step "tests" "a failing test names what broke; fix the code, or the test if the behaviour changed on purpose" \
+  cargo test --workspace --locked
+step "dependencies" "Beacon keeps a short dependency list on purpose; do it without the crate, or add it to ALLOWED in scripts/check and Cargo.toml and say why in the commit" \
+  dependencies
+step "nothing private" "replace the address with an example one (127.0.0.1, example.com)" private_names
+
+if [ "$fast" = 0 ]; then
+  step "release build" "the release profile must build: see what \`cargo build --release\` reports" \
+    cargo build --release --workspace --locked
+fi
+
+[ "$failed" = 0 ] && echo "all checks passed" || { echo "some checks failed"; exit 1; }

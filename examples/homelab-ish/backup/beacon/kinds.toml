@@ -1,0 +1,48 @@
+# A made-up backup service. It posts a snapshot after every run (spec/api.md, POST /v1/snapshots),
+# so its alerts open and recover from what the snapshot says.
+source = "backup"
+name = "Backups"
+icon = "archive"
+
+[kinds."backup.failed"]
+class = "alert"
+push = "urgent"
+description = "The last backup run failed."
+title = "Backup failed"
+body = "{reason}. The last good backup was {last_ok}."
+facts = { last_ok = "time" }
+slots = { reason = 80 }
+open = "/system"
+actions = ["acknowledge", "silence_1h"]
+preview = "Backup problem"
+recovered = "Backups are working again"
+repeat = ["2h", "6h"]
+
+[kinds."backup.stale"]
+class = "alert"
+push = "urgent"
+description = "No backup has finished for longer than the schedule allows."
+title = "Backups are overdue"
+body = "None has finished for {since}. The last good backup was {last_ok}."
+facts = { since = "duration", last_ok = "time" }
+open = "/system"
+actions = ["acknowledge", "dismiss"]
+# recovered defaults to "Backups are back", recovered_body to "Lasted {lasted}."
+
+[kinds."backup.space"]
+class = "alert"
+push = "normal"
+description = "The backup bucket is close to its free allowance."
+title = "Backup storage is nearly full"
+body = "{used_percent}% of the allowance is used. The oldest snapshots go first if it fills."
+facts = { used_percent = "int" }
+open = "/system"
+actions = ["acknowledge"]
+recovered = "Backup storage has room again"
+
+[kinds."backup.finished"]
+class = "record"
+description = "A backup run finished."
+title = "Backup finished"
+body = "{size} saved in {took}."
+facts = { size = "string", took = "duration" }

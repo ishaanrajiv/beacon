@@ -1,0 +1,13 @@
+[package]
+name = "beacon-apns"
+description = "Apple push for Beacon: token auth, HTTP/2, payloads, retries."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

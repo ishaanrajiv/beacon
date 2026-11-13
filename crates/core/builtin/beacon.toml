@@ -1,0 +1,47 @@
+# Beacon's own kinds. Beacon posts these itself; spec/delivery.md says when.
+source = "beacon"
+name = "Notifications"
+icon = "bell"
+
+[kinds."beacon.source_unobserved"]
+class = "update"
+push = "none"
+description = "A source stopped reporting, or said it can't see what it watches. Its alerts are muted until it reports again."
+title = "Can't check {source_name}"
+body = "{reason} Its alerts are on hold until it reports again."
+facts = { source_name = "string" }
+slots = { reason = 100 }
+
+[kinds."beacon.source_observed"]
+class = "record"
+description = "A source that was unobserved reported again. Its alerts push again."
+title = "Checking {source_name} again"
+facts = { source_name = "string" }
+
+[kinds."beacon.flapping"]
+class = "update"
+push = "normal"
+description = "An alert opened more often than the flap limit. It stays quiet until it settles."
+title = "An alert keeps flapping"
+body = "{alert} opened {openings} times in {window}. It stays quiet until it settles for {stable}."
+facts = { openings = "int", window = "duration", stable = "duration" }
+slots = { alert = 40 }
+
+[kinds."beacon.catch_up"]
+class = "update"
+push = "normal"
+description = "The morning push that stands in for what was held over quiet hours."
+title = "{count} things came in overnight"
+body = "{titles}"
+facts = { count = "int" }
+slots = { titles = 150 }
+preview = "Overnight summary"
+
+[kinds."beacon.budget"]
+class = "update"
+push = "none"
+description = "More pushes than the daily budget went out, not counting alerts."
+title = "More pushes than usual today"
+body = "{count} so far. Most were {kind_title} from {source_name}."
+facts = { count = "int", source_name = "string" }
+slots = { kind_title = 40 }

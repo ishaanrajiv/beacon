@@ -1,0 +1,60 @@
+# Working on Beacon
+
+Beacon is one small Rust server that decides which notifications deserve your attention and
+delivers them to your own iPhone app through Apple's push service. It is maintained by coding
+agents, so its rules are checks that fail with a message saying what to do. Run `scripts/check`
+before every commit.
+
+## Layout
+
+| Path | What it is |
+|---|---|
+| `crates/core` | Types and pure functions: classes, push levels, declarations (`kinds.toml`), templates and rendering, Beacon's own kinds. Next: the alert lifecycle and the delivery decision. No sockets, no database. |
+| `crates/store` | SQLite: items, alerts, silences, presence, devices, the registry, push attempts. |
+| `crates/server` | The HTTP/1.1 server on `std::net`, the API routes, the background jobs. |
+| `crates/apns` | Apple push: provider tokens, HTTP/2, payloads, retries. The only crate with reqwest, ring and base64. |
+| `crates/codegen` | `beacon gen`: typed emitters for Python and TypeScript. |
+| `crates/cli` | The `beacon` binary. |
+| `crates/core/builtin/` | The kinds Beacon owns: `beacon.*` and what Trail's webhook becomes, `trail.*`. |
+| `spec/` | The contracts: declarations, API, delivery, Apple push, config, clients. |
+| `examples/homelab-ish/` | Made-up services' `kinds.toml` files; the tests load them. |
+
+## Rules
+
+- **The spec and the code change together.** A change to a wire format, a file format, a default
+  number or a config field updates its file in `spec/` in the same commit. The spec is what other
+  agents build clients against; a behaviour it doesn't describe doesn't exist.
+- **No new dependencies.** `Cargo.toml` lists every crate Beacon may use, and `scripts/check` fails
+  on any other, and on reqwest, ring or base64 anywhere but `crates/apns`. There is no async
+  runtime outside `crates/apns`, no SQL engine but SQLite, and no logging framework, on purpose.
+- **Every error says how to fix it.** Return a `Problem { at, message, fix }`
+  (`crates/core/src/problem.rs`). Name the field, say what is wrong with the value, and give a value
+  that would work. Use `closest` to suggest the name the writer probably meant. The API sends the
+  same three fields (`spec/api.md`, "Errors").
+- **No `unwrap`, `expect`, `panic!` or `unsafe`** outside tests; the lints deny them. Return the error.
+- **Declared, not free text.** Every notification is an instance of a kind a service declared.
+  Producers send facts and slots; Beacon writes the words from the kind's templates. Don't add a
+  route that takes a finished title.
+- **Nothing is trusted to memory alone.** Work that is owed (a held push, a repeat, the morning
+  catch-up, a retry) survives a kill at any line: it is in SQLite in the same transaction as what
+  caused it, or found again at start from what is stored.
+- **Time comes in, never from inside.** Functions that decide anything take the clock as an
+  argument, so every case is tested with a fake clock.
+- **Behaviour has a test.** A bug fix starts with the test that fails. Every validation message
+  has a test that triggers it.
+- **Nothing private in the repository.** Examples use made-up services (`backup`, `assistant`,
+  `ship`), `example.com` and loopback addresses. No real hostnames, addresses, domains, product
+  names or people, in code, tests, specs or commit messages.
+- **Heavy jobs are capped.** Build with `CARGO_BUILD_JOBS=4` and `nice`: the machine this is
+  written on runs other services. `scripts/check` sets the cap.
+
+## Commands
+
+```sh
+scripts/check                 # format, lint, tests, allowed dependencies, nothing private, release build
+scripts/check --fast          # the same without the release build
+cargo test -p beacon-core     # declarations, templates, rendering
+```
+
+The `beacon` command (`spec/clients.md`) is not built yet; until it is, `crates/core` is the only
+crate with code.
