@@ -109,7 +109,7 @@ const TOP: [&str; 18] = [
 const LIMITS: [&str; 1] = ["body_bytes"];
 const PRESENCE: [&str; 2] = ["heartbeat", "active_window"];
 const QUIET: [&str; 2] = ["start", "end"];
-const DELIVERY: [&str; 10] = [
+const DELIVERY: [&str; 9] = [
     "hold",
     "alert_hold",
     "flap_window",
@@ -119,13 +119,25 @@ const DELIVERY: [&str; 10] = [
     "snooze",
     "snapshot_stale_after",
     "late",
-    "give_up",
 ];
 const APNS: [&str; 6] = ["key_path", "key_id", "team_id", "topic", "retry", "give_up"];
 const INBOX: [&str; 3] = ["resolved_days", "page", "since_last_visit_items"];
 const TRAIL: [&str; 2] = ["open", "stale_after"];
 const SINK: [&str; 2] = ["trail_url", "source"];
 const AUTH: [&str; 1] = ["producer_token"];
+/// Every section's fields, to say where a field written in the wrong place belongs.
+const SECTIONS: [(&str, &[&str]); 10] = [
+    ("", &TOP),
+    ("limits", &LIMITS),
+    ("presence", &PRESENCE),
+    ("quiet_hours", &QUIET),
+    ("delivery", &DELIVERY),
+    ("apns", &APNS),
+    ("inbox", &INBOX),
+    ("trail", &TRAIL),
+    ("sink", &SINK),
+    ("auth", &AUTH),
+];
 
 /// Reads beacon.toml at `path`; None reads no file and keeps every default.
 pub fn load(path: Option<&Path>) -> Result<Config, Vec<Problem>> {
@@ -298,8 +310,6 @@ pub fn parse(text: &str) -> Result<Config, Vec<Problem>> {
         r.duration(&d, "delivery", "snapshot_stale_after", MINUTE, 7 * DAY),
     );
     set(&mut s.late, r.duration(&d, "delivery", "late", MINUTE, 7 * DAY));
-    // Older files put give_up under [delivery]; spec/config.md has it under [apns].
-    set(&mut s.give_up, r.duration(&d, "delivery", "give_up", MINUTE, DAY));
 
     let a = r.section(&table, "apns", &APNS);
     set(
@@ -425,7 +435,7 @@ pub fn parse(text: &str) -> Result<Config, Vec<Problem>> {
         );
     }
     if let Some(url) = r.string(&sink, "sink", "trail_url") {
-        if url.starts_with("http://") || url.starts_with("https://") {
+        if url.starts_with("http://") {
             c.sink = Some(Sink {
                 trail_url: url.trim_end_matches('/').to_string(),
                 source,
@@ -433,8 +443,8 @@ pub fn parse(text: &str) -> Result<Config, Vec<Problem>> {
         } else {
             r.problem(
                 "sink.trail_url",
-                format!("`{url}` is not an http:// or https:// URL"),
-                "write Trail's address, like \"http://127.0.0.1:8200\"",
+                format!("`{url}` is not an http:// URL"),
+                "write Trail's address, like \"http://127.0.0.1:8200\": the copy speaks plain HTTP, so run Trail beside Beacon",
             );
         }
     }
@@ -507,10 +517,16 @@ impl Reader {
             if known.contains(&key.as_str()) {
                 continue;
             }
-            let fix = match closest(key, known.iter().copied()) {
-                Some(near) => format!("did you mean `{near}`?"),
-                None if section.is_empty() => format!("the fields are {}", known.join(", ")),
-                None => format!("[{section}] has {}", known.join(", ")),
+            let elsewhere = SECTIONS
+                .iter()
+                .find(|(name, fields)| *name != section && fields.contains(&key.as_str()))
+                .map(|(name, _)| *name);
+            let fix = match (closest(key, known.iter().copied()), elsewhere) {
+                (_, Some("")) => format!("`{key}` goes at the top of the file, before any [section]"),
+                (_, Some(name)) => format!("`{key}` belongs under [{name}]"),
+                (Some(near), None) => format!("did you mean `{near}`?"),
+                (None, None) if section.is_empty() => format!("the fields are {}", known.join(", ")),
+                (None, None) => format!("[{section}] has {}", known.join(", ")),
             };
             self.problem(
                 &at(section, key),
@@ -814,7 +830,14 @@ producer_token = "0123456789abcdef0123"
             ("[inbox]\nresolved_days = 91", "outside 1 to 90"),
             ("[inbox]\npage = 0", "outside 1 to 200"),
             ("[trail]\nopen = \"http://x\"", "is not a link"),
-            ("[sink]\ntrail_url = \"127.0.0.1:8200\"", "http:// or https://"),
+            ("[sink]\ntrail_url = \"127.0.0.1:8200\"", "is not an http:// URL"),
+            (
+                "[sink]\ntrail_url = \"https://trail.example.com\"",
+                "is not an http:// URL",
+            ),
+            ("[delivery]\ngive_up = \"1h\"", "belongs under [apns]"),
+            ("hold = \"1s\"", "belongs under [delivery]"),
+            ("[delivery]\npush = false", "goes at the top of the file"),
             ("[sink]\nsource = \"Bea con\"", "not a Trail source name"),
             ("[auth]\nproducer_token = \"short\"", "at least 16"),
             ("limits = 3", "must be a table"),

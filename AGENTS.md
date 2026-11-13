@@ -10,7 +10,7 @@ before every commit.
 | Path | What it is |
 |---|---|
 | `crates/core` | Types and pure functions: classes, push levels, declarations (`kinds.toml`), templates and rendering, Beacon's own kinds, the alert and action lifecycles, the delivery decision, quiet hours. No sockets, no database. |
-| `crates/store` | SQLite: items, alerts, silences, presence, devices, the registry, push attempts. Each method applies a core transition and records its decision in one transaction; `crates/store/README.md` maps routes and jobs to methods. |
+| `crates/store` | SQLite: items, alerts, silences, presence, the registry, push attempts in `beacon.db`; devices and their tokens in `devices.db`. Each method applies a core transition and records its decision in one transaction; `crates/store/README.md` maps routes and jobs to methods. |
 | `crates/server` | The HTTP/1.1 server on `std::net`, the API routes, the background jobs. |
 | `crates/apns` | Apple push: provider tokens, HTTP/2, payloads, retries. The only crate with reqwest, ring and base64. |
 | `crates/codegen` | `beacon gen`: typed emitters for Python and TypeScript. Each generated file is a client below plus one function per kind. |
@@ -52,13 +52,16 @@ before every commit.
 ## Commands
 
 ```sh
-scripts/check                 # format, lint, tests, allowed dependencies, nothing private, client suites, release build
+scripts/check                 # format, lint, tests, allowed dependencies, nothing private, client suites, release build, binary size, idle memory
 scripts/check --fast          # Rust only: no client suites, no pyright/tsc over generated code, no release build
 cargo test -p beacon-core     # declarations, templates, rendering, the decision, the lifecycles
 cargo test -p beacon-store    # the store against SQLite, with a fake clock
+cargo test -p beacon-server   # the API over HTTP with a fake clock and a fake Apple
+cargo test -p beacon-apns     # provider tokens, payloads, retries, against a fake transport
 cargo test -p beacon-codegen  # generated code; runs pyright and tsc through npx when it is on PATH
 BEACON_BLESS=1 cargo test -p beacon-codegen   # rewrite clients/*/tests/gen after changing a client or the generator
 ```
 
-`beacon serve` says it is not built yet until `crates/server` provides `beacon_server::run`
-(`crates/cli/src/serve.rs` is the one place to wire it).
+`beacon serve --config beacon.toml` runs `beacon_server::run` (`crates/cli/src/serve.rs`). The
+server's tests (`cargo test -p beacon-server`) start it on an ephemeral port with a fake clock and a
+fake Apple (`crates/server/tests/http.rs`); nothing in the tests calls Apple.

@@ -70,6 +70,10 @@ Beacon has one user. Its rules keep other web pages and other machines from acti
   and passes.
 - **Local**: the peer address is loopback, the request has no `X-Forwarded-For` and no `Forwarded`
   header (so it didn't come through the proxy), and `Content-Type: application/json`.
+- A `DELETE` has no body, so it needs no `Content-Type`; its other rules still hold. (A browser
+  can't send a cross-origin `DELETE` without asking first, and Beacon never says yes.)
+- A `producer` token is compared whole; with `auth.producer_token` unset, only `local` requests
+  may produce.
 - A request that fails its rule gets `403` with a `fix` naming the rule.
 
 ## Routes
@@ -186,14 +190,17 @@ Every kind Beacon knows, built-in ones included, sorted by name. Sends an `ETag`
       "actions": [{"id": "acknowledge", "label": "Acknowledge", "url": null}, {"id": "silence_1h", "label": "Silence 1h", "url": null}],
       "time_bound": false,
       "context": false,
-      "one_off": false
+      "one_off": false,
+      "categories": []
     }
   ]
 }
 ```
 
 The iPhone app registers one notification category per kind from this (`spec/apns.md`,
-"Categories").
+"Categories"). `categories` lists the app's own categories a kind's pushes carry instead (the
+first by default); the app registers those itself. A custom action's `url` is its template, as
+declared.
 
 ## Producers
 
@@ -222,6 +229,7 @@ One notification of a declared kind.
 | `state` | string | `"firing"` for an alert, `"open"` for an action | Alert: `"firing"` or `"resolved"`. Action: `"open"` or `"resolved"`. Update and record: must be absent (`400`). |
 | `context` | string or null | null | Required (1 to 128 characters) when the kind declares `context = true`; must be null or absent otherwise (`400`). Like `assistant:thread:42`. |
 | `url` | string or null | the kind's rendered `open` | Overrides the link. Starts with `/` or `https://`, at most 1024 characters. |
+| `category` | string or null | the kind's first `categories`, else the kind's name | One of the kind's declared `categories` (`spec/declarations.md`): the `aps.category` of this item's pushes, so the app shows that category's buttons. Any other value is `422`, with the closest declared one in the fix. Kept with the item; a later event for the same alert or action may change it. |
 
 With `"state": "resolved"`, `facts` and `slots` may be left out: the item keeps its latest ones.
 When sent, they are checked and replace them.
@@ -293,7 +301,7 @@ limit) posts one after each check, so a restart or a missed post is put right at
 | `stale_after` | duration | `[delivery] snapshot_stale_after` (`15m`) | `1m` to `7d`. With no snapshot for this long, the source becomes unobserved. |
 | `sent_at` | integer ms | none | When the source made it. If sent: `409` when older than the newest snapshot already taken from this source, more than 5 minutes old, or more than 1 minute in the future. |
 | `kinds` | list of kind names | every `alert` and `action` kind of the source | The kinds this snapshot is complete for. Each must be an alert or action kind of the source (`422`). |
-| `firing` | list | `[]` | Entries `{kind, key, facts, slots, labels, context, url}`, each as in `POST /v1/events` (no `state`). Every `kind` must be in `kinds`; each `(kind, key)` at most once (`400`). |
+| `firing` | list | `[]` | Entries `{kind, key, facts, slots, labels, context, url, category}`, each as in `POST /v1/events` (no `state`). Every `kind` must be in `kinds`; each `(kind, key)` at most once (`400`). |
 
 With `observed: true`, in one transaction:
 
@@ -338,8 +346,10 @@ else in Trail changes. Local access only. Every item it makes belongs to source 
 - Trail's keys and notice ids are used as item keys as they are (up to 200 and 256 characters, any
   text): the key rule of `POST /v1/events` doesn't apply to them.
 - Each item's slots are Trail's `title` (cut to 40) and `body` (cut to 150). Its labels are
-  Trail's `labels`, plus `trail_source` (Trail's `source`) and `trail_alert` (Trail's `alert`).
-  Its link is `[trail] open`.
+  `trail_source` (Trail's `source`) and `trail_alert` (Trail's `alert`), then Trail's `labels`:
+  a label whose name isn't snake_case is dropped, values are cut to 128 characters, and at most 16
+  are kept. A notice's labels are the same. Its link is `[trail] open`.
+- Trail listing one key twice in a snapshot counts once.
 - A snapshot also observes source `trail`, with `stale_after` = `[trail] stale_after` (`11m`:
   Trail re-posts every 5 minutes). If Trail stops posting, `trail` becomes unobserved and its
   alerts are muted.
@@ -612,7 +622,8 @@ The item, plus:
 
 A held push of an item that leaves `open` is suppressed (`closed`).
 
-`200` `{"item": Item, "silence": Silence or null}`. Pressing an action whose effect already holds
+`200` `{"item": Item, "silence": Silence or null}`: `silence` is the one `silence_1h` opened, with
+its `until`, so the client can say until when. Pressing an action whose effect already holds
 (done on a done item, snooze on a snoozed one, acknowledge on an acknowledged alert or a resolved
 one-off; a second tap or a notification button that fired twice) is `200` with
 the item unchanged. An action the item doesn't offer now is `409`, with the item's current actions
@@ -625,7 +636,8 @@ in the fix. `404` for an unknown item.
 ```
 
 or `{"ids": [4182, 4177]}`: exactly one of the two. `through` marks every item with an id up to
-it; `ids` at most 500 items. `200` `{"ok": true, "seen": 3}`: how many were newly marked. A held
+it; `ids` at most 500 items. Optional `"client"`: `"web"`, `"ios"` or `"api"` (default), recorded in
+each item's history. `200` `{"ok": true, "seen": 3}`: how many were newly marked. A held
 push of a newly seen item is suppressed (`seen`). When a client marks seen is in
 `spec/delivery.md`, "Seen and done".
 
@@ -656,8 +668,8 @@ A silence mutes pushes for what it matches until it ends. Items are still record
 
 #### `GET /v1/silences`
 
-`{"silences": [Silence]}`: the active ones, soonest-ending first. `?all=1` adds those that ended in
-the last 7 days, newest first.
+`{"silences": [Silence]}`: the active ones, soonest-ending first. `?all=1` (parameter `all`) adds
+those that ended in the last 7 days, newest first.
 
 #### `POST /v1/silences`
 
@@ -674,13 +686,19 @@ the last 7 days, newest first.
 
 `201` with the Silence.
 
+**Idempotency-Key** (header, optional), as for `POST /v1/events`: the same key and body within
+`idempotency` (24 h) answers the silence the first request opened, and opens no other; the same
+key with another body is `409`. The body is compared as sent, so a retried `"for": "30m"` matches
+even though its end would now be later. Keys for silences are their own scope, apart from every
+source's.
+
 A deploy script opens one before it deploys and moves its end after:
 
 ```sh
-id=$(curl -s -X POST -H 'Content-Type: application/json' http://127.0.0.1:8300/v1/silences \
+id=$(curl -s -X POST -H 'Content-Type: application/json' http://127.0.0.1:8210/v1/silences \
   -d '{"match": {"labels": {"service": "dashboard"}}, "for": "30m", "reason": "Deploying dashboard"}' | jq .id)
 # … deploy …
-curl -s -X PATCH -H 'Content-Type: application/json' "http://127.0.0.1:8300/v1/silences/$id" -d '{"for": "5m"}'
+curl -s -X PATCH -H 'Content-Type: application/json' "http://127.0.0.1:8210/v1/silences/$id" -d '{"for": "5m"}'
 ```
 
 (`beacon silence add` and `beacon silence extend` do the same, `spec/clients.md`.)
@@ -721,7 +739,9 @@ Adds the device, or updates its environment and name. The iPhone app sends this 
 {"devices": [{"device": "…3f9a1c", "environment": "production", "name": "iPhone", "created": 1794000000000, "updated": 1794571200000, "last_push": 1794571201000, "last_status": "accepted"}]}
 ```
 
-Tokens are never returned or logged whole: `device` is the last six characters.
+Tokens are never returned or logged whole: `device` is the last six characters. They are kept
+only in `devices.db` (`spec/config.md`, "Storage"), never in `beacon.db`, so the main database can
+be shared read-only.
 
 #### `DELETE /v1/devices/{token}`
 

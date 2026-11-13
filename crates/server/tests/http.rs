@@ -1,6 +1,9 @@
 //! The server over HTTP: started on an ephemeral port with a temporary data folder, a fake clock
 //! and a fake Apple, and driven the way producers and the apps drive it.
 
+// The helpers below are test code too, but outside #[test] functions clippy sees them as code.
+#![allow(clippy::unwrap_used, clippy::panic)]
+
 use beacon_apns::{Environment, Response, Transport};
 use beacon_core::config;
 use beacon_core::duration::{HOUR, MINUTE, SECOND};

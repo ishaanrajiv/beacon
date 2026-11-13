@@ -150,10 +150,18 @@ fn an_unknown_command_or_option_is_a_usage_error() {
 }
 
 #[test]
-fn serve_says_it_is_not_built_yet() {
-    let (code, text) = refused(&["serve", "--config", "beacon.toml"]);
+fn serve_refuses_a_config_it_cant_use() {
+    let (code, text) = refused(&["serve", "--config", "/nonexistent/beacon.toml"]);
     assert_eq!(code, 1);
-    assert!(text.contains("not built yet"), "{text}");
+    assert!(text.contains("can't read it"), "{text}");
+    let dir = std::env::temp_dir().join(format!("beacon-cli-serve-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("beacon.toml");
+    std::fs::write(&path, "lisen = \"127.0.0.1:1\"\n").unwrap();
+    let (code, text) = refused(&["serve", "--config", path.to_str().unwrap()]);
+    assert_eq!(code, 1);
+    assert!(text.contains("did you mean `listen`?"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
