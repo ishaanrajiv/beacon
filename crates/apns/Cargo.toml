@@ -11,3 +11,8 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+beacon-core.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+ring.workspace = true
+base64.workspace = true

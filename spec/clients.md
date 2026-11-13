@@ -14,7 +14,7 @@ client followed by the kinds' functions: `beacon gen` copies everything between 
 `--- runtime start ---` and `--- runtime end ---` markers of `clients/python/beacon_client.py` or
 `clients/node/beacon_client.ts` into the file. Those two files are the clients: tested on their
 own against a fake Beacon, and usable alone (`send(kind, …)`, `entry`, `snapshot`, `unobserved`
-take any kind by name, unchecked until Beacon answers). The generator is `crates/codegen`;
+take any kind by name, and `send` and `entry` any `category`, unchecked until Beacon answers). The generator is `crates/codegen`;
 `examples/homelab-ish/` holds the declarations its tests generate from, and
 `clients/*/tests/gen/` the files generated from them.
 
@@ -29,7 +29,7 @@ take any kind by name, unchecked until Beacon answers). The generator is `crates
 | Never throws | A failure returns a result with `ok` false and a `problem` string; it never raises into application code, unless strict mode is on. |
 | Strict mode | For tests: `BEACON_STRICT=1`, or `strict` in `configure`. A result that isn't `ok` raises `BeaconError` (Python) or rejects (TypeScript). |
 | Off switch | `BEACON_DISABLED=1`: every call returns `ok` at once and sends nothing. |
-| Where | `BEACON_URL` (default `http://127.0.0.1:8300`); `BEACON_TOKEN`, when set, is sent as `Authorization: Bearer` (the server's `auth.producer_token`). `configure()` overrides each. |
+| Where | `BEACON_URL` (default `http://127.0.0.1:8210`); `BEACON_TOKEN`, when set, is sent as `Authorization: Bearer` (the server's `auth.producer_token`). `configure()` overrides each. |
 | Up to date | The file's first three lines name the source and the generator's version, say not to edit it, and give a hash of the declarations' JSON form (`declarations: fnv1a64 <16 hex digits>`; FNV-1a over the compact JSON `beacon publish` sends, so comments and layout don't change it). `beacon gen --check` fails when the file differs from what the folder would generate now, and says whether the declarations changed. |
 
 The result (`Sent`):
@@ -56,7 +56,7 @@ Fact types in the generated signatures:
 Names: a kind's function is its name with `.` and `-` turned into `_` in Python
 (`backup_failed`), and camelCase in TypeScript (`backupFailed`, `assistantTaskResult`). Fact and
 slot argument names are exactly the declared names, in both (declarations can't use `key`,
-`labels`, `url` or `context`, the emitters' own arguments). `beacon gen`, `check` and `publish`
+`labels`, `url`, `context` or `category`, the emitters' own arguments). `beacon gen`, `check` and `publish`
 refuse a folder where two kinds would get the same function name, counting the `_resolved` and
 `_entry` companions (`ship.down_resolved` beside an alert `ship.down`), and a fact or slot named
 after a Python keyword (`from`, `class`), which can't be an argument.
@@ -70,7 +70,7 @@ after a Python keyword (`from`, `class`), which can't be an argument.
 from __future__ import annotations
 
 # (the runtime of clients/python/beacon_client.py: imports, then)
-DEFAULT_URL = "http://127.0.0.1:8300"
+DEFAULT_URL = "http://127.0.0.1:8210"
 
 class BeaconError(Exception): ...
 
@@ -126,6 +126,25 @@ def unobserved(reason: str, *, stale_after: str | None = None) -> Sent: ...
 - A kind with `context = true` takes a required `context: str`, in its function, its `_entry` and
   its `_resolved` (`POST /v1/events` requires it whatever the state).
 - `url` overrides the kind's link; it is left out of a kind's signature when the kind has no `open`.
+- A kind that declares `categories` (`spec/declarations.md`) takes an optional `category`, typed as
+  the declared names, in its function and its `_entry` (not its `_resolved`). It is sent as the
+  event's or entry's top-level `category` only when given; left out, Beacon uses the first
+  declared. A kind without `categories` has no `category` argument, so naming one is a type error:
+
+  ```python
+  # categories = ["PERMISSION", "PERMISSION_DESTRUCTIVE"]
+  def assistant_permission(
+      *,
+      thread: str,
+      command: str,
+      tool: str,
+      context: str,
+      key: str = "",
+      labels: Mapping[str, str] | None = None,
+      url: str | None = None,
+      category: Literal["PERMISSION", "PERMISSION_DESTRUCTIVE"] | None = None,
+  ) -> Sent: ...
+  ```
 - An optional (`?`) fact is an argument defaulting to `None`, and isn't sent when left out.
 - `snapshot` posts `POST /v1/snapshots` for `SOURCE` with `observed: true` and `sent_at` (the
   moment of the call, the same on every retry); `unobserved` posts one with `observed: false` and
@@ -142,7 +161,7 @@ def unobserved(reason: str, *, stale_after: str | None = None) -> Sent: ...
 // declarations: fnv1a64 6867d21600e772ba
 
 // (the runtime of clients/node/beacon_client.ts:)
-export const DEFAULT_URL = "http://127.0.0.1:8300";
+export const DEFAULT_URL = "http://127.0.0.1:8210";
 export interface Sent { ok: boolean; status: number; outcome: string | null; item: number | null; problem: string | null }
 export interface Entry { readonly kind: string; readonly body: Readonly<Record<string, unknown>> }
 export class BeaconError extends Error {}
@@ -158,6 +177,9 @@ export function backupFailedResolved(args: { key?: string } = {}): Promise<Sent>
 export function backupFailedEntry(args: { last_ok: number | Date; reason: string; url?: string } & Common): Entry;
 export function backupFinished(args: { size: string; took: number } & Common): Promise<Sent>;
 
+// A kind with categories = ["PERMISSION", "PERMISSION_DESTRUCTIVE"] (from `assistant`):
+export function assistantPermission(args: { thread: string; command: string; tool: string; context: string; url?: string; category?: "PERMISSION" | "PERMISSION_DESTRUCTIVE" } & Common): Promise<Sent>;
+
 export type SnapshotKind = "backup.failed" | "backup.space" | "backup.stale";
 export function snapshot(firing: readonly Entry[], options: { kinds?: readonly SnapshotKind[]; stale_after?: string } = {}): Promise<Sent>;
 export function unobserved(reason: string, options: { stale_after?: string } = {}): Promise<Sent>;
@@ -168,7 +190,8 @@ It type-checks under `tsc --strict --noEmit` with `noUnusedLocals`, `noUnusedPar
 on (it needs `lib: ["dom"]` or `@types/node` for `fetch`), reads `process.env` when there is one,
 and uses `AbortSignal.timeout` for the 5 s limit. An optional fact is an optional property; a kind
 whose function would take only `Common` can be called with no argument. The argument object is an
-object literal at the call, so an undeclared fact or slot is an excess-property error.
+object literal at the call, so an undeclared fact or slot is an excess-property error, and so is a
+`category` on a kind that declares no categories.
 
 ## The `beacon` command
 
@@ -186,7 +209,7 @@ beacon silence end <id> [--server URL]
 beacon silence list [--all] [--server URL] [--json]
 ```
 
-`--server` defaults to `BEACON_URL`, else `http://127.0.0.1:8300`; `BEACON_TOKEN` is sent as for
+`--server` defaults to `BEACON_URL`, else `http://127.0.0.1:8210`; `BEACON_TOKEN` is sent as for
 the emitters.
 
 | Command | Does |

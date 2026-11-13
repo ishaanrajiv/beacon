@@ -138,6 +138,34 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(body["facts"], {"thread": "42"})
         self.assertNotIn("labels", body)
 
+    def test_a_category_is_sent_only_when_given(self) -> None:
+        thread, tool, command, context = "42", "shell", "rm -r old-logs", "assistant:thread:42"
+        assistant_kinds.assistant_permission(
+            thread=thread, tool=tool, command=command, context=context, category="PERMISSION_DESTRUCTIVE"
+        )
+        self.assertEqual(self.beacon.body()["category"], "PERMISSION_DESTRUCTIVE")
+        assistant_kinds.assistant_permission(thread=thread, tool=tool, command=command, context=context)
+        self.assertNotIn("category", self.beacon.body())
+        entry = assistant_kinds.assistant_permission_entry(
+            thread=thread, tool=tool, command=command, context=context, category="PERMISSION"
+        )
+        assistant_kinds.snapshot([entry])
+        self.assertEqual(
+            self.beacon.body()["firing"],
+            [
+                {
+                    "kind": "assistant.permission",
+                    "key": "",
+                    "facts": {"thread": "42"},
+                    "slots": {"command": "rm -r old-logs", "tool": "shell"},
+                    "context": "assistant:thread:42",
+                    "category": "PERMISSION",
+                }
+            ],
+        )
+        beacon_client.send("assistant.permission", category="PERMISSION")
+        self.assertEqual(self.beacon.body()["category"], "PERMISSION")
+
     def test_a_snapshot_lists_its_entries(self) -> None:
         self.beacon.answers.append((200, {"ok": True, "opened": [4183], "observed": True}))
         sent = backup_kinds.snapshot(
@@ -230,7 +258,7 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(self.beacon.requests, [])
 
     def test_the_default_address(self) -> None:
-        self.assertEqual(beacon_client.DEFAULT_URL, "http://127.0.0.1:8300")
+        self.assertEqual(beacon_client.DEFAULT_URL, "http://127.0.0.1:8210")
         self.assertEqual(backup_kinds.DEFAULT_URL, beacon_client.DEFAULT_URL)
 
     def test_the_standalone_client_sends_any_kind(self) -> None:

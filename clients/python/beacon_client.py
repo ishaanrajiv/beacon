@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Mapping, Sequence, cast
 
-DEFAULT_URL = "http://127.0.0.1:8300"
+DEFAULT_URL = "http://127.0.0.1:8210"
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _MS = timedelta(milliseconds=1)
 
@@ -123,6 +123,7 @@ class _Runtime:
         labels: Mapping[str, str] | None,
         context: str | None,
         url: str | None,
+        category: str | None,
     ) -> dict[str, object]:
         body: dict[str, object] = {"kind": kind, "key": key}
         if facts is not None:
@@ -135,6 +136,8 @@ class _Runtime:
             body["context"] = context
         if url is not None:
             body["url"] = url
+        if category is not None:
+            body["category"] = category
         return body
 
     def event(
@@ -147,9 +150,12 @@ class _Runtime:
         labels: Mapping[str, str] | None = None,
         context: str | None = None,
         url: str | None = None,
+        category: str | None = None,
         state: Literal["resolved"] | None = None,
     ) -> Sent:
-        body = self.event_body(kind, key=key, facts=facts, slots=slots, labels=labels, context=context, url=url)
+        body = self.event_body(
+            kind, key=key, facts=facts, slots=slots, labels=labels, context=context, url=url, category=category
+        )
         if state is not None:
             body["state"] = state
         return self.post("/v1/events", body)
@@ -164,8 +170,11 @@ class _Runtime:
         labels: Mapping[str, str] | None = None,
         context: str | None = None,
         url: str | None = None,
+        category: str | None = None,
     ) -> Entry:
-        body = self.event_body(kind, key=key, facts=facts, slots=slots, labels=labels, context=context, url=url)
+        body = self.event_body(
+            kind, key=key, facts=facts, slots=slots, labels=labels, context=context, url=url, category=category
+        )
         return Entry(kind=kind, body=body)
 
     def snapshot(
@@ -267,6 +276,7 @@ def send(
     labels: Mapping[str, str] | None = None,
     context: str | None = None,
     url: str | None = None,
+    category: str | None = None,
     resolve: bool = False,
 ) -> Sent:
     """One `POST /v1/events` for any kind. Prefer the typed functions `beacon gen` writes."""
@@ -278,6 +288,7 @@ def send(
         labels=labels,
         context=context,
         url=url,
+        category=category,
         state="resolved" if resolve else None,
     )
 
@@ -291,9 +302,12 @@ def entry(
     labels: Mapping[str, str] | None = None,
     context: str | None = None,
     url: str | None = None,
+    category: str | None = None,
 ) -> Entry:
     """One firing entry for `snapshot`."""
-    return _beacon.entry(kind, key=key, facts=facts, slots=slots, labels=labels, context=context, url=url)
+    return _beacon.entry(
+        kind, key=key, facts=facts, slots=slots, labels=labels, context=context, url=url, category=category
+    )
 
 
 def snapshot(

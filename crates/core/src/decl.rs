@@ -53,7 +53,9 @@ pub const RECOVERED_BODY_DEFAULT: &str = "Lasted {lasted}.";
 /// The placeholder for how long an alert was open, usable in `recovered` and `recovered_body` only.
 pub const LASTED: &str = "lasted";
 /// Names a fact or slot can't take: the generated emitters' own arguments (`spec/clients.md`).
-pub const RESERVED_VALUE_NAMES: [&str; 4] = ["key", "labels", "url", "context"];
+pub const RESERVED_VALUE_NAMES: [&str; 5] = ["key", "labels", "url", "context", "category"];
+/// Most notification categories a kind declares.
+pub const CATEGORIES_MAX: usize = 4;
 
 // ---------- the typed model ----------
 
@@ -105,6 +107,10 @@ pub struct Kind {
     pub context: bool,
     #[serde(default)]
     pub one_off: bool,
+    /// The app's notification categories this kind's pushes may carry; the first is the default.
+    /// Empty: the kind's name is the category.
+    #[serde(default)]
+    pub categories: Vec<String>,
 }
 
 fn default_throttle() -> Option<Duration> {
@@ -266,7 +272,7 @@ impl Declarations {
 // ---------- reading the TOML ----------
 
 const FILE_FIELDS: [&str; 4] = ["source", "name", "icon", "kinds"];
-const KIND_FIELDS: [&str; 17] = [
+const KIND_FIELDS: [&str; 18] = [
     "class",
     "push",
     "description",
@@ -284,6 +290,7 @@ const KIND_FIELDS: [&str; 17] = [
     "recovered_body",
     "context",
     "one_off",
+    "categories",
 ];
 const CUSTOM_ACTION_FIELDS: [&str; 3] = ["id", "label", "url"];
 
@@ -519,6 +526,18 @@ fn read_kind(at: &str, fields: &toml::Table, problems: &mut Vec<Problem>) -> Opt
         }
     }
 
+    let mut categories = Vec::new();
+    for (i, value) in array(at, fields, "categories", problems).iter().enumerate() {
+        match value.as_str() {
+            Some(text) => categories.push(text.to_string()),
+            None => problems.push(Problem::new(
+                format!("{at}.categories[{i}]"),
+                "a category must be a string",
+                "write names the app registered, like categories = [\"APPROVAL\"]",
+            )),
+        }
+    }
+
     let throttle = match string(at, fields, "throttle", problems).as_deref() {
         None => default_throttle(),
         Some("none") => None,
@@ -562,6 +581,7 @@ fn read_kind(at: &str, fields: &toml::Table, problems: &mut Vec<Problem>) -> Opt
         recovered_body,
         context,
         one_off,
+        categories,
     })
 }
 
@@ -958,6 +978,7 @@ fn check_kind(decl: &Declarations, name: &str, kind: &Kind, check: &Check, probl
         ));
     }
     check_repeat(&at, kind, problems);
+    check_categories(&at, kind, problems);
     if let Some(throttle) = kind.throttle
         && throttle.ms() < THROTTLE_MIN
     {
@@ -1293,6 +1314,60 @@ fn check_actions(at: &str, kind: &Kind, used: &mut BTreeSet<String>, problems: &
                     check_link(&format!("{here}.url"), url, problems);
                 }
             }
+        }
+    }
+}
+
+/// Whether `text` can be a notification category: `^[A-Z][A-Z0-9_]{0,39}$`.
+pub fn is_category(text: &str) -> bool {
+    let mut bytes = text.bytes();
+    bytes.next().is_some_and(|b| b.is_ascii_uppercase())
+        && text.len() <= 40
+        && bytes.all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// The category a push of `kind` (named `name`) carries: `chosen` when the event picked one,
+/// else the first declared, else the kind's name.
+pub fn push_category<'a>(name: &'a str, kind: &'a Kind, chosen: Option<&'a str>) -> &'a str {
+    chosen
+        .or_else(|| kind.categories.first().map(String::as_str))
+        .unwrap_or(name)
+}
+
+fn check_categories(at: &str, kind: &Kind, problems: &mut Vec<Problem>) {
+    if kind.categories.is_empty() {
+        return;
+    }
+    let here = format!("{at}.categories");
+    if kind.class == Class::Record {
+        problems.push(Problem::new(
+            &here,
+            "a record never pushes, so it has no notification category",
+            "remove categories",
+        ));
+        return;
+    }
+    if kind.categories.len() > CATEGORIES_MAX {
+        problems.push(Problem::new(
+            &here,
+            format!("{} categories; at most {CATEGORIES_MAX}", kind.categories.len()),
+            "keep the ones the app registered for this kind",
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for (i, name) in kind.categories.iter().enumerate() {
+        if !is_category(name) {
+            problems.push(Problem::new(
+                format!("{here}[{i}]"),
+                format!("`{name}` is not a category name"),
+                "use 1 to 40 of A-Z, 0-9 and _, starting with a letter, like `APPROVAL`",
+            ));
+        } else if !seen.insert(name.as_str()) {
+            problems.push(Problem::new(
+                format!("{here}[{i}]"),
+                format!("`{name}` is listed twice"),
+                "list each category once",
+            ));
         }
     }
 }

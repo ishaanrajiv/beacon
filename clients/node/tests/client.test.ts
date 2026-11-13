@@ -95,6 +95,27 @@ test("resolving sends the state and no values", async () => {
   assert.equal(seen[2]?.body.context, "assistant:thread:42");
 });
 
+test("a category is sent only when given", async () => {
+  const args = { thread: "42", tool: "shell", command: "rm -r old-logs", context: "assistant:thread:42" };
+  await assistant.assistantPermission({ ...args, category: "PERMISSION_DESTRUCTIVE" });
+  assert.equal(seen[0]?.body.category, "PERMISSION_DESTRUCTIVE");
+  await assistant.assistantPermission(args);
+  assert.equal("category" in (seen[1]?.body ?? {}), false);
+  await assistant.snapshot([assistant.assistantPermissionEntry({ ...args, category: "PERMISSION" })]);
+  assert.deepEqual(seen[2]?.body.firing, [
+    {
+      kind: "assistant.permission",
+      key: "",
+      facts: { thread: "42" },
+      slots: { command: "rm -r old-logs", tool: "shell" },
+      context: "assistant:thread:42",
+      category: "PERMISSION",
+    },
+  ]);
+  await client.send("assistant.permission", { category: "PERMISSION" });
+  assert.equal(seen[3]?.body.category, "PERMISSION");
+});
+
 test("an alert with only a slot", async () => {
   await assistant.assistantUnavailable({ cause: "The tools are offline" });
   assert.deepEqual(seen[0]?.body.slots, { cause: "The tools are offline" });
@@ -196,6 +217,6 @@ test("disabled sends nothing", async () => {
 });
 
 test("the default address", () => {
-  assert.equal(client.DEFAULT_URL, "http://127.0.0.1:8300");
+  assert.equal(client.DEFAULT_URL, "http://127.0.0.1:8210");
   assert.equal(backup.DEFAULT_URL, client.DEFAULT_URL);
 });

@@ -11,7 +11,7 @@ use beacon_core::builtin;
 use beacon_core::delivery::{self, CatchUpPlan, Held, PRESENCE_KEPT, SILENCE_KEPT};
 use beacon_core::duration::DAY;
 use beacon_core::lifecycle::Input;
-use beacon_core::model::{PushLevel, PushReason, PushStatus, Trigger};
+use beacon_core::model::{Class, PushLevel, PushReason, PushStatus, Trigger};
 use beacon_core::quiet::local_day;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -56,6 +56,8 @@ pub struct PushJob {
     pub item: i64,
     /// `item`, or `recovery` (passive, no category).
     pub purpose: String,
+    /// The item's class: the push's relevance score.
+    pub class: Class,
     pub title: String,
     pub body: String,
     pub level: PushLevel,
@@ -203,13 +205,13 @@ impl Store {
         let give_up = self.settings().give_up;
         self.read(|tx, _| {
             let devices: Vec<(String, String)> = {
-                let mut stmt = tx.prepare_cached("SELECT token, environment FROM devices ORDER BY updated DESC")?;
+                let mut stmt = tx.prepare_cached("SELECT token, environment FROM dev.devices ORDER BY updated DESC")?;
                 let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
                 rows.collect::<rusqlite::Result<_>>()?
             };
             let mut stmt = tx.prepare_cached(
                 "SELECT id, item, purpose, title, body, level, collapse_id, category, thread, url, data, queued_at, \
-                 attempts FROM pushes WHERE status = 'queued' AND next_attempt <= ?1 AND queued_at + ?2 > ?1 ORDER BY id",
+                 attempts, (SELECT class FROM items WHERE items.id = pushes.item) FROM pushes WHERE status = 'queued' AND next_attempt <= ?1 AND queued_at + ?2 > ?1 ORDER BY id",
             )?;
             let rows = stmt.query_map(params![now, give_up], |r| {
                 Ok((
@@ -226,16 +228,32 @@ impl Store {
                     r.get::<_, String>(10)?,
                     r.get::<_, i64>(11)?,
                     r.get::<_, i64>(12)?,
+                    r.get::<_, Option<String>>(13)?,
                 ))
             })?;
             let mut out = Vec::new();
             for row in rows {
-                let (id, item, purpose, title, body, level, collapse_id, category, thread, url, data, queued_at, attempts) =
-                    row?;
+                let (
+                    id,
+                    item,
+                    purpose,
+                    title,
+                    body,
+                    level,
+                    collapse_id,
+                    category,
+                    thread,
+                    url,
+                    data,
+                    queued_at,
+                    attempts,
+                    class,
+                ) = row?;
                 out.push(PushJob {
                     id,
                     item,
                     purpose,
+                    class: class.map_or(Ok(Class::Update), |c| from_word(&c))?,
                     title,
                     body,
                     level: from_word(&level)?,
@@ -272,14 +290,16 @@ impl Store {
                         push,
                         item,
                         now,
-                        attempt.token,
+                        crate::reads::last_six_raw(&attempt.token),
                         attempt.environment,
                         count + 1,
                         attempt.status,
                         attempt.reason
                     ])?;
                 w.conn
-                    .prepare_cached("UPDATE devices SET last_push = ?2, last_status = ?3 WHERE token = ?1")?
+                    .prepare_cached(
+                        "UPDATE dev.devices SET last_push = ?2, last_status = ?3 WHERE token = ?1",
+                    )?
                     .execute(params![attempt.token, now, attempt.status])?;
             }
             match next {
@@ -484,5 +504,60 @@ impl Tx<'_, '_> {
             self.version()?;
         }
         Ok(deleted as u64)
+    }
+}
+
+/// One item change for the copy to Trail (`spec/config.md`, "The copy to Trail"): a history
+/// step, with the item as it is now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SinkRecord {
+    /// The history row's id: the event's id is `beacon-<id>`, and the cursor moves past it.
+    pub id: i64,
+    pub at: i64,
+    pub item: i64,
+    pub what: String,
+    pub kind: String,
+    pub class: String,
+    pub source: String,
+    pub state: Option<String>,
+    pub title: String,
+    pub push_level: String,
+    pub push_status: String,
+    pub push_reason: Option<String>,
+}
+
+impl Store {
+    /// Item changes after the copy's cursor, oldest first, at most `limit`.
+    pub fn sink_batch(&self, limit: u32) -> Result<Vec<SinkRecord>> {
+        self.read(|tx, _| {
+            let after = meta(tx, "sink_cursor")?.unwrap_or(0);
+            let mut stmt = tx.prepare_cached(
+                "SELECT h.id, h.at, h.item, h.what, i.kind, i.class, i.source, i.state, i.title, i.push_level, \
+                 i.push_status, i.push_reason FROM history h JOIN items i ON i.id = h.item WHERE h.id > ?1 \
+                 ORDER BY h.id LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![after, limit], |r| {
+                Ok(SinkRecord {
+                    id: r.get(0)?,
+                    at: r.get(1)?,
+                    item: r.get(2)?,
+                    what: r.get(3)?,
+                    kind: r.get(4)?,
+                    class: r.get(5)?,
+                    source: r.get(6)?,
+                    state: r.get(7)?,
+                    title: r.get(8)?,
+                    push_level: r.get(9)?,
+                    push_status: r.get(10)?,
+                    push_reason: r.get(11)?,
+                })
+            })?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    /// Moves the copy's cursor past history row `id`, once Trail has taken it.
+    pub fn sink_done(&self, id: i64, now: i64) -> Result<()> {
+        self.write(now, |w| set_meta(w.conn, "sink_cursor", Some(id)))
     }
 }

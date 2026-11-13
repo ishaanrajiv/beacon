@@ -5,8 +5,7 @@
 #   scripts/check --fast   Rust only: format, lint, tests, dependencies, nothing private; skips the
 #                          client suites, the type checks of generated code and the release build
 #
-# Each step that fails says what to run to fix it. The full check will grow the steps Trail's has
-# (binary size, idle memory, end to end) as those crates land.
+# Each step that fails says what to run to fix it.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"   # keep builds off every core
@@ -15,6 +14,10 @@ fast=0
 [ "${1:-}" = "--fast" ] && fast=1
 # crates/codegen's tests run pyright and tsc (through npx) over generated code; --fast skips them.
 [ "$fast" = 1 ] && export BEACON_SKIP_TYPECHECK=1
+
+# The budgets. Raising one is a decision: say why in the commit.
+MAX_BINARY_BYTES=12000000       # the release `beacon` binary (8.4 MB when this was set)
+MAX_IDLE_RSS_KB=20000           # a server with an APNs key and nothing to do (about 9,800 kB when this was set)
 
 # The dependency list. Raising it is a decision: say why in the commit.
 ALLOWED="serde serde_json toml rusqlite ureq jiff getrandom lexopt reqwest ring base64"
@@ -80,11 +83,41 @@ step "nothing private" "replace the address with an example one (127.0.0.1, exam
 python_client() { (cd clients/python && python3 -m unittest discover -s tests && npx --yes pyright@1.1.414); }
 node_client() { (cd clients/node && node --test tests/ && npx --yes -p typescript@5 tsc -p .); }
 
+binary_size() {
+  cargo build -q --release --locked -p beacon || return 1
+  local bytes; bytes="$(stat -c %s target/release/beacon)"
+  echo "target/release/beacon is $bytes bytes (budget $MAX_BINARY_BYTES)"
+  [ "$bytes" -le "$MAX_BINARY_BYTES" ]
+}
+
+idle_memory() {
+  # A server with an empty store and, when openssl can make one, an APNs key (so the HTTP/2
+  # client to Apple is built), left alone for three seconds. Linux only: it reads /proc.
+  local dir port pid kb
+  dir="$(mktemp -d)"
+  port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
+  printf 'listen = "127.0.0.1:%s"\ndata_dir = "%s/data"\n' "$port" "$dir" > "$dir/beacon.toml"
+  if openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$dir/AuthKey_ABC123DEFG.p8" 2> /dev/null; then
+    printf '[apns]\nkey_path = "%s/AuthKey_ABC123DEFG.p8"\nteam_id = "TEAM123456"\ntopic = "com.example.lab"\n' "$dir" >> "$dir/beacon.toml"
+  fi
+  target/release/beacon serve --config "$dir/beacon.toml" 2> /dev/null &
+  pid=$!
+  python3 -c 'import time; time.sleep(3)'
+  kb="$(awk '/^VmRSS:/ {print $2}' "/proc/$pid/status" 2> /dev/null)"
+  kill "$pid" 2> /dev/null; wait "$pid" 2> /dev/null; rm -rf "$dir"
+  echo "an idle server holds ${kb:-?} kB (budget $MAX_IDLE_RSS_KB)"
+  [ -n "$kb" ] && [ "$kb" -le "$MAX_IDLE_RSS_KB" ]
+}
+
 if [ "$fast" = 0 ]; then
   step "python client" "run \`python3 -m unittest discover -s tests\` and \`npx pyright@1.1.414\` in clients/python; after changing the client or the generator, \`BEACON_BLESS=1 cargo test -p beacon-codegen\` rewrites tests/gen" python_client
   step "node client" "run \`node --test tests/\` and \`npx -p typescript@5 tsc -p .\` in clients/node; after changing the client or the generator, \`BEACON_BLESS=1 cargo test -p beacon-codegen\` rewrites tests/gen" node_client
   step "release build" "the release profile must build: see what \`cargo build --release\` reports" \
     cargo build --release --workspace --locked
+  step "binary size" "find what grew with \`cargo bloat\` or by reverting; raise MAX_BINARY_BYTES only on purpose" binary_size
+  if [ -r /proc/self/status ]; then
+    step "idle memory" "find what a server now allocates at start; raise MAX_IDLE_RSS_KB only on purpose" idle_memory
+  fi
 fi
 
 [ "$failed" = 0 ] && echo "all checks passed" || { echo "some checks failed"; exit 1; }

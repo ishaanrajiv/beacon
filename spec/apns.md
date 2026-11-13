@@ -65,7 +65,7 @@ Body:
     "relevance-score": 1.0
   },
   "url": "/system",
-  "data": {"item": "4182", "kind": "backup.failed", "key": "nightly", "collapse_id": "b1-29fd692930019189"}
+  "data": {"item": "4182", "kind": "backup.failed", "key": "nightly", "collapse_id": "b1-29fd692930019189", "context": "assistant:thread:42"}
 }
 ```
 
@@ -75,10 +75,10 @@ Body:
 | `aps.interruption-level` | `time-sensitive` (urgent), `active` (normal), `passive` (silent). Urgent never asks for critical alerts: the app has no entitlement. |
 | `aps.sound` | `"default"`, left out for `passive`. |
 | `aps.thread-id` | The item's source. |
-| `aps.category` | The item's kind. Left out of a recovery push, so a recovered alert shows no buttons. |
+| `aps.category` | The category the event chose (`category`, `spec/api.md`), else the kind's first declared `categories`, else the kind's name. Left out of a recovery push, so a recovered alert shows no buttons. |
 | `aps.relevance-score` | Alert `1.0`, action `0.8`, update `0.5`, recovery `0.3`. |
 | `url` | The item's link, or left out when it has none. |
-| `data` | String values only: `item` (the id), `kind`, `key`, `collapse_id`. |
+| `data` | String values only: `item` (the id), `kind`, `key`, `collapse_id`, and `context` when the item has one (so the app can open that context). |
 
 No `badge` (the app shows a dot in its own UI, never an icon badge), no `mutable-content` (no
 Notification Service Extension), no `content-available`.
@@ -89,9 +89,9 @@ dropped; then the title is cut to 40 characters. `category`, `thread-id` and `da
 
 ### Categories
 
-`aps.category` is the kind's name, so the app must have registered a category of that name to show
-its buttons. The app fetches `GET /v1/kinds` at launch (and when its `ETag` changes) and registers
-one `UNNotificationCategory` per kind:
+`aps.category` is the kind's name unless the kind declares `categories`, so the app must have
+registered a category of that name to show its buttons. The app fetches `GET /v1/kinds` at launch
+(and when its `ETag` changes) and registers one `UNNotificationCategory` per kind:
 
 - identifier: the kind's name;
 - actions: the kind's built-in actions, in its declared order, each identified by its action id
@@ -99,6 +99,11 @@ one `UNNotificationCategory` per kind:
   notification buttons;
 - `hiddenPreviewsBodyPlaceholder`: the kind's `preview`, shown when previews are hidden on a
   locked phone.
+
+A kind that declares `categories` (`spec/declarations.md`) uses categories the app registered
+itself, with its own buttons (an approval's Approve and Deny, say): its pushes carry the first, or
+the one the event chose. The app still registers the kind's own category from `GET /v1/kinds`, and
+answers its own categories' buttons as it likes.
 
 When a button is pressed the app posts `POST /v1/items/{data.item}/actions` with that action id
 and `"client": "ios"`. Tapping the notification opens `url` and posts `POST /v1/seen` for the item.
@@ -155,6 +160,6 @@ production, or the reverse). So:
 Body: `{"aps": {"timestamp", "event", "content-state", "dismissal-date"?, "stale-date"?, "alert"?}}`,
 from the request's `timestamp`, `event`, `contentState`, `dismissalDate`, `staleDate` and `alert`;
 `alert` gains `"sound": "default"`. Over 4 KB is refused (`400`), never trimmed. The environment
-is the request's, else that of the most recently updated device, then the other on
-`BadDeviceToken`. A dead-token answer is `410` to the caller and deletes nothing (the token is the
+is the request's alone when it names one; else that of the most recently updated device, then the
+other on `BadDeviceToken`. A dead-token answer is `410` to the caller and deletes nothing (the token is the
 activity's, not a device's).

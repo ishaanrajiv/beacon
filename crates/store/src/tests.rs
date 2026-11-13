@@ -1519,3 +1519,205 @@ fn the_registry_lists_every_source() {
     .unwrap();
     assert_eq!(store.publish(&beacon, T0).unwrap_err().kind, ErrorKind::Conflict);
 }
+
+// ---------- devices.db, categories, context ----------
+
+fn temp_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("beacon-store-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Every text value in every table of the SQLite file at `path`, opened on its own.
+fn every_text(path: &std::path::Path) -> String {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let mut out = String::new();
+    for table in tables {
+        let mut stmt = conn.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
+        let n = stmt.column_count();
+        let mut rows = stmt.query([]).unwrap();
+        while let Some(row) = rows.next().unwrap() {
+            for i in 0..n {
+                if let Ok(text) = row.get::<_, String>(i) {
+                    out.push_str(&text);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn tokens_live_only_in_devices_db() {
+    let dir = temp_dir("devices");
+    let path = dir.join("beacon.db");
+    let token = "ab12".repeat(16);
+    {
+        let store = Store::open(&path, Settings::default()).unwrap();
+        store
+            .publish(&parse(BACKUP, &Check::default()).unwrap(), T0)
+            .unwrap();
+        store
+            .register_device(&token, "production", Some("iPhone"), T0)
+            .unwrap();
+        store.apply_event(&failed(), None, T0).unwrap();
+        let job = &store.pushes_due(T0).unwrap()[0];
+        assert_eq!(job.devices, [(token.clone(), "production".to_string())]);
+        let attempt = Attempt {
+            token: token.clone(),
+            environment: "production".into(),
+            status: "accepted".into(),
+            reason: None,
+        };
+        store
+            .push_attempted(job.id, &[attempt], PushNext::Sent, T0)
+            .unwrap();
+        let detail = store.item_detail(job.item, T0).unwrap().unwrap();
+        assert_eq!(detail.attempts[0].device, "…12ab12");
+        assert!(store.set_device_environment(&token, "sandbox", T0).unwrap());
+        assert_eq!(store.devices().unwrap()[0].environment, "sandbox");
+        assert_eq!(
+            store.devices().unwrap()[0].last_status.as_deref(),
+            Some("accepted")
+        );
+    }
+    assert!(!every_text(&path).contains(&token), "beacon.db holds no token");
+    assert!(every_text(&dir.join("devices.db")).contains(&token));
+    let store = Store::open(&path, Settings::default()).unwrap();
+    assert_eq!(store.devices().unwrap().len(), 1, "devices survive a restart");
+}
+
+#[test]
+fn a_version_1_database_moves_its_devices_out() {
+    let dir = temp_dir("migrate");
+    let path = dir.join("beacon.db");
+    let token = "cd34".repeat(16);
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(include_str!("schema.sql")).unwrap();
+        conn.execute_batch("PRAGMA user_version = 1").unwrap();
+        conn.execute(
+            "INSERT INTO devices (token, environment, name, created, updated) VALUES (?1, 'production', 'iPhone', 1, 2)",
+            [&token],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO attempts (push, item, at, device, environment, attempt, status) \
+             VALUES (1, 1, 1, ?1, 'production', 1, 'accepted')",
+            [&token],
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path, Settings::default()).unwrap();
+    let devices = store.devices().unwrap();
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].name.as_deref(), Some("iPhone"));
+    drop(store);
+    assert!(!every_text(&path).contains(&token));
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    assert_eq!(version, 2);
+    let device: String = conn
+        .query_row("SELECT device FROM attempts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(device, "34cd34");
+}
+
+const APPROVALS: &str = r#"
+source = "approvals"
+name = "Approvals"
+icon = "shield"
+
+[kinds."approvals.needed"]
+class = "action"
+push = "normal"
+title = "Approval needed"
+body = "{what}"
+slots = { what = 80 }
+actions = ["done", "dismiss"]
+context = true
+categories = ["APPROVAL", "APPROVAL_LONG"]
+"#;
+
+#[test]
+fn a_push_carries_the_kinds_category_or_the_events_choice_and_its_context() {
+    let store = store();
+    store
+        .publish(&parse(APPROVALS, &Check::default()).unwrap(), T0)
+        .unwrap();
+    let mut e = event("approvals.needed", "1", json!({}), json!({"what": "Deploy web"}));
+    e.context = Some("assistant:thread:42".into());
+    store.apply_event(&e, None, T0).unwrap();
+    let job = &store.pushes_due(T0).unwrap()[0];
+    assert_eq!(job.category.as_deref(), Some("APPROVAL"));
+    assert_eq!(job.data["context"], "assistant:thread:42");
+    e.key = "2".into();
+    e.category = Some("APPROVAL_LONG".into());
+    store.apply_event(&e, None, T0).unwrap();
+    let job = &store.pushes_due(T0).unwrap()[1];
+    assert_eq!(job.category.as_deref(), Some("APPROVAL_LONG"));
+    e.key = "3".into();
+    e.category = Some("APROVAL".into());
+    let err = store.apply_event(&e, None, T0).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Undeclared);
+    assert!(err.problem().fix.contains("did you mean `APPROVAL`"), "{err}");
+    let mut plain = failed();
+    plain.category = Some("APPROVAL".into());
+    let err = store.apply_event(&plain, None, T0).unwrap_err();
+    assert_eq!(err.problem().at, "event category");
+    assert!(err.problem().fix.contains("declare `categories"), "{err}");
+    let job = &store.pushes_due(T0).unwrap()[0];
+    assert!(job.data.get("context").is_some());
+    let failed_job = store.apply_event(&failed(), None, T0).unwrap();
+    let jobs = store.pushes_due(T0).unwrap();
+    let backup = jobs.iter().find(|j| j.item == item(&failed_job).id).unwrap();
+    assert_eq!(
+        backup.category.as_deref(),
+        Some("backup.failed"),
+        "no categories: the kind's name"
+    );
+    assert!(backup.data.get("context").is_none());
+}
+
+#[test]
+fn a_silence_with_an_idempotency_key_opens_once() {
+    let store = store();
+    let new = NewSilence {
+        matcher: SilenceMatch {
+            source: Some("backup".into()),
+            ..SilenceMatch::default()
+        },
+        until: T0 + HOUR,
+        reason: "Deploying".into(),
+        client: "api".into(),
+    };
+    let (first, repeat) = store
+        .open_silence_once(&new, "k1", "{\"for\":\"1h\"}", T0)
+        .unwrap();
+    assert!(!repeat);
+    let later = NewSilence {
+        until: T0 + MINUTE + HOUR,
+        ..new.clone()
+    };
+    let (again, repeat) = store
+        .open_silence_once(&later, "k1", "{\"for\":\"1h\"}", T0 + MINUTE)
+        .unwrap();
+    assert!(repeat);
+    assert_eq!(again.id, first.id);
+    assert_eq!(store.silences(false, T0 + MINUTE).unwrap().len(), 1);
+    let err = store
+        .open_silence_once(&new, "k1", "{\"for\":\"2h\"}", T0 + MINUTE)
+        .unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Conflict);
+    let err = store.open_silence_once(&new, "a key", "{}", T0).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Invalid);
+}

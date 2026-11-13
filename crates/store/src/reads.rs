@@ -155,8 +155,13 @@ const NEEDS_YOU_MAX: i64 = 100;
 const RESOLVED_MAX: i64 = 50;
 
 pub(crate) fn last_six(token: &str) -> String {
+    format!("…{}", last_six_raw(token))
+}
+
+/// A token's last six characters: all of it that beacon.db keeps (in push attempts).
+pub(crate) fn last_six_raw(token: &str) -> &str {
     let start = token.len().saturating_sub(6);
-    format!("…{}", token.get(start..).unwrap_or(token))
+    token.get(start..).unwrap_or(token)
 }
 
 fn items(rows: Vec<Row>, now: i64, s: &Settings) -> Vec<Item> {
@@ -317,7 +322,7 @@ impl Store {
     pub fn devices(&self) -> Result<Vec<DeviceView>> {
         self.read(|tx, _| {
             let mut stmt = tx.prepare_cached(
-                "SELECT token, environment, name, created, updated, last_push, last_status FROM devices \
+                "SELECT token, environment, name, created, updated, last_push, last_status FROM dev.devices \
                  ORDER BY updated DESC",
             )?;
             let rows = stmt.query_map([], |r| {

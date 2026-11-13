@@ -100,8 +100,8 @@ A send goes to every registered device (`spec/apns.md`), with:
 | sound | `default`, except `passive` |
 | `thread-id` | the item's source, so each source is its own group on the phone |
 | `apns-collapse-id` | the item's `collapse_id` |
-| `category` | the item's kind |
-| `url`, `data` | the item's link; its id, kind, key and collapse id |
+| `category` | the event's chosen `category`, else the kind's first declared `categories`, else the item's kind |
+| `url`, `data` | the item's link; its id, kind, key and collapse id, and its context when it has one |
 
 `collapse_id` (`crates/core/src/ids.rs`):
 

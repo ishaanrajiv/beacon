@@ -6,8 +6,9 @@ error with the name you probably meant, so a typo is caught at start. Durations 
 and a unit (`90s`, `10m`, `2h`, `7d`). The parser will be `crates/core/src/config.rs`.
 
 ```toml
-listen = "127.0.0.1:8300"       # address and port. Loopback by default: put a proxy in front to reach it from elsewhere.
-data_dir = "./beacon-data"      # the SQLite database (beacon.db) and nothing else
+listen = "127.0.0.1:8210"       # address and port. Loopback by default: put a proxy in front to reach it from elsewhere.
+data_dir = "./beacon-data"      # the SQLite database, beacon.db
+devices_db = "./beacon-data/devices.db"   # the devices and their push tokens; default data_dir/devices.db
 timezone = "UTC"                # IANA name: quiet hours, the catch-up, the budget's day, and how times render
 push = true                     # false: decide and record everything, send nothing (push.reason "push_off")
 origins = []                    # Origin values a browser may send mutations from, beside the request's own host
@@ -55,7 +56,7 @@ open = "/"                      # the link every trail.* item opens
 stale_after = "11m"             # Trail re-posts its snapshot every 5 minutes
 
 [sink]
-trail_url = "http://127.0.0.1:8200"   # unset: nothing is copied to Trail
+trail_url = "http://127.0.0.1:8200"   # unset: nothing is copied to Trail. Plain http: Trail runs beside Beacon
 source = "beacon"               # the Trail source the copies are recorded under
 
 [auth]
@@ -87,7 +88,9 @@ producer_token = "…"            # when set, producer routes also accept Author
 | `inbox.page` | 1 to 200 |
 | `inbox.since_last_visit_items` | 0 to 50 |
 | `trail.open`, link | starts with `/` or `https://` |
-| `sink.trail_url` | `http://` or `https://` |
+| `sink.trail_url` | `http://` (the copy speaks plain HTTP) |
+| `apns.key_id`, `apns.team_id` | 10 capital letters and digits |
+| `auth.producer_token` | at least 16 printable characters, no spaces |
 
 A value out of range stops Beacon at start with a `Problem` naming the field and a value that
 works.
@@ -95,8 +98,15 @@ works.
 ## Storage
 
 `data_dir/beacon.db`: SQLite in write-ahead-log mode with `synchronous = FULL`, so an accepted
-event survives a power cut. The folder is created with mode 700 and the database 600. Back it up
+event survives a power cut. The folder is created with mode 700 and the databases 600. Back it up
 like any SQLite file (`sqlite3 beacon.db ".backup copy.db"`, or copy it while Beacon is stopped).
+
+`devices_db` (default `data_dir/devices.db`): the registered devices and their APNs tokens, and
+nothing else. Tokens are secrets, so they never enter `beacon.db`: a push attempt keeps only the
+token's last six characters, and the push queue looks devices up when it sends. `beacon.db` can
+then be opened read-only by another program (an assistant answering "what did Beacon send
+today?") without exposing a token. Back up both files. A `beacon.db` from before devices moved
+(schema version 1) has its devices moved into `devices_db` at start, with the old rows overwritten.
 
 ## The copy to Trail
 
@@ -106,8 +116,8 @@ in order, from a cursor kept in its database, retrying with backoff while Trail 
 each event's id is `beacon-<history row id>`, so a resend is stored once. The copy is outside the
 notification's path: a Trail outage never delays a push.
 
-The event is `<sink.source>.notification.recorded`. Declare it in the Trail declarations of
-whoever runs Beacon:
+The event is `<sink.source>.notification.recorded`. Its `item_source` is the item's source (Trail
+reserves `source` for the sender). Declare it in the Trail declarations of whoever runs Beacon:
 
 ```toml
 [events."beacon.notification.recorded"]
@@ -118,7 +128,7 @@ item = "int"
 what = "string"            # a history step (spec/api.md, GET /v1/items/{id}), like opened, resolved, push_sent
 kind = "string"
 class = { enum = ["alert", "action", "update", "record"] }
-source = "string"
+item_source = "string"
 state = "string?"          # the item's state after the change; absent for updates and records
 title = "string"
 push_level = { enum = ["urgent", "normal", "silent", "none"] }
@@ -129,5 +139,11 @@ push_reason = "string?"
 ## Running it
 
 One process, no async runtime outside the push sender. Beacon is small: a server with nothing to
-do should hold well under 20 MB. A systemd unit, a container, or `beacon serve` in a terminal all
-work; it needs only its config, its data folder and, to push, the key file.
+do should hold well under 20 MB (`scripts/check` measures it). A systemd unit, a container, or
+`beacon serve` in a terminal all work; it needs only its config, its data folder and, to push, the
+key file.
+
+Beacon is crash-only: there is no shutdown step. Every accepted write is committed before it is
+answered, owed work is a time stored beside what caused it, and a push that was in flight is
+retried at start (within `apns.give_up`), so SIGTERM's default action, ending the process at once,
+loses nothing Beacon answered for. That is how it stops; a service manager needs no stop command.

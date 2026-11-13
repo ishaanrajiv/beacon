@@ -28,6 +28,22 @@ context = true
 actions = ["dismiss"]
 preview = "A question for you"
 
+[kinds."assistant.permission"]
+class = "action"
+push = "normal"
+description = "The assistant asks to run a command, with Allow and Deny on the notification."
+title = "Run {tool}"
+preview = "The assistant asks to run a command"
+body = "{command}"
+facts = { thread = "string" }
+slots = { tool = 24, command = 140 }
+open = "/assistant/threads/{thread}"
+context = true
+# Categories the app registered with its own buttons; the first is the default, and an event may
+# pick the other for a command that deletes something.
+categories = ["PERMISSION", "PERMISSION_DESTRUCTIVE"]
+actions = ["dismiss"]
+
 [kinds."assistant.reminder"]
 class = "action"
 push = "normal"

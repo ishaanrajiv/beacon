@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 pub(crate) const COLUMNS: &str = "id, version, kind, class, source, source_name, icon, key, title, body, preview, url, \
      url_override, context, labels, facts, slots, kind_decl, buttons, created, updated, state, opened, acknowledged, \
      dismissed, snoozed_until, done, resolved, seen, one_off, openings, flapping, repeat, repeats_sent, next_repeat, \
-     last_change, collapse_id, push_level, push_status, push_reason, push_at, release_at, covered_by, push_job";
+     last_change, collapse_id, push_level, push_status, push_reason, push_at, release_at, covered_by, push_job, category";
 
 /// Everything stored about one item.
 #[derive(Debug, Clone)]
@@ -34,6 +34,8 @@ pub(crate) struct Row {
     /// The event set `url`: it isn't rendered from the kind's `open`.
     pub url_override: bool,
     pub context: Option<String>,
+    /// The notification category the event chose among its kind's `categories`.
+    pub category: Option<String>,
     pub labels: BTreeMap<String, String>,
     pub facts: Map<String, Value>,
     pub slots: Map<String, Value>,
@@ -167,6 +169,7 @@ pub(crate) fn from_sql(r: &SqlRow<'_>) -> rusqlite::Result<Row> {
         url: r.get("url")?,
         url_override: r.get("url_override")?,
         context: r.get("context")?,
+        category: r.get("category")?,
         labels: get_json(r, "labels")?,
         facts: get_json(r, "facts")?,
         slots: get_json(r, "slots")?,
@@ -272,7 +275,7 @@ pub(crate) fn save(conn: &Connection, row: &Row) -> Result<()> {
              resolved = ?21, seen = ?22, one_off = ?23, openings = ?24, flapping = ?25, repeat = ?26, \
              repeats_sent = ?27, next_repeat = ?28, last_change = ?29, collapse_id = ?30, push_level = ?31, \
              push_status = ?32, push_reason = ?33, push_at = ?34, release_at = ?35, covered_by = ?36, \
-             push_job = ?37 WHERE id = ?1",
+             push_job = ?37, category = ?38 WHERE id = ?1",
         )?
         .execute(params![
             row.id,
@@ -312,6 +315,7 @@ pub(crate) fn save(conn: &Connection, row: &Row) -> Result<()> {
             row.push.release_at,
             row.push.covered_by,
             row.push_job,
+            row.category,
         ])?;
     if n == 0 {
         return Err(Error::new(

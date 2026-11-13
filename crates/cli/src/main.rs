@@ -50,7 +50,7 @@ Silence pushes
   beacon silence end <id> [--server URL]
   beacon silence list [--all] [--server URL] [--json]
 
---server defaults to BEACON_URL, else http://127.0.0.1:8300; BEACON_TOKEN is sent as a bearer token.
+--server defaults to BEACON_URL, else http://127.0.0.1:8210; BEACON_TOKEN is sent as a bearer token.
 Values: text for a string fact or slot (reason=\"\" sends an empty slot); a number for int and
 float; 90s, 5m, 2h, 7d or whole milliseconds for a duration; now, -15m, +2h, milliseconds since
 1970 or 2026-11-13T02:00:00+00:00 for a time.

@@ -91,6 +91,7 @@ equal the file's `source`.
 | `recovered_body` | template | `"Lasted {lasted}."` on a recovering alert | `alert` only, not `one_off`. The body once it recovers. |
 | `context` | bool | `false` | Not on `record`. Events of this kind carry a viewing context (`spec/api.md`, `POST /v1/events`), like `assistant:thread:42`, and aren't pushed while a client is viewing it. |
 | `one_off` | bool | `false` | `alert` only. Nothing will report this alert's recovery (a failed deploy): acknowledging or dismissing it resolves it. It must offer `acknowledge` or `dismiss`, and has no `recovered` and no `repeat`. |
+| `categories` | list of strings | `[]` | Not on `record`. At most 4, each `^[A-Z][A-Z0-9_]{0,39}$`, no repeats. Notification categories the app registered itself (approval buttons, say): the first is the `aps.category` of this kind's pushes instead of the kind's name, and an event may pick another of them with its `category` field (`spec/api.md`, `POST /v1/events`). Empty: the category is the kind's name (`spec/apns.md`, "Categories"). |
 
 Durations are a whole number and a unit: `90s`, `10m`, `2h`, `7d`. Any other field in a kind is an
 error, with the name you probably meant.
@@ -133,7 +134,7 @@ A fact is a short typed value: a name, a number, a moment. Written `name = "type
 | `time` | milliseconds since 1970 UTC | in the server's timezone, beside now: `16:45` today, `yesterday 16:45`, `tomorrow 09:00`, `Tue 16:45` within six days either way, else `12 Nov`, or `12 Nov 2025` in another year |
 
 Rules: a fact's name is snake_case, starting with a letter, at most 32 characters. It may not be
-`lasted`, nor `key`, `labels`, `url` or `context` (the generated emitters' own arguments), nor contain `password`, `passwd`, `secret`, `token`, `otp`, `api_key`, `apikey`,
+`lasted`, nor `key`, `labels`, `url`, `context` or `category` (the generated emitters' own arguments), nor contain `password`, `passwd`, `secret`, `token`, `otp`, `api_key`, `apikey`,
 `authorization`, `cookie` or `credential` (notifications are kept for months and shown on a lock
 screen). Every declared fact must appear in some template (`title`, `body`, `open`, `recovered`,
 `recovered_body`, or a custom action's `url`).
@@ -324,7 +325,8 @@ default, except that a missing `throttle` means `"10m"` and `null` means `"none"
       "recovered": "Backups are working again",
       "recovered_body": "Lasted {lasted}.",
       "context": false,
-      "one_off": false
+      "one_off": false,
+      "categories": []
     }
   }
 }

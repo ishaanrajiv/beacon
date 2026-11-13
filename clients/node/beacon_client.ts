@@ -7,7 +7,7 @@
 // this file take any kind by name, unchecked until Beacon answers.
 
 // --- runtime start ---
-export const DEFAULT_URL = "http://127.0.0.1:8300";
+export const DEFAULT_URL = "http://127.0.0.1:8210";
 
 /** What Beacon answered. `ok` is true for a 2xx; otherwise `problem` says what went wrong. */
 export interface Sent {
@@ -51,6 +51,7 @@ interface EventOptions {
   labels?: Record<string, string> | undefined;
   context?: string | undefined;
   url?: string | undefined;
+  category?: string | undefined;
 }
 
 class BeaconRuntime {
@@ -105,6 +106,7 @@ class BeaconRuntime {
     if (options.labels !== undefined && Object.keys(options.labels).length > 0) body["labels"] = options.labels;
     if (options.context !== undefined) body["context"] = options.context;
     if (options.url !== undefined) body["url"] = options.url;
+    if (options.category !== undefined) body["category"] = options.category;
     return body;
   }
 
