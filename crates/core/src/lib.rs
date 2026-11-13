@@ -6,6 +6,7 @@
 //! - [`template`]: `{placeholder}` templates, value cleaning and word-boundary truncation.
 //! - [`render`]: an event's facts and slots checked against its kind and rendered to text.
 //! - [`builtin`]: the kinds Beacon owns (`beacon.*`, `trail.*`).
+//! - [`config`]: beacon.toml, read and checked.
 //! - [`ids`]: the collapse ids pushes carry.
 //! - [`delivery`]: the delivery decision, silences, presence, the catch-up and the budget.
 //! - [`lifecycle`]: the alert and action state machines.
@@ -14,6 +15,7 @@
 //! - [`duration`], [`names`], [`problem`]: the small pieces the rest share.
 
 pub mod builtin;
+pub mod config;
 pub mod decl;
 pub mod delivery;
 pub mod duration;
