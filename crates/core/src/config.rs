@@ -704,7 +704,7 @@ mod tests {
     #[test]
     fn the_spec_example_reads() {
         let text = r#"
-listen = "127.0.0.1:8300"
+listen = "127.0.0.1:9000"
 data_dir = "/var/lib/beacon"
 timezone = "Europe/London"
 push = false
@@ -750,7 +750,7 @@ source = "beacon"
 producer_token = "0123456789abcdef0123"
 "#;
         let c = parse(text).unwrap_or_else(|p| panic!("{p:?}"));
-        assert_eq!(c.listen, "127.0.0.1:8300");
+        assert_eq!(c.listen, "127.0.0.1:9000");
         assert_eq!(c.devices_db, PathBuf::from("/var/lib/beacon/devices.db"));
         assert_eq!(c.timezone, "Europe/London");
         assert!(!c.settings.push);
