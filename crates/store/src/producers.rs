@@ -51,6 +51,9 @@ pub struct Event {
     pub context: Option<String>,
     #[serde(default)]
     pub url: Option<String>,
+    /// One of the kind's declared `categories`: the push's category instead of the first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +92,8 @@ pub struct SnapshotEntry {
     pub context: Option<String>,
     #[serde(default)]
     pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
 }
 
 fn yes() -> bool {
@@ -407,6 +412,30 @@ fn check_shape(
     problems
 }
 
+/// A chosen category must be one the kind declares (`422`).
+fn check_category(at: &str, kind_name: &str, kind: &Kind, category: Option<&str>) -> Vec<Problem> {
+    let Some(category) = category else {
+        return Vec::new();
+    };
+    if kind.categories.iter().any(|c| c == category) {
+        return Vec::new();
+    }
+    let fix = if kind.categories.is_empty() {
+        format!("leave category out, or declare `categories = [\"{category}\"]` on {kind_name} and publish")
+    } else {
+        let names: Vec<String> = kind.categories.iter().map(|c| format!("`{c}`")).collect();
+        match closest(category, kind.categories.iter().map(String::as_str)) {
+            Some(near) => format!("did you mean `{near}`? {kind_name} declares {}", names.join(", ")),
+            None => format!("send one of {}, or declare it and publish", names.join(", ")),
+        }
+    };
+    vec![Problem::new(
+        format!("{at} category"),
+        format!("`{category}` is not a category {kind_name} declares"),
+        fix,
+    )]
+}
+
 fn undeclared(at: &str, name: &str, registry: &BTreeMap<String, Declarations>) -> Error {
     let all: Vec<&str> = registry
         .values()
@@ -484,11 +513,12 @@ impl Tx<'_, '_> {
         let keep = resolving && event.facts.is_none() && event.slots.is_none();
         let facts = event.facts.clone().unwrap_or_default();
         let slots = event.slots.clone().unwrap_or_default();
+        let mut problems = check_category(at, &event.kind, kind, event.category.as_deref());
         if !keep {
-            let problems = check_values(at, &event.kind, kind, &facts, &slots);
-            if !problems.is_empty() {
-                return Err(Error::many(ErrorKind::Undeclared, problems));
-            }
+            problems.extend(check_values(at, &event.kind, kind, &facts, &slots));
+        }
+        if !problems.is_empty() {
+            return Err(Error::many(ErrorKind::Undeclared, problems));
         }
         let fields = Fields {
             facts: (!keep).then_some(facts),
@@ -496,6 +526,7 @@ impl Tx<'_, '_> {
             labels: event.labels.clone(),
             context: event.context.clone(),
             url: event.url.clone(),
+            category: event.category.clone(),
         };
         let (outcome, row) = self.route(&event.kind, kind, &event.key, resolving, fields)?;
         Ok(EventAnswer {
@@ -697,6 +728,7 @@ impl Tx<'_, '_> {
                 entry.context.as_deref(),
                 entry.url.as_deref(),
             ));
+            values.extend(check_category(&at, &entry.kind, kind, entry.category.as_deref()));
             values.extend(check_values(&at, &entry.kind, kind, &entry.facts, &entry.slots));
         }
         if !shape.is_empty() {
@@ -723,6 +755,7 @@ impl Tx<'_, '_> {
                 labels: entry.labels.clone(),
                 context: entry.context.clone(),
                 url: entry.url.clone(),
+                category: entry.category.clone(),
             };
             let latest = rows::latest(self.conn, &entry.kind, &entry.key)?;
             let skip = match kind.class {
@@ -879,6 +912,7 @@ struct Fields {
     labels: BTreeMap<String, String>,
     context: Option<String>,
     url: Option<String>,
+    category: Option<String>,
 }
 
 impl Fields {
@@ -888,6 +922,7 @@ impl Fields {
         new.slots = self.slots.unwrap_or_default();
         new.labels = self.labels;
         new.context = self.context;
+        new.category = self.category;
         new.url = self.url;
         new
     }
@@ -905,6 +940,7 @@ impl Fields {
         }
         row.labels = self.labels;
         row.context = self.context;
+        row.category = self.category;
         row.url_override = self.url.is_some();
         if self.url.is_some() {
             row.url = self.url;

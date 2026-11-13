@@ -57,6 +57,7 @@ pub(crate) struct NewItem<'v> {
     pub slots: Map<String, Value>,
     pub labels: BTreeMap<String, String>,
     pub context: Option<String>,
+    pub category: Option<String>,
     pub url: Option<String>,
     /// A push level other than the kind's (the catch-up's).
     pub push: Option<PushLevel>,
@@ -73,6 +74,7 @@ impl<'v> NewItem<'v> {
             slots: Map::new(),
             labels: BTreeMap::new(),
             context: None,
+            category: None,
             url: None,
             push: None,
             collapse_id: None,
@@ -161,6 +163,7 @@ impl<'a, 'r> Tx<'a, 'r> {
             url: new.url.clone(),
             url_override: new.url.is_some(),
             context: new.context,
+            category: new.category,
             labels: new.labels,
             facts: new.facts,
             slots: new.slots,
@@ -442,14 +445,15 @@ impl<'a, 'r> Tx<'a, 'r> {
 
     /// Queues the item's push for every device.
     fn send(&mut self, row: &mut Row) -> Result<()> {
-        let data = json!({"id": row.id, "kind": row.kind, "key": row.key, "collapse_id": row.collapse_id});
+        let data = push_data(row);
+        let category = beacon_core::decl::push_category(&row.kind, &row.decl, row.category.as_deref());
         let job = self.queue(
             row,
             "item",
             &row.title,
             &row.body,
             row.push.level,
-            Some(&row.kind),
+            Some(category),
             &data,
         )?;
         self.set_push(row, PushStatus::Queued, None, None);
@@ -503,7 +507,7 @@ impl<'a, 'r> Tx<'a, 'r> {
         if !self.s.push {
             return self.suppress(row, PushReason::PushOff);
         }
-        let data = json!({"id": row.id, "kind": row.kind, "key": row.key, "collapse_id": row.collapse_id});
+        let data = push_data(row);
         let job = self.queue(
             row,
             "recovery",
@@ -626,6 +630,16 @@ impl<'a, 'r> Tx<'a, 'r> {
 }
 
 /// The input an alert or action event's open state means.
+/// A push's `data` (`spec/apns.md`): the item's id, kind, key and collapse id, and its context
+/// when it has one. Never a token.
+fn push_data(row: &Row) -> Value {
+    let mut data = json!({"id": row.id, "kind": row.kind, "key": row.key, "collapse_id": row.collapse_id});
+    if let (Some(context), Some(map)) = (&row.context, data.as_object_mut()) {
+        map.insert("context".into(), json!(context));
+    }
+    data
+}
+
 pub(crate) fn open_input(class: Class) -> Input {
     if class == Class::Alert {
         Input::Fire

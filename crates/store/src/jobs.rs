@@ -203,7 +203,7 @@ impl Store {
         let give_up = self.settings().give_up;
         self.read(|tx, _| {
             let devices: Vec<(String, String)> = {
-                let mut stmt = tx.prepare_cached("SELECT token, environment FROM devices ORDER BY updated DESC")?;
+                let mut stmt = tx.prepare_cached("SELECT token, environment FROM dev.devices ORDER BY updated DESC")?;
                 let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
                 rows.collect::<rusqlite::Result<_>>()?
             };
@@ -272,14 +272,16 @@ impl Store {
                         push,
                         item,
                         now,
-                        attempt.token,
+                        crate::reads::last_six_raw(&attempt.token),
                         attempt.environment,
                         count + 1,
                         attempt.status,
                         attempt.reason
                     ])?;
                 w.conn
-                    .prepare_cached("UPDATE devices SET last_push = ?2, last_status = ?3 WHERE token = ?1")?
+                    .prepare_cached(
+                        "UPDATE dev.devices SET last_push = ?2, last_status = ?3 WHERE token = ?1",
+                    )?
                     .execute(params![attempt.token, now, attempt.status])?;
             }
             match next {

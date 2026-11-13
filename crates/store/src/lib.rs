@@ -44,7 +44,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 /// The schema version this crate writes (`PRAGMA user_version`).
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Beacon's store. Open it once and share it; it is `Send + Sync`. Calls are serialized on one
@@ -64,15 +64,34 @@ pub(crate) struct Inner {
 }
 
 impl Store {
-    /// Opens (creating if needed) the database at `path`: `data_dir/beacon.db`.
+    /// Opens (creating if needed) the database at `path` (`data_dir/beacon.db`), with the devices
+    /// in `devices.db` beside it.
     pub fn open(path: &Path, settings: Settings) -> Result<Store> {
+        Store::open_with_devices(path, &path.with_file_name("devices.db"), settings)
+    }
+
+    /// Opens `beacon.db` at `path` and the devices database at `devices`. Push tokens live only in
+    /// `devices`, so `beacon.db` can be shared read-only without exposing them.
+    pub fn open_with_devices(path: &Path, devices: &Path, settings: Settings) -> Result<Store> {
         let conn = Connection::open(path).map_err(|e| Error::sql("can't open beacon.db", &e))?;
+        let devices = devices.to_str().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Storage,
+                "devices.db",
+                "the devices database's path is not UTF-8",
+                "put devices_db at a path of plain characters",
+            )
+        })?;
+        conn.execute("ATTACH DATABASE ?1 AS dev", [devices])
+            .map_err(|e| Error::sql("can't open devices.db", &e))?;
         Store::start(conn, settings, true)
     }
 
     /// A store in memory, for tests and `beacon check`.
     pub fn open_in_memory(settings: Settings) -> Result<Store> {
         let conn = Connection::open_in_memory().map_err(|e| Error::sql("can't open a database", &e))?;
+        conn.execute_batch("ATTACH DATABASE ':memory:' AS dev")
+            .map_err(|e| Error::sql("can't open a database", &e))?;
         Store::start(conn, settings, false)
     }
 
@@ -206,31 +225,50 @@ fn migrate(conn: &mut Connection, wal: bool) -> Result<()> {
         ));
     }
     if wal {
-        let mode: String = conn
-            .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
-            .map_err(|e| Error::sql("can't switch to WAL", &e))?;
-        if !mode.eq_ignore_ascii_case("wal") {
-            return Err(Error::new(
-                ErrorKind::Storage,
-                "beacon.db",
-                format!("SQLite kept journal mode `{mode}` instead of WAL"),
-                "put data_dir on a local disk: WAL needs shared memory, which network file systems lack",
-            ));
+        for schema in ["main", "dev"] {
+            let mode: String = conn
+                .query_row(&format!("PRAGMA {schema}.journal_mode = WAL"), [], |r| r.get(0))
+                .map_err(|e| Error::sql("can't switch to WAL", &e))?;
+            if !mode.eq_ignore_ascii_case("wal") {
+                return Err(Error::new(
+                    ErrorKind::Storage,
+                    "beacon.db",
+                    format!("SQLite kept journal mode `{mode}` instead of WAL"),
+                    "put data_dir on a local disk: WAL needs shared memory, which network file systems lack",
+                ));
+            }
         }
     }
-    // An accepted event survives a power cut (spec/config.md, "Storage").
-    conn.execute_batch("PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON; PRAGMA temp_store = MEMORY;")
-        .map_err(|e| Error::sql("can't set pragmas", &e))?;
+    // An accepted event survives a power cut (spec/config.md, "Storage"). Deleted rows are
+    // overwritten, so a token moved out of beacon.db doesn't linger in its free pages.
+    conn.execute_batch(
+        "PRAGMA main.synchronous = FULL; PRAGMA dev.synchronous = FULL; PRAGMA foreign_keys = ON; \
+         PRAGMA temp_store = MEMORY; PRAGMA main.secure_delete = ON; PRAGMA dev.secure_delete = ON;",
+    )
+    .map_err(|e| Error::sql("can't set pragmas", &e))?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| Error::sql("can't start the schema", &e))?;
+    tx.execute_batch(include_str!("devices.sql"))
+        .map_err(|e| Error::sql("can't create devices.db's schema", &e))?;
     if version == 0 {
-        let tx = conn
-            .transaction()
-            .map_err(|e| Error::sql("can't start the schema", &e))?;
         tx.execute_batch(include_str!("schema.sql"))
             .map_err(|e| Error::sql("can't create the schema", &e))?;
+    }
+    if version < 2 {
+        tx.execute_batch(include_str!("migrate_2.sql"))
+            .map_err(|e| Error::sql("can't move to schema version 2", &e))?;
+    }
+    if version < SCHEMA_VERSION {
         tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
             .map_err(|e| Error::sql("can't set the schema version", &e))?;
-        tx.commit()
-            .map_err(|e| Error::sql("can't commit the schema", &e))?;
+    }
+    tx.commit()
+        .map_err(|e| Error::sql("can't commit the schema", &e))?;
+    if wal && version > 0 && version < 2 {
+        // The moved tokens' old pages leave the log too.
+        conn.execute_batch("PRAGMA main.wal_checkpoint(TRUNCATE)")
+            .map_err(|e| Error::sql("can't checkpoint beacon.db", &e))?;
     }
     Ok(())
 }

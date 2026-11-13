@@ -65,6 +65,8 @@ pub struct SilenceView {
     pub matched: i64,
 }
 
+/// The Idempotency-Key scope of `POST /v1/silences`: not a source name, so it meets no event's.
+const SILENCE_SCOPE: &str = "-silences";
 const SEEN_IDS_MAX: usize = 500;
 const SILENCE_MAX: i64 = 30 * DAY;
 const REASON_MAX: usize = 100;
@@ -276,31 +278,67 @@ impl Store {
 
     // ---------- silences ----------
 
+    /// `POST /v1/silences` with an Idempotency-Key: the same key and `body` (the request as sent,
+    /// so a `for` isn't compared by the end it led to) within `idempotency` answers the silence it
+    /// opened and changes nothing; the same key with another body is `409`. The bool is true for
+    /// such a repeat.
+    pub fn open_silence_once(
+        &self,
+        new: &NewSilence,
+        key: &str,
+        body: &str,
+        now: i64,
+    ) -> Result<(SilenceView, bool)> {
+        if !beacon_core::names::is_key(key) || key.is_empty() {
+            return Err(bad(
+                "header Idempotency-Key",
+                "an Idempotency-Key is 1 to 128 printable ASCII characters with no spaces",
+                "send a fresh random id, like a UUID",
+            ));
+        }
+        check_new_silence(new, now)?;
+        self.write(now, |w| {
+            let stored: Option<(String, String)> = w
+                .conn
+                .prepare_cached(
+                    "SELECT body, answer FROM idempotency WHERE source = ?1 AND key = ?2 AND at > ?3",
+                )?
+                .query_row(params![SILENCE_SCOPE, key, now - w.s.idempotency], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()?;
+            if let Some((first, answer)) = stored {
+                if first != body {
+                    return Err(Error::new(
+                        ErrorKind::Conflict,
+                        "header Idempotency-Key",
+                        format!("`{key}` was used for another silence in the last day"),
+                        "send a new Idempotency-Key for each new silence; reuse one only to retry the same request",
+                    ));
+                }
+                let id: i64 = answer.parse().unwrap_or_default();
+                let view = w
+                    .silence_view(id)?
+                    .ok_or_else(|| Error::not_found("silence", format!("no silence {id}")))?;
+                return Ok((view, true));
+            }
+            let id = w.open_silence(&new.matcher, &new.reason, new.until, &new.client)?;
+            w.conn
+                .prepare_cached(
+                    "INSERT INTO idempotency (source, key, body, answer, at) VALUES (?1, ?2, ?3, ?4, ?5) \
+                     ON CONFLICT (source, key) DO UPDATE SET body = ?3, answer = ?4, at = ?5",
+                )?
+                .execute(params![SILENCE_SCOPE, key, body, id.to_string(), now])?;
+            let view = w
+                .silence_view(id)?
+                .ok_or_else(|| Error::not_found("silence", format!("no silence {id}")))?;
+            Ok((view, false))
+        })
+    }
+
     /// `POST /v1/silences`.
     pub fn open_silence(&self, new: &NewSilence, now: i64) -> Result<SilenceView> {
-        if new.matcher.is_empty() {
-            return Err(bad(
-                "silence match",
-                "a silence must match on something",
-                "give at least one of source, kind, key, labels",
-            ));
-        }
-        if new.matcher.key.is_some() && new.matcher.kind.is_none() {
-            return Err(bad(
-                "silence match.key",
-                "`key` needs `kind`",
-                "add the kind the key belongs to",
-            ));
-        }
-        check_until(new.until, now)?;
-        check_reason(&new.reason)?;
-        if !matches!(new.client.as_str(), "web" | "ios" | "api") {
-            return Err(bad(
-                "silence client",
-                format!("`{}` is not a client", new.client),
-                "send web, ios or api",
-            ));
-        }
+        check_new_silence(new, now)?;
         self.write(now, |w| {
             let id = w.open_silence(&new.matcher, &new.reason, new.until, &new.client)?;
             w.silence_view(id)?
@@ -449,11 +487,22 @@ impl Store {
         self.write(now, |w| {
             w.conn
                 .prepare_cached(
-                    "INSERT INTO devices (token, environment, name, created, updated) VALUES (?1, ?2, ?3, ?4, ?4) \
+                    "INSERT INTO dev.devices (token, environment, name, created, updated) VALUES (?1, ?2, ?3, ?4, ?4) \
                      ON CONFLICT (token) DO UPDATE SET environment = ?2, name = coalesce(?3, name), updated = ?4",
                 )?
                 .execute(params![token, environment, name, now])?;
             Ok(())
+        })
+    }
+
+    /// The push sender found a device's token works only in the other environment
+    /// (`spec/apns.md`, "Dead tokens"): it is moved there.
+    pub fn set_device_environment(&self, token: &str, environment: &str, now: i64) -> Result<bool> {
+        self.write(now, |w| {
+            Ok(w.conn
+                .prepare_cached("UPDATE dev.devices SET environment = ?2 WHERE token = ?1")?
+                .execute([token, environment])?
+                > 0)
         })
     }
 
@@ -462,11 +511,38 @@ impl Store {
     pub fn forget_device(&self, token: &str, now: i64) -> Result<bool> {
         self.write(now, |w| {
             Ok(w.conn
-                .prepare_cached("DELETE FROM devices WHERE token = ?1")?
+                .prepare_cached("DELETE FROM dev.devices WHERE token = ?1")?
                 .execute([token])?
                 > 0)
         })
     }
+}
+
+fn check_new_silence(new: &NewSilence, now: i64) -> Result<()> {
+    if new.matcher.is_empty() {
+        return Err(bad(
+            "silence match",
+            "a silence must match on something",
+            "give at least one of source, kind, key, labels",
+        ));
+    }
+    if new.matcher.key.is_some() && new.matcher.kind.is_none() {
+        return Err(bad(
+            "silence match.key",
+            "`key` needs `kind`",
+            "add the kind the key belongs to",
+        ));
+    }
+    check_until(new.until, now)?;
+    check_reason(&new.reason)?;
+    if !matches!(new.client.as_str(), "web" | "ios" | "api") {
+        return Err(bad(
+            "silence client",
+            format!("`{}` is not a client", new.client),
+            "send web, ios or api",
+        ));
+    }
+    Ok(())
 }
 
 fn check_until(until: i64, now: i64) -> Result<()> {
