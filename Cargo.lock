@@ -26,6 +26,7 @@ version = "0.1.0"
 dependencies = [
  "beacon-codegen",
  "beacon-core",
+ "beacon-server",
  "getrandom 0.4.3",
  "jiff",
  "lexopt",
@@ -64,6 +65,14 @@ dependencies = [
 [[package]]
 name = "beacon-server"
 version = "0.1.0"
+dependencies = [
+ "beacon-apns",
+ "beacon-core",
+ "beacon-store",
+ "serde",
+ "serde_json",
+ "ureq",
+]
 
 [[package]]
 name = "beacon-store"

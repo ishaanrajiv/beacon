@@ -61,6 +61,25 @@ impl Environment {
     }
 }
 
+/// A fresh P-256 signing key in the form of Apple's `.p8` files (PKCS#8 PEM). Apple issues the
+/// real one; this is for tests that run Beacon against a fake Apple.
+pub fn new_key_pem() -> Result<String, beacon_core::Problem> {
+    use base64::Engine;
+    use ring::rand::SystemRandom;
+    use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair};
+    let der = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &SystemRandom::new()).map_err(
+        |_| beacon_core::Problem::new("apns key", "the system's random source failed", "try again"),
+    )?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(der.as_ref());
+    let mut pem = String::from("-----BEGIN PRIVATE KEY-----\n");
+    for line in b64.as_bytes().chunks(64) {
+        pem.push_str(&String::from_utf8_lossy(line));
+        pem.push('\n');
+    }
+    pem.push_str("-----END PRIVATE KEY-----\n");
+    Ok(pem)
+}
+
 #[cfg(test)]
 pub(crate) mod testkit {
     use base64::Engine;

@@ -29,7 +29,7 @@ mod tests;
 
 pub use clients::{Heartbeat, NewSilence, PressAnswer, SeenTarget, SilenceView};
 pub use error::{Error, ErrorKind, Result};
-pub use jobs::{Attempt, Due, PushJob, PushNext, Ran};
+pub use jobs::{Attempt, Due, PushJob, PushNext, Ran, SinkRecord};
 pub use producers::{Event, EventAnswer, EventOutcome, EventState, Snapshot, SnapshotAnswer, SnapshotEntry};
 pub use reads::{
     Acted, AttemptView, DeviceView, HistoryEntry, Inbox, InboxQuery, ItemDetail, SourceView, VisitSummary,
