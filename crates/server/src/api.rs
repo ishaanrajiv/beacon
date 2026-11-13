@@ -81,7 +81,7 @@ fn route(app: &App, req: &Request) -> Reply {
 fn run(app: &App, req: &Request, method: &str, pattern: &str, parts: &[String]) -> Answer {
     let part = |i: usize| parts.get(i).map_or("", String::as_str);
     match (method, pattern) {
-        ("GET", "/v1") => Ok(Reply::ok(json!({"version": crate::VERSION, "routes": ROUTES}))),
+        ("GET", "/" | "/v1") => Ok(Reply::ok(json!({"version": crate::VERSION, "routes": ROUTES}))),
         ("GET", "/v1/health") => Ok(health(app)),
         ("GET", "/v1/registry") => {
             let sources = app.store.sources().map_err(store_error)?;
