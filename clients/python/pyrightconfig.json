@@ -1,0 +1,6 @@
+{
+  "include": ["beacon_client.py", "tests"],
+  "extraPaths": [".", "tests/gen"],
+  "pythonVersion": "3.10",
+  "typeCheckingMode": "strict"
+}
