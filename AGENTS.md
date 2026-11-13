@@ -9,8 +9,8 @@ before every commit.
 
 | Path | What it is |
 |---|---|
-| `crates/core` | Types and pure functions: classes, push levels, declarations (`kinds.toml`), templates and rendering, Beacon's own kinds. Next: the alert lifecycle and the delivery decision. No sockets, no database. |
-| `crates/store` | SQLite: items, alerts, silences, presence, devices, the registry, push attempts. |
+| `crates/core` | Types and pure functions: classes, push levels, declarations (`kinds.toml`), templates and rendering, Beacon's own kinds, the alert and action lifecycles, the delivery decision, quiet hours. No sockets, no database. |
+| `crates/store` | SQLite: items, alerts, silences, presence, devices, the registry, push attempts. Each method applies a core transition and records its decision in one transaction; `crates/store/README.md` maps routes and jobs to methods. |
 | `crates/server` | The HTTP/1.1 server on `std::net`, the API routes, the background jobs. |
 | `crates/apns` | Apple push: provider tokens, HTTP/2, payloads, retries. The only crate with reqwest, ring and base64. |
 | `crates/codegen` | `beacon gen`: typed emitters for Python and TypeScript. |
@@ -53,8 +53,9 @@ before every commit.
 ```sh
 scripts/check                 # format, lint, tests, allowed dependencies, nothing private, release build
 scripts/check --fast          # the same without the release build
-cargo test -p beacon-core     # declarations, templates, rendering
+cargo test -p beacon-core     # declarations, templates, rendering, the decision, the lifecycles
+cargo test -p beacon-store    # the store against SQLite, with a fake clock
 ```
 
-The `beacon` command (`spec/clients.md`) is not built yet; until it is, `crates/core` is the only
-crate with code.
+The `beacon` command (`spec/clients.md`) and the server are not built yet; `crates/core` and
+`crates/store` are the crates with code.

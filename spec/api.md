@@ -353,7 +353,9 @@ else in Trail changes. Local access only. Every item it makes belongs to source 
 | `info` | `trail.info`, key = the notice `id` |
 
 - Recorded once per notice `id`: a repeat answers `200` with `"repeat": true` and changes nothing.
-- A notice whose `ts` is more than an hour old is recorded and not pushed (`push.reason: "late"`).
+- A notice whose `ts` is more than `delivery.late` (an hour) old is recorded and not pushed:
+  whatever the decision would have been, its push is suppressed `late` (a `trail.info` record stays
+  `none`).
 - `event` is not read.
 
 Validation: `type` is `snapshot` or `notice`; `sent_at`/`ts` positive integers; each entry's
@@ -611,7 +613,8 @@ The item, plus:
 A held push of an item that leaves `open` is suppressed (`closed`).
 
 `200` `{"item": Item, "silence": Silence or null}`. Pressing an action whose effect already holds
-(done on a done item, from a second tap or a notification button that fired twice) is `200` with
+(done on a done item, snooze on a snoozed one, acknowledge on an acknowledged alert or a resolved
+one-off; a second tap or a notification button that fired twice) is `200` with
 the item unchanged. An action the item doesn't offer now is `409`, with the item's current actions
 in the fix. `404` for an unknown item.
 
