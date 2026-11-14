@@ -40,10 +40,10 @@ export interface Flushed {
 
 /** The parts of `node:fs/promises` the spool uses, typed here so the file needs no `@types/node`. */
 interface SpoolFs {
-  mkdir(path: string, options: { recursive: true }): Promise<unknown>;
+  mkdir(path: string, options: { recursive: true; mode: number }): Promise<unknown>;
   readdir(path: string): Promise<string[]>;
   readFile(path: string, encoding: "utf8"): Promise<string>;
-  writeFile(path: string, data: string, options: { flag: "wx" }): Promise<void>;
+  writeFile(path: string, data: string, options: { flag: "wx"; mode: number }): Promise<void>;
   link(from: string, to: string): Promise<void>;
   unlink(path: string): Promise<void>;
   stat(path: string): Promise<{ size: number }>;
@@ -275,7 +275,8 @@ class BeaconRuntime {
    */
   async publish(fs: SpoolFs, spool: string, data: string, now: number): Promise<void> {
     const temporary = `.${this.idempotencyKey().slice(0, 16)}.tmp`;
-    await fs.writeFile(`${spool}/${temporary}`, data, { flag: "wx" });
+    // Readable by this user only: it holds notification text. A hard link shares the mode.
+    await fs.writeFile(`${spool}/${temporary}`, data, { flag: "wx", mode: 0o600 });
     try {
       for (let tries = 0; tries < SPOOL_NAME_TRIES; tries++) {
         try {
@@ -349,7 +350,8 @@ class BeaconRuntime {
     let dropped = 0;
     try {
       const fs = await this.fs();
-      await fs.mkdir(spool, { recursive: true });
+      // Made for this user only; a folder that is already there keeps its mode.
+      await fs.mkdir(spool, { recursive: true, mode: 0o700 });
       let names = await this.spooled(fs, spool);
       // Removed only once the new file is written, so a failed write loses nothing.
       const replaced: string[] = [];

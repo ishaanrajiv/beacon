@@ -2,7 +2,7 @@
 // Run from clients/node: `node --test tests/` (Node 22.18+ runs TypeScript as it is).
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -453,6 +453,39 @@ test("a name another process takes first is not overwritten", async () => {
     bodies().map((b) => b["key"]),
     ["theirs", "mine"],
   );
+});
+
+test("the folder and its files are private to this user", { skip: process.platform === "win32" }, async () => {
+  useSpool();
+  const realFs = client.runtime.fs;
+  const temporary: number[] = [];
+  client.runtime.fs = async () => {
+    const fs = await realFs.call(client.runtime);
+    const link = async (from: string, to: string): Promise<void> => {
+      temporary.push(statSync(from).mode & 0o777);
+      await fs.link(from, to);
+    };
+    return { ...fs, link };
+  };
+  const umask = process.umask(0o022);
+  const shared = join(spool, "..", "shared");
+  try {
+    refuse();
+    await client.send("backup.space", { key: "mine" });
+    // A folder that is already there keeps its mode.
+    mkdirSync(shared);
+    chmodSync(shared, 0o750);
+    process.env.BEACON_SPOOL_DIR = shared;
+    refuse();
+    await client.send("backup.space", { key: "shared" });
+  } finally {
+    process.umask(umask);
+    client.runtime.fs = realFs;
+  }
+  assert.equal(statSync(spool).mode & 0o777, 0o700);
+  assert.deepEqual(temporary, [0o600, 0o600]);
+  assert.equal(statSync(join(spool, names()[0] ?? "")).mode & 0o777, 0o600);
+  assert.equal(statSync(shared).mode & 0o777, 0o750);
 });
 
 test("a snapshot whose replacement can't be written is kept", async () => {

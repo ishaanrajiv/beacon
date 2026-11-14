@@ -8,6 +8,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -449,6 +450,35 @@ class SpoolTest(unittest.TestCase):
             sent = beacon_client.send("backup.space", key="mine")
         self.assertTrue(sent.queued, sent.problem)
         self.assertEqual(self.keys(), ["theirs", "mine"])
+
+    @unittest.skipUnless(os.name == "posix", "Unix file modes")
+    def test_the_folder_and_its_files_are_private_to_this_user(self) -> None:
+        temporary: list[int] = []
+
+        def link(src: str, dst: str) -> None:
+            temporary.append(stat.S_IMODE(os.stat(src).st_mode))
+            real_link(src, dst)
+
+        real_link = os.link
+        umask = os.umask(0o022)
+        try:
+            with mock.patch("os.link", link):
+                self.refuse()
+                beacon_client.send("backup.space", key="mine")
+            # A folder that is already there keeps its mode.
+            shared = os.path.join(self.folder.name, "shared")
+            os.mkdir(shared)
+            os.chmod(shared, 0o750)
+            os.environ["BEACON_SPOOL_DIR"] = shared
+            self.refuse()
+            beacon_client.send("backup.space", key="shared")
+        finally:
+            os.umask(umask)
+        self.assertEqual(stat.S_IMODE(os.stat(self.spool).st_mode), 0o700)
+        self.assertEqual(temporary, [0o600])
+        [name] = self.names()
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.spool, name)).st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(os.stat(shared).st_mode), 0o750)
 
     def test_a_snapshot_whose_replacement_cant_be_written_is_kept(self) -> None:
         real_open = open

@@ -258,6 +258,10 @@ those two numbers, compared as numbers. No lock file is needed to keep that orde
   The folder must be on a file system with hard links.
 - **Older names.** Files named `<ms>-<sequence>-<hex>.json` by earlier versions are still read,
   ordered by their `(ms, sequence)` among the rest, and sent.
+- **Modes.** The files hold notification text, so a folder the spool makes is mode `700`, and
+  every file it writes (temporary and final, and the command's `.kinds-<source>.json`) is created
+  mode `600`, whatever the umask. A folder that is already there keeps its mode. A platform without
+  Unix modes gets its defaults.
 
 A file holds:
 

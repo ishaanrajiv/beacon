@@ -1046,3 +1046,57 @@ fn a_request_larger_than_the_whole_spool_is_not_queued_and_evicts_nothing() {
     assert!(text.contains("larger than the spool's limit"), "{text}");
     assert_eq!(spooled_keys(&dir), ["k0", "k1"]);
 }
+
+/// Run again in a child under `umask 022` by the test after it: this process can't set its own.
+#[cfg(unix)]
+#[test]
+fn the_spool_folder_and_its_files_are_private_to_their_user() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let dir = scratch("spool-private");
+    let spool = dir.join("spool");
+    let decl = beacon_core::decl::load(Path::new(&example("ship")), &Default::default()).unwrap();
+    let fake = Fake::start(vec![
+        (200, decl.to_json()),
+        (503, json!({})),
+        (503, json!({})),
+        (503, json!({})),
+    ]);
+    beacon(&[
+        "send",
+        "ship.drift",
+        "count=3",
+        "oldest=-1h",
+        "--spool",
+        spool.to_str().unwrap(),
+        "--server",
+        &fake.url,
+    ])
+    .unwrap();
+    assert_eq!(mode(&spool), 0o700);
+    // A request file is a hard link to the temporary file it was written as: one mode for both.
+    let [name] = spool_names(&spool).try_into().unwrap();
+    assert_eq!(mode(&spool.join(name)), 0o600);
+    assert_eq!(mode(&spool.join(".kinds-ship.json")), 0o600);
+    // A folder that is already there keeps its mode.
+    let shared = dir.join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o750)).unwrap();
+    send_while_away(&shared, "shared");
+    assert_eq!(mode(&shared), 0o750);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_spool_is_private_under_a_umask_of_022() {
+    let test = "tests::the_spool_folder_and_its_files_are_private_to_their_user";
+    let run = std::process::Command::new("sh")
+        .args(["-c", "umask 022 && exec \"$0\" --exact \"$1\""])
+        .arg(std::env::current_exe().unwrap())
+        .arg(test)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&run.stdout).into_owned() + &String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{text}");
+    assert!(text.contains("1 passed"), "{text}");
+}

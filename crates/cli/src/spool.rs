@@ -80,15 +80,16 @@ fn position(name: &str) -> Option<(i64, u32)> {
     Some((ms.parse().ok()?, sequence.parse().ok()?))
 }
 
-/// Creates `path`, which must not exist yet, holding `data`.
+/// Creates `path`, which must not exist yet, holding `data`, readable by this user only (mode 600):
+/// it holds notification text. A hard link to it shares the mode.
 fn create_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
     #[cfg(test)]
     fault::check()?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
-    file.write_all(data)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)?.write_all(data)
 }
 
 /// Two snapshots of one source covering the same kinds: the newer says all the older did.
@@ -184,6 +185,18 @@ impl Spool {
         )))
     }
 
+    /// Makes the folder for this user only (mode 700); one that is already there keeps its mode.
+    fn make_dir(&self) -> std::io::Result<()> {
+        if self.dir.is_dir() {
+            return Ok(());
+        }
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&self.dir)
+    }
+
     fn path(&self, name: &str) -> PathBuf {
         self.dir.join(name)
     }
@@ -228,7 +241,8 @@ impl Spool {
                 ),
             ));
         }
-        std::fs::create_dir_all(&self.dir).map_err(|e| self.problem(format!("can't be made: {e}")))?;
+        self.make_dir()
+            .map_err(|e| self.problem(format!("can't be made: {e}")))?;
         // Removed only once the new file is written, so a failed write loses nothing.
         let (replaced, names): (Vec<String>, Vec<String>) = self.names().into_iter().partition(|name| {
             path == SNAPSHOTS
@@ -321,7 +335,7 @@ impl Spool {
     /// while Beacon is away.
     pub fn save_kinds(&self, source: &str, decl: &Value) {
         let name = format!(".kinds-{source}.json");
-        let _ = std::fs::create_dir_all(&self.dir);
+        let _ = self.make_dir();
         let _ = self.write(&name, decl.to_string().as_bytes());
     }
 

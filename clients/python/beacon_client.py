@@ -301,7 +301,8 @@ class _Runtime:
         process took that name first; then it looks again. So no two processes take one name, and no reader
         sees half a file."""
         temporary = os.path.join(spool, f".{secrets.token_hex(8)}.tmp")
-        with open(temporary, "xb") as file:
+        # Readable by this user only: it holds notification text. A hard link shares the mode.
+        with open(temporary, "xb", opener=lambda name, flags: os.open(name, flags, 0o600)) as file:
             file.write(data)
         try:
             for _ in range(SPOOL_NAME_TRIES):
@@ -371,7 +372,8 @@ class _Runtime:
             )
             return Sent(ok=False, status=sent.status, outcome=None, item=None, problem=problem)
         try:
-            os.makedirs(spool, exist_ok=True)
+            # Made for this user only; a folder that is already there keeps its mode.
+            os.makedirs(spool, mode=0o700, exist_ok=True)
             names = self.spooled(spool)
             # Removed only once the new file is written, so a failed write loses nothing.
             replaced: list[str] = []
