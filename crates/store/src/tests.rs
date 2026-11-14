@@ -1512,6 +1512,38 @@ fn a_closed_action_stays_closed_while_the_snapshot_lists_it() {
 }
 
 #[test]
+fn two_checks_of_one_source_keep_their_own_bookkeeping() {
+    // One check of `assistant` covers its reminders, another its questions. A snapshot only
+    // touches the kinds it covers: before, the questions' snapshot forgot that the reminder was
+    // listed, so the next reminders' snapshot opened the reminder you had closed again.
+    let store = store();
+    let reminder = SnapshotEntry {
+        kind: "assistant.reminder".into(),
+        key: "r1".into(),
+        slots: json!({"text": "Call"}).as_object().cloned().unwrap(),
+        ..SnapshotEntry::default()
+    };
+    let covering = |kind: &str, firing: Vec<SnapshotEntry>| Snapshot {
+        source: "assistant".into(),
+        kinds: Some(vec![kind.into()]),
+        ..snapshot(firing)
+    };
+    let first = store
+        .apply_snapshot(&covering("assistant.reminder", vec![reminder.clone()]), T0)
+        .unwrap();
+    let id = first.opened[0];
+    store.press(id, "done", None, "ios", T0 + MINUTE).unwrap();
+    store
+        .apply_snapshot(&covering("assistant.question", vec![]), T0 + 2 * MINUTE)
+        .unwrap();
+    let again = store
+        .apply_snapshot(&covering("assistant.reminder", vec![reminder]), T0 + 3 * MINUTE)
+        .unwrap();
+    assert!(again.opened.is_empty(), "{again:?}");
+    assert_eq!(store.item(id, T0).unwrap().unwrap().state, Some(ItemState::Done));
+}
+
+#[test]
 fn an_unobserved_source_mutes_its_alerts_until_it_reports_again() {
     let store = store();
     let mut s = snapshot(vec![]);

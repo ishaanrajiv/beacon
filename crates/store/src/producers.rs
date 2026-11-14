@@ -1017,10 +1017,13 @@ impl Tx<'_, '_> {
                 answer.resolved.push(row.id);
             }
         }
-        // The listed set becomes this snapshot's.
-        self.conn
-            .prepare_cached("DELETE FROM listed WHERE source = ?1")?
-            .execute([&snap.source])?;
+        // The listed set of each covered kind becomes this snapshot's; another check's kinds of
+        // the same source keep theirs.
+        for name in &covered {
+            self.conn
+                .prepare_cached("DELETE FROM listed WHERE source = ?1 AND kind = ?2")?
+                .execute(params![snap.source, name])?;
+        }
         for (kind, key) in &present {
             self.conn
                 .prepare_cached("INSERT INTO listed (source, kind, key) VALUES (?1, ?2, ?3)")?

@@ -335,7 +335,9 @@ With `observed: true`, in one transaction:
    covered kind of this source, that has no entry, resolves. It doesn't matter whether an event or
    a snapshot opened it.
 3. An action you closed (done or dismissed) whose `(kind, key)` is still listed stays closed. It
-   opens again as a new item only after a snapshot without it, followed by one with it.
+   opens again as a new item only after a snapshot covering its kind without it, followed by one
+   with it. What was listed is kept per kind: a snapshot touches only the kinds it covers, so two
+   checks of one source can each post a snapshot for their own kinds.
 4. The source is observed again (if it wasn't, its open `beacon.source_stopped` resolves, or with
    none open Beacon records `beacon.source_observed`), its
    `last_snapshot` is now and its `stale_after` is the one given.
