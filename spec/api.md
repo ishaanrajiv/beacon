@@ -48,7 +48,7 @@ when there are several (a declarations file, an event with three bad facts).
 | `405` | The route exists, with another method. The `Allow` header lists the methods. |
 | `409` | A conflict: an Idempotency-Key reused with another body, a snapshot older than one already taken, an action that doesn't apply to the item's state, a reserved source. |
 | `410` | `POST /v1/live-activity` only: Apple says the activity's token is dead. |
-| `413` | The body is over `limits.body_bytes`. |
+| `413` | The body is over `limits.body_bytes`: by its Content-Length, or for a chunked body as soon as the chunks so far and the next chunk's size pass it. |
 | `422` | Readable, but not declared: an undeclared kind, or facts and slots that don't fit their kind. |
 | `502` | `POST /v1/live-activity` only: Apple didn't take the update. |
 | `503` | Storage failed (retry), or for `POST /v1/live-activity`, no APNs key is configured. |

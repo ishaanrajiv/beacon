@@ -336,7 +336,8 @@ impl Connection {
                     while !self.line(deadline)?.is_empty() {}
                     break;
                 }
-                if body.len() + size > limit {
+                // Checked so a size near usize::MAX can't wrap the sum round under the limit.
+                if size > limit.saturating_sub(body.len()) {
                     return Err(too_large());
                 }
                 self.take(size, &mut body, deadline)?;

@@ -1088,6 +1088,42 @@ fn a_body_over_the_limit_is_413() {
     assert_eq!(lab.post("/v1/events", &big).status, 413);
 }
 
+/// Sends `body` as a chunked request body, already framed, and answers the status.
+fn chunked(addr: SocketAddr, framed: &str) -> u16 {
+    let mut stream = TcpStream::connect(addr).unwrap();
+    let request = format!(
+        "POST /v1/events HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Type: application/json\r\n\
+         Transfer-Encoding: chunked\r\n\r\n{framed}"
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut out = Vec::new();
+    stream.read_to_end(&mut out).unwrap();
+    let out = String::from_utf8(out).unwrap();
+    let status = out.split(' ').nth(1).unwrap_or_default();
+    status.parse().unwrap_or(0)
+}
+
+#[test]
+fn a_chunked_body_over_the_limit_is_413_even_when_its_sizes_would_wrap() {
+    let lab = start_with("[limits]\nbody_bytes = 4096", true);
+    // A small chunk, then a size that wraps `len + size` round to a small number.
+    assert_eq!(chunked(lab.addr(), "1\r\n{\r\nffffffffffffffff\r\n"), 413);
+    // Two chunks that only together pass the limit.
+    let two = format!(
+        "800\r\n{}\r\n801\r\n{}\r\n0\r\n\r\n",
+        "x".repeat(0x800),
+        "x".repeat(0x801)
+    );
+    assert_eq!(chunked(lab.addr(), &two), 413);
+    // Exactly the limit is read (and refused for what it says, not its size).
+    let body = format!(
+        "{{\"kind\": \"lab.note\", \"slots\": {{\"text\": \"{}\"}}}}",
+        "x".repeat(10)
+    );
+    let framed = format!("{:x}\r\n{body}\r\n0\r\n\r\n", body.len());
+    assert_eq!(chunked(lab.addr(), &framed), 200);
+}
+
 #[test]
 fn idempotent_events_answer_again() {
     let lab = start();
