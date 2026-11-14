@@ -119,6 +119,25 @@ A send goes to every registered device (`spec/apns.md`), with:
 The item's `push.status` is `queued` until a device takes it (`sent`) or every device has failed
 for good (`failed`, with `rejected`, `expired`, `no_devices` or `unconfigured`).
 
+**A queued push never outlives what it says.** The phone must not end up showing the firing text
+of an alert or action that has closed:
+
+- When an item leaves `open` (an alert resolved or dismissed, an action done, dismissed, snoozed
+  or resolved) while its push is `queued` (waiting for its first attempt or a retry), the push
+  makes no more attempts. If no attempt was `accepted` or `uncertain`, no device has it: the
+  item's push is suppressed (`closed`) and it needs no recovery. If one was, a device may have
+  it: a resolved alert that isn't flapping or one-off gets its **recovery** push, which replaces
+  that banner through the shared collapse id; anything else is suppressed (`closed`), and the
+  iPhone app removes the notification when it next opens (`spec/clients.md`).
+- A push the sender has in flight at that moment has no attempt recorded yet, so it is cancelled
+  as above. When Apple's answer comes back it is recorded; if the push was the item's own,
+  Apple took it or gave no clear answer, and the item is an alert that has stayed resolved with
+  nothing newer queued, the recovery goes out then. One sender sends one push at a time, so the
+  recovery always follows the push it replaces.
+- A newer push about the same item (a repeat, a recovery, a reopening's push) cancels an older
+  one still queued: they share a collapse id, and the older would only put stale text back. A
+  reopening cancels a recovery still queued even when the reopening itself doesn't push.
+
 ## Alerts
 
 An alert item is one incident of one `(kind, key)`. Its state is `open`, `dismissed` or
@@ -130,7 +149,7 @@ stop).
 | — (no item, or the last resolved `flap_window` or more ago) | fire | `open` | A new item. `openings = 1`. `seen = false`. Repeats scheduled from now. Decide (`opened`). |
 | `resolved`, within `flap_window` of resolving | fire | `open` | The same item reopens: `times.opened` now, `times.resolved`, `acknowledged` and `dismissed` cleared, `seen = false`, text back to the firing text, repeats rescheduled. Count the openings within the window; more than `flap_openings` (3) → flapping (below). Decide (`reopened`). |
 | `open`, `dismissed` | fire | unchanged | Facts, slots, text and labels updated. No push. |
-| `open`, `dismissed` | resolve (an event, or absent from its source's snapshot) | `resolved` | `times.resolved` now. Text becomes the recovery text, with `{lasted}` from `times.opened` to now. `seen = false`. A held push is suppressed (`closed`). Repeats cancelled. If the item's push was `sent` and it isn't flapping, a **recovery** push: the recovery text, same collapse id, `passive`, no category; the item's `push.status` follows it (`queued`, then `sent`). It is not subject to silences, quiet hours, presence or throttle; only to `push = false` (suppressed, `push_off`). |
+| `open`, `dismissed` | resolve (an event, or absent from its source's snapshot) | `resolved` | `times.resolved` now. Text becomes the recovery text, with `{lasted}` from `times.opened` to now. `seen = false`. A held push is suppressed (`closed`); a queued one stops ("Sending"). Repeats cancelled. If the item's push was `sent`, or was queued and a device may have it ("Sending"), and it isn't flapping, a **recovery** push: the recovery text, same collapse id, `passive`, no category; the item's `push.status` follows it (`queued`, then `sent`). It is not subject to silences, quiet hours, presence or throttle; only to `push = false` (suppressed, `push_off`). |
 | `resolved` | resolve | unchanged | Nothing (`outcome: "ignored"`). |
 | `open`, `dismissed` | acknowledge | unchanged | `acknowledged` now. Repeats cancelled. A one-off alert resolves instead (no recovery text: it keeps its own). |
 | `open` | dismiss | `dismissed` | Leaves Needs you; stays in Alerts. Repeats cancelled. A held push is suppressed (`closed`). A one-off alert resolves instead. |
@@ -160,7 +179,7 @@ stop).
 |---|---|---|---|
 | — (no item in `open` or `snoozed` for the `(kind, key)`) | open | `open` | A new item. `seen = false`. Decide (`opened`). |
 | `open`, `snoozed` | open | unchanged | Facts, slots, text and labels updated. No push. |
-| `open`, `snoozed` | done | `done` | `times.done`. A held push is suppressed (`closed`). |
+| `open`, `snoozed` | done | `done` | `times.done`. A held push is suppressed (`closed`); a queued one stops ("Sending"). |
 | `open`, `snoozed` | dismiss | `dismissed` | `times.dismissed`. The same. |
 | `open` | snooze until T | `snoozed` | `times.snoozed_until = T`. The same. |
 | `snoozed` | T passes | `open` | `seen = false`. Decide (`woke`). |

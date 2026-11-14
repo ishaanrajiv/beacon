@@ -569,7 +569,7 @@ Every route that returns notifications returns this shape.
 |---|---|
 | `none` | `declared` (a record, or a kind with push `none`) |
 | `held` | `active` (you're active somewhere), `quiet_hours` |
-| `suppressed` | `silenced`, `unobserved`, `flapping`, `viewing` (a client showed its context), `seen` (seen while held), `closed` (done, dismissed, snoozed or resolved while held), `throttled`, `catch_up`, `late`, `push_off` |
+| `suppressed` | `silenced`, `unobserved`, `flapping`, `viewing` (a client showed its context), `seen` (seen while held), `closed` (done, dismissed, snoozed or resolved while held, or while queued: see `spec/delivery.md`, "Sending"), `throttled`, `catch_up`, `late`, `push_off` |
 | `failed` | `no_devices`, `rejected` (Apple refused it for every device), `expired` (not taken within an hour), `unconfigured` (no signing key) |
 
 The buttons that apply now (`actions`), from the kind's declared list:

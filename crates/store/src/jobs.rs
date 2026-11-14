@@ -11,7 +11,7 @@ use beacon_core::builtin;
 use beacon_core::delivery::{self, CatchUpPlan, Held, PRESENCE_KEPT, SILENCE_KEPT};
 use beacon_core::duration::DAY;
 use beacon_core::lifecycle::Input;
-use beacon_core::model::{Class, PushLevel, PushReason, PushStatus, Trigger};
+use beacon_core::model::{Class, ItemState, PushLevel, PushReason, PushStatus, Trigger};
 use beacon_core::quiet::local_day;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -276,10 +276,10 @@ impl Store {
     /// (`push_failed`), or still `queued` for a retry.
     pub fn push_attempted(&self, push: i64, attempts: &[Attempt], next: PushNext, now: i64) -> Result<()> {
         self.write(now, |w| {
-            let (item, purpose, count): (i64, String, i64) = w
+            let (item, purpose, count, status): (i64, String, i64, String) = w
                 .conn
-                .prepare_cached("SELECT item, purpose, attempts FROM pushes WHERE id = ?1")?
-                .query_row([push], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                .prepare_cached("SELECT item, purpose, attempts, status FROM pushes WHERE id = ?1")?
+                .query_row([push], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
             for attempt in attempts {
                 w.conn
                     .prepare_cached(
@@ -301,6 +301,9 @@ impl Store {
                         "UPDATE dev.devices SET last_push = ?2, last_status = ?3 WHERE token = ?1",
                     )?
                     .execute(params![attempt.token, now, attempt.status])?;
+            }
+            if status != "queued" {
+                return w.cancelled_in_flight(push, item, &purpose, next);
             }
             match next {
                 PushNext::RetryAt(at) => {
@@ -346,6 +349,35 @@ impl Tx<'_, '_> {
             row.push.status = status;
             row.push.reason = reason;
             row.push.at = Some(self.now);
+            self.touch(&mut row)?;
+        }
+        Ok(())
+    }
+
+    /// The answer to a push that was cancelled while the sender had it in flight (its item left
+    /// open, or a newer push replaced it). Its attempts are kept and it makes no more. If a
+    /// device may have it, it was the item's push, and the item is an alert that has since
+    /// resolved with nothing newer queued, the recovery owed goes out now to replace its banner.
+    fn cancelled_in_flight(&mut self, push: i64, item: i64, purpose: &str, next: PushNext) -> Result<()> {
+        self.conn
+            .prepare_cached("UPDATE pushes SET attempts = attempts + 1 WHERE id = ?1")?
+            .execute([push])?;
+        if next == PushNext::Sent {
+            self.history(item, "push_sent", None)?;
+        }
+        if purpose != "item" || !crate::engine::may_have_delivered(self.conn, push)? {
+            return Ok(());
+        }
+        let Some(mut row) = rows::load(self.conn, item)? else {
+            return Ok(());
+        };
+        let owed = row.push_job == Some(push)
+            && row.life.class == Class::Alert
+            && row.life.state == Some(ItemState::Resolved)
+            && !row.life.flapping
+            && !row.life.one_off;
+        if owed {
+            self.recovery(&mut row)?;
             self.touch(&mut row)?;
         }
         Ok(())

@@ -294,6 +294,126 @@ fn resolving_a_sent_alert_queues_a_passive_recovery() {
     assert!(again.item.is_none());
 }
 
+fn attempt(status: &str) -> Attempt {
+    Attempt {
+        token: "a".repeat(64),
+        environment: "production".into(),
+        status: status.into(),
+        reason: (status != "accepted").then(|| "timeout".into()),
+    }
+}
+
+#[test]
+fn a_queued_push_no_device_took_is_cancelled_when_its_alert_resolves() {
+    let store = store();
+    let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+    assert_eq!(it.push.status, S::Queued);
+    // Apple rejected it with a retryable answer: no device has it.
+    let job = store.pushes_due(T0).unwrap()[0].id;
+    store
+        .push_attempted(
+            job,
+            &[attempt("rejected")],
+            PushNext::RetryAt(T0 + 10 * SECOND),
+            T0,
+        )
+        .unwrap();
+    let after = item(
+        &store
+            .apply_event(&resolved(failed()), None, T0 + 5 * SECOND)
+            .unwrap(),
+    );
+    assert_eq!(after.push.status, S::Suppressed);
+    assert_eq!(after.push.reason, Some(R::Closed));
+    // No retry of the firing text, and no recovery for a banner nobody got.
+    assert!(store.pushes_due(T0 + HOUR / 2).unwrap().is_empty());
+    assert_eq!(history(&store, it.id), ["opened", "resolved", "push_suppressed"]);
+}
+
+#[test]
+fn a_queued_push_a_device_may_have_is_followed_by_the_recovery() {
+    let store = store();
+    let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+    let job = store.pushes_due(T0).unwrap()[0].id;
+    // No clear answer from Apple: it may be on the phone, and is waiting to retry.
+    store
+        .push_attempted(
+            job,
+            &[attempt("uncertain")],
+            PushNext::RetryAt(T0 + 10 * SECOND),
+            T0,
+        )
+        .unwrap();
+    let after = item(
+        &store
+            .apply_event(&resolved(failed()), None, T0 + 5 * SECOND)
+            .unwrap(),
+    );
+    assert_eq!(after.push.status, S::Queued);
+    let due = store.pushes_due(T0 + HOUR / 2).unwrap();
+    assert_eq!(
+        due.len(),
+        1,
+        "only the recovery: the firing push makes no more attempts"
+    );
+    assert_eq!(due[0].purpose, "recovery");
+    assert_eq!(due[0].title, after.title);
+    assert_eq!(due[0].collapse_id, it.collapse_id);
+    sent(&store, T0 + 10 * SECOND);
+    let done = store.item(it.id, T0).unwrap().unwrap();
+    assert_eq!(done.push.status, S::Sent);
+    assert!(history(&store, it.id).contains(&"recovery_sent".to_string()));
+}
+
+#[test]
+fn a_push_in_flight_when_its_alert_resolves_is_followed_by_the_recovery_if_taken() {
+    for (answer, next, recovery) in [
+        ("accepted", PushNext::Sent, true),
+        ("uncertain", PushNext::RetryAt(T0 + 10 * SECOND), true),
+        ("rejected", PushNext::Failed(R::Rejected), false),
+    ] {
+        let store = store();
+        let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+        // The sender has taken the job and is talking to Apple...
+        let job = store.pushes_due(T0).unwrap()[0].id;
+        // ...when the alert resolves: no attempt is recorded yet, so it is cancelled.
+        let after = item(&store.apply_event(&resolved(failed()), None, T0 + SECOND).unwrap());
+        assert_eq!(after.push.status, S::Suppressed);
+        // Then Apple answers.
+        store
+            .push_attempted(job, &[attempt(answer)], next, T0 + 2 * SECOND)
+            .unwrap();
+        let due = store.pushes_due(T0 + HOUR / 2).unwrap();
+        if recovery {
+            assert_eq!(due.len(), 1, "{answer}");
+            assert_eq!(due[0].purpose, "recovery");
+            let row = store.item(it.id, T0).unwrap().unwrap();
+            assert_eq!(row.push.status, S::Queued);
+        } else {
+            assert!(due.is_empty(), "{answer}");
+            let row = store.item(it.id, T0).unwrap().unwrap();
+            assert_eq!(row.push.status, S::Suppressed);
+        }
+    }
+}
+
+#[test]
+fn a_reopening_cancels_a_recovery_still_waiting() {
+    let store = store();
+    let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+    sent(&store, T0);
+    store.apply_event(&resolved(failed()), None, T0 + MINUTE).unwrap();
+    assert_eq!(store.pushes_due(T0 + MINUTE).unwrap()[0].purpose, "recovery");
+    store.apply_event(&failed(), None, T0 + 2 * MINUTE).unwrap();
+    assert!(
+        store
+            .pushes_due(T0 + 2 * MINUTE)
+            .unwrap()
+            .iter()
+            .all(|job| job.purpose != "recovery" || job.item != it.id)
+    );
+}
+
 #[test]
 fn an_alert_that_never_pushed_recovers_quietly() {
     let store = store();
@@ -902,9 +1022,16 @@ fn actions_snooze_wake_and_close() {
             "snoozed",
             "updated",
             "woke",
-            "done"
+            "done",
+            "push_suppressed"
         ]
     );
+    // The push the wake queued was never taken: closing it cancelled it.
+    assert_eq!(
+        (done.push.status, done.push.reason),
+        (S::Suppressed, Some(R::Closed))
+    );
+    assert!(store.pushes_due(T0 + 3 * HOUR).unwrap().is_empty());
 }
 
 #[test]

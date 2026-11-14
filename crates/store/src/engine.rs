@@ -287,13 +287,27 @@ impl<'a, 'r> Tx<'a, 'r> {
         if step.close_held && row.push.status == PushStatus::Held {
             self.suppress(row, PushReason::Closed)?;
         }
+        // A push still queued for an item that left open makes no more attempts. If a device
+        // may already have it, the recovery below replaces its banner.
+        let mut may_have = false;
+        if step.close_held && row.push.status == PushStatus::Queued {
+            may_have = self.cancel_queued(row)?;
+            if !(may_have && step.recovery) {
+                self.suppress(row, PushReason::Closed)?;
+            }
+        }
         match step.text {
             Text::Keep => {}
             Text::Firing => self.render_firing(row),
             Text::Recovery => self.render_recovery(row),
         }
-        if step.recovery && row.push.status == PushStatus::Sent {
+        if step.recovery && (row.push.status == PushStatus::Sent || may_have) {
             self.recovery(row)?;
+        }
+        // A recovery still waiting when the alert fires again would say it is back while it is
+        // open: the reopening's own decision stands instead.
+        if step.outcome == Outcome::Reopened {
+            self.supersede_queued(row.id)?;
         }
         if step.flapping {
             self.history(row.id, "flapping", None)?;
@@ -489,6 +503,33 @@ impl<'a, 'r> Tx<'a, 'r> {
         Ok(())
     }
 
+    /// Cancels the item's queued push (`spec/delivery.md`, "Sending"): no more attempts. True
+    /// when a device may already have it: an attempt was accepted, or got no clear answer.
+    fn cancel_queued(&self, row: &Row) -> Result<bool> {
+        let Some(job) = row.push_job else {
+            return Ok(false);
+        };
+        let may_have = may_have_delivered(self.conn, job)?;
+        self.conn
+            .prepare_cached(
+                "UPDATE pushes SET status = 'cancelled', reason = 'closed', finished = ?2 \
+                 WHERE id = ?1 AND status = 'queued'",
+            )?
+            .execute(params![job, self.now])?;
+        Ok(may_have)
+    }
+
+    /// Cancels every push of the item still waiting to be sent: something newer stands.
+    fn supersede_queued(&self, item: i64) -> Result<()> {
+        self.conn
+            .prepare_cached(
+                "UPDATE pushes SET status = 'cancelled', reason = 'superseded', finished = ?2 \
+                 WHERE item = ?1 AND status = 'queued'",
+            )?
+            .execute(params![item, self.now])?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)] // reason: one row of the push queue, field by field
     fn queue(
         &self,
@@ -500,6 +541,9 @@ impl<'a, 'r> Tx<'a, 'r> {
         category: Option<&str>,
         data: &Value,
     ) -> Result<i64> {
+        // The newest push about an item replaces the last one's banner (the collapse id), so an
+        // older one still waiting to retry would only put stale text back over it.
+        self.supersede_queued(row.id)?;
         self.conn
             .prepare_cached(
                 "INSERT INTO pushes (item, purpose, queued_at, title, body, level, collapse_id, category, thread, url, \
@@ -521,9 +565,9 @@ impl<'a, 'r> Tx<'a, 'r> {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// A resolved alert whose push was sent: the recovery text, passive, same collapse id. Only
-    /// `push = false` stops it.
-    fn recovery(&mut self, row: &mut Row) -> Result<()> {
+    /// A resolved alert whose push was sent, or may have reached a device: the recovery text,
+    /// passive, same collapse id. Only `push = false` stops it.
+    pub(crate) fn recovery(&mut self, row: &mut Row) -> Result<()> {
         if !self.s.push {
             return self.suppress(row, PushReason::PushOff);
         }
@@ -649,7 +693,16 @@ impl<'a, 'r> Tx<'a, 'r> {
     }
 }
 
-/// The input an alert or action event's open state means.
+/// Whether a device may have push `job`: an attempt Apple accepted, or one with no clear answer.
+pub(crate) fn may_have_delivered(conn: &Connection, job: i64) -> Result<bool> {
+    let n: i64 = conn
+        .prepare_cached(
+            "SELECT count(*) FROM attempts WHERE push = ?1 AND status IN ('accepted', 'uncertain')",
+        )?
+        .query_row([job], |r| r.get(0))?;
+    Ok(n > 0)
+}
+
 /// A push's `data` (`spec/apns.md`): the item's id, kind, key and collapse id, and its context
 /// when it has one. Never a token.
 fn push_data(row: &Row) -> Value {
@@ -660,6 +713,7 @@ fn push_data(row: &Row) -> Value {
     data
 }
 
+/// The input an alert or action event's open state means.
 pub(crate) fn open_input(class: Class) -> Input {
     if class == Class::Alert {
         Input::Fire
