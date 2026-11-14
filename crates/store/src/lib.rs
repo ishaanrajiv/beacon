@@ -50,7 +50,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 /// The schema version this crate writes (`PRAGMA user_version`).
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Beacon's store. Open it once and share it; it is `Send + Sync`. Calls are serialized on one
@@ -95,7 +95,7 @@ impl Store {
         })?;
         conn.execute("ATTACH DATABASE ?1 AS dev", [devices])
             .map_err(|e| Error::sql("can't open devices.db", &e))?;
-        Store::start(conn, settings, true)
+        Store::start(conn, settings, Some(&path.with_file_name("previous")))
     }
 
     /// A store in memory, for tests and `beacon check`.
@@ -103,13 +103,15 @@ impl Store {
         let conn = Connection::open_in_memory().map_err(|e| Error::sql("can't open a database", &e))?;
         conn.execute_batch("ATTACH DATABASE ':memory:' AS dev")
             .map_err(|e| Error::sql("can't open a database", &e))?;
-        Store::start(conn, settings, false)
+        Store::start(conn, settings, None)
     }
 
-    fn start(mut conn: Connection, settings: Settings, wal: bool) -> Result<Store> {
+    /// `previous` is where a copy of beacon.db is kept before a migration: a file database's
+    /// `<data_dir>/previous`, or none in memory (which also means no WAL).
+    fn start(mut conn: Connection, settings: Settings, previous: Option<&Path>) -> Result<Store> {
         conn.busy_timeout(BUSY_TIMEOUT)
             .map_err(|e| Error::sql("can't set the busy timeout", &e))?;
-        migrate(&mut conn, wal)?;
+        migrate(&mut conn, previous)?;
         let builtin = beacon_core::builtin::declarations().map_err(|problems| {
             Error::new(
                 ErrorKind::Storage,
@@ -190,6 +192,7 @@ impl Store {
             w.unreadable = unreadable;
             f(&mut w)?
         };
+        engine::stamp_history(&tx)?;
         tx.commit().map_err(|e| Error::sql("can't commit", &e))?;
         Ok(value)
     }
@@ -245,7 +248,8 @@ impl Inner {
 }
 
 /// Sets the connection up and brings the schema to [`SCHEMA_VERSION`].
-fn migrate(conn: &mut Connection, wal: bool) -> Result<()> {
+fn migrate(conn: &mut Connection, previous: Option<&Path>) -> Result<()> {
+    let wal = previous.is_some();
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(|e| Error::sql("can't read the schema version", &e))?;
@@ -254,8 +258,16 @@ fn migrate(conn: &mut Connection, wal: bool) -> Result<()> {
             ErrorKind::Storage,
             "beacon.db",
             format!("the database is schema version {version}; this Beacon knows up to {SCHEMA_VERSION}"),
-            "run the newer Beacon that wrote it, or restore a backup made before the upgrade",
+            format!(
+                "run the newer Beacon that wrote it, or put back the copy it kept before upgrading, previous/v{SCHEMA_VERSION}/beacon.db beside beacon.db (spec/config.md, \"Going back a version\")"
+            ),
         ));
+    }
+    if let Some(previous) = previous
+        && version > 0
+        && version < SCHEMA_VERSION
+    {
+        keep_previous(conn, &previous.join(format!("v{version}")))?;
     }
     if wal {
         for schema in ["main", "dev"] {
@@ -292,6 +304,10 @@ fn migrate(conn: &mut Connection, wal: bool) -> Result<()> {
         tx.execute_batch(include_str!("migrate_2.sql"))
             .map_err(|e| Error::sql("can't move to schema version 2", &e))?;
     }
+    if version < 3 {
+        tx.execute_batch(include_str!("migrate_3.sql"))
+            .map_err(|e| Error::sql("can't move to schema version 3", &e))?;
+    }
     if version < SCHEMA_VERSION {
         tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
             .map_err(|e| Error::sql("can't set the schema version", &e))?;
@@ -304,4 +320,41 @@ fn migrate(conn: &mut Connection, wal: bool) -> Result<()> {
             .map_err(|e| Error::sql("can't checkpoint beacon.db", &e))?;
     }
     Ok(())
+}
+
+/// Keeps a consistent copy of beacon.db as it is before a migration, at
+/// `<data_dir>/previous/v<old>/beacon.db`, so going back to the Beacon that wrote it is a file copy
+/// (`spec/config.md`, "Going back a version"). Written under another name and renamed, so the copy
+/// is whole or absent. Without it, Beacon doesn't migrate: it stops with the problem.
+fn keep_previous(conn: &Connection, dir: &Path) -> Result<()> {
+    let fail = |what: String| {
+        Error::new(
+            ErrorKind::Storage,
+            "beacon.db",
+            format!(
+                "can't keep a copy of the database before upgrading its schema, in {}: {what}",
+                dir.display()
+            ),
+            format!(
+                "make {} writable by Beacon's user, with room for a copy of beacon.db, and start again; nothing was changed",
+                dir.display()
+            ),
+        )
+    };
+    std::fs::create_dir_all(dir).map_err(|e| fail(e.to_string()))?;
+    let partial = dir.join("beacon.db.partial");
+    let _ = std::fs::remove_file(&partial);
+    let target = partial
+        .to_str()
+        .ok_or_else(|| fail("the path is not UTF-8".to_string()))?;
+    conn.execute("VACUUM main INTO ?1", [target])
+        .map_err(|e| fail(e.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // It may hold what beacon.db held: only Beacon's user reads it.
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&partial, dir.join("beacon.db")).map_err(|e| fail(e.to_string()))
 }

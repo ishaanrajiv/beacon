@@ -1336,3 +1336,126 @@ fn a_keep_publish_keeps_kinds_and_a_plain_one_closes_what_it_removed() {
             .any(|h| h["what"] == "kind_removed")
     );
 }
+
+// ---------- the copy to Trail ----------
+
+/// A Trail that records each ingest body and answers from a script of statuses, then 200.
+fn fake_trail(script: Vec<u16>) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let bodies = seen.clone();
+    std::thread::spawn(move || {
+        let mut script = script.into_iter();
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
+                let line = line.trim_end();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            bodies
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(&body).unwrap_or(Value::Null));
+            let status = script.next().unwrap_or(200);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            );
+        }
+    });
+    (url, seen)
+}
+
+/// The ids of the events in each body Trail was sent.
+fn ingested(seen: &Mutex<Vec<Value>>) -> Vec<Vec<String>> {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .map(|body| {
+            body["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["id"].as_str().unwrap().to_string())
+                .collect()
+        })
+        .collect()
+}
+
+fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !done() {
+        assert!(std::time::Instant::now() < until, "waited 20 s for {what}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_copy_trail_refuses_is_dropped_and_counted_not_retried() {
+    let (url, seen) = fake_trail(vec![400]);
+    let lab = start_with(&format!("[sink]\ntrail_url = \"{url}\"\n"), false);
+    let note = |text: &str| {
+        let sent = lab.post(
+            "/v1/events",
+            &json!({"kind": "lab.note", "key": text, "slots": {"text": text}}),
+        );
+        assert_eq!(sent.status, 200, "{:?}", sent.json);
+    };
+    note("first");
+    wait_for("the first copy", || !ingested(&seen).is_empty());
+    note("second");
+    wait_for("the second copy", || ingested(&seen).len() >= 2);
+    let bodies = ingested(&seen);
+    let refused = &bodies[0];
+    assert_eq!(refused.len(), 1);
+    // A 4xx will never be taken: the copies behind it go on without it.
+    assert!(
+        !bodies[1].contains(&refused[0]),
+        "the refused copy was sent again: {bodies:?}"
+    );
+    assert_eq!(lab.get("/v1/health").json["sink_dropped"], 1);
+}
+
+#[test]
+fn a_refused_batch_is_sent_again_one_change_at_a_time() {
+    // Down for the first try, so two changes wait; then the batch of both is refused, the first
+    // alone is taken and the second alone refused.
+    let (url, seen) = fake_trail(vec![503, 400, 200, 400]);
+    let lab = start_with(&format!("[sink]\ntrail_url = \"{url}\"\n"), false);
+    let note = |text: &str| {
+        let body = json!({"kind": "lab.note", "key": text, "slots": {"text": text}});
+        assert_eq!(lab.post("/v1/events", &body).status, 200);
+    };
+    note("first");
+    wait_for("the first try", || !ingested(&seen).is_empty());
+    note("second");
+    wait_for("both, one at a time", || ingested(&seen).len() >= 4);
+    let one = "beacon-1".to_string();
+    let two = "beacon-2".to_string();
+    assert_eq!(
+        ingested(&seen),
+        [
+            vec![one.clone()],
+            vec![one.clone(), two.clone()],
+            vec![one],
+            vec![two]
+        ]
+    );
+    wait_for("the drop to be counted", || {
+        lab.get("/v1/health").json["sink_dropped"] == 1
+    });
+}

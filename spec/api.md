@@ -115,7 +115,7 @@ the bare prefix (`/beacon/`) gets a `200` rather than a `404`.
 ### `GET /v1/health`
 
 ```json
-{"ok": true, "version": "0.1.0", "started": 1794571200000, "push": true, "apns": "ok", "devices": 1, "unreadable_sources": 0}
+{"ok": true, "version": "0.1.0", "started": 1794571200000, "push": true, "apns": "ok", "devices": 1, "unreadable_sources": 0, "sink_dropped": 0}
 ```
 
 | Field | |
@@ -125,6 +125,7 @@ the bare prefix (`/beacon/`) gets a `200` rather than a `404`.
 | `apns` | `ok`, or `unconfigured` when there is no signing key |
 | `devices` | registered devices |
 | `unreadable_sources` | published sources whose stored declarations, or some of whose kinds, Beacon can't read back (`spec/declarations.md`, "Reading back what was stored"); `GET /v1/registry` says which |
+| `sink_dropped` | item changes Trail refused with a `4xx`, so the copy to Trail dropped them (`spec/config.md`, "The copy to Trail"); 0 without `[sink]` |
 
 ## The registry
 

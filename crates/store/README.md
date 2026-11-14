@@ -50,12 +50,15 @@ owns "did you mean" for unknown fields and the body limits.
 | Owed work, at least once a second and at start | `run_due(now) -> Ran`: holds released, the catch-up, snoozes woken, repeats, flapping alerts settled, silences ended, stale sources, pushes given up (`expired`), daily retention. Each piece runs in its own transaction, oldest first. |
 | What is due, without running it | `due(now) -> Vec<(at, Due)>`; `next_due(now) -> Option<at>` to sleep until |
 | The push sender | `pushes_due(now) -> Vec<PushJob>` (each with every device, read from `devices.db` at that moment), then `push_attempted(push, &[Attempt], PushNext, now)` with `Sent`, `Failed(reason)` or `RetryAt(t)` (an attempt keeps the token's last six characters only); `forget_device` for a dead token, `set_device_environment` for one Apple took in the other environment |
-| The copy to Trail | `sink_batch(limit) -> Vec<SinkRecord>` after the cursor, then `sink_done(last_id, now)` once Trail took them |
+| The copy to Trail | `sink_batch(limit) -> Vec<SinkRecord>` after the cursor, each as its change left the item; `sink_done(last_id, now)` once Trail took them; `sink_dropped(id, now)` past one Trail refused, counted (`sink_dropped_count`) |
 
 ## Layout
 
 `lib.rs` (open, migrate, transactions), `rows.rs` (an item's row), `engine.rs` (deciding and
 recording inside a transaction), `producers.rs`, `trail.rs` (Trail's webhook), `clients.rs`, `reads.rs`, `jobs.rs`,
 `schema.sql` (version 1), `migrate_2.sql` (version 2: devices out to `devices.sql`, attempts keep
-six characters, items keep a chosen category). `cargo test -p beacon-store`
+six characters, items keep a chosen category), `migrate_3.sql` (version 3: history rows keep what
+their item was, filled by `engine::stamp_history` before every commit). Before a migration, `migrate`
+keeps a copy of the old database in `<data_dir>/previous/v<old>/` (`spec/config.md`, "Going back a
+version"). `cargo test -p beacon-store`
 runs every case against an in-memory database, plus one file database across a restart.

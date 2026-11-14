@@ -272,6 +272,7 @@ impl Store {
             w.unreadable = unreadable;
             w.store_declarations(decl, keep)?
         };
+        crate::engine::stamp_history(&tx)?;
         tx.commit().map_err(|e| Error::sql("can't commit", &e))?;
         inner.reload_registry()?;
         Ok(published)

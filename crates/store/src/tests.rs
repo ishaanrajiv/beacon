@@ -2415,7 +2415,7 @@ fn a_version_1_database_moves_its_devices_out() {
     assert!(!every_text(&path).contains(&token));
     let conn = rusqlite::Connection::open(&path).unwrap();
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let device: String = conn
         .query_row("SELECT device FROM attempts", [], |r| r.get(0))
         .unwrap();
@@ -2882,4 +2882,130 @@ fn every_item_carries_its_service_so_a_deploys_silence_matches_it() {
         .unwrap();
     assert_eq!(stopped.labels["service"], "backup");
     assert_eq!(stopped.push.reason, Some(R::Silenced));
+}
+
+#[test]
+fn the_copy_to_trail_says_what_the_item_was_at_each_change() {
+    let store = store();
+    let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+    sent(&store, T0);
+    // The copy hasn't run yet (Trail is down) when the alert resolves.
+    store
+        .apply_event(&resolved(failed()), None, T0 + 90 * MINUTE)
+        .unwrap();
+    let steps: Vec<(String, Option<String>, String, String)> = store
+        .sink_batch(100)
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.what, r.state, r.title, r.push_status))
+        .collect();
+    let open = Some("open".to_string());
+    assert_eq!(
+        steps,
+        [
+            ("opened".into(), open.clone(), it.title.clone(), "queued".into()),
+            ("push_sent".into(), open, it.title.clone(), "sent".into()),
+            (
+                "resolved".into(),
+                Some("resolved".into()),
+                "Backups are working again".into(),
+                "queued".into()
+            ),
+        ]
+    );
+}
+
+/// A beacon.db at schema version 2 with an alert that opened, pushed and resolved: made by this
+/// version, then taken back to what version 2 had.
+fn version_2_database(name: &str) -> std::path::PathBuf {
+    let dir = temp_dir(name);
+    let path = dir.join("beacon.db");
+    let store = Store::open(&path, Settings::default()).unwrap();
+    store
+        .publish(&parse(BACKUP, &Check::default()).unwrap(), T0 - DAY)
+        .unwrap();
+    store.apply_event(&failed(), None, T0).unwrap();
+    sent(&store, T0);
+    store.apply_event(&resolved(failed()), None, T0 + HOUR).unwrap();
+    drop(store);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "DROP VIEW IF EXISTS items_v1; DROP VIEW IF EXISTS history_v1; DROP INDEX history_unstamped; \
+         ALTER TABLE history DROP COLUMN state; ALTER TABLE history DROP COLUMN title; \
+         ALTER TABLE history DROP COLUMN push_level; ALTER TABLE history DROP COLUMN push_status; \
+         ALTER TABLE history DROP COLUMN push_reason; PRAGMA user_version = 2;",
+    )
+    .unwrap();
+    path
+}
+
+fn user_version(path: &std::path::Path) -> i64 {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap()
+}
+
+#[test]
+fn upgrading_the_schema_keeps_a_whole_copy_of_the_version_before() {
+    let path = version_2_database("upgrade");
+    let store = Store::open(&path, Settings::default()).unwrap();
+    // The rows from before have the item as it is now: what the copy to Trail sent for them.
+    let states: Vec<Option<String>> = store
+        .sink_batch(100)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.state)
+        .collect();
+    assert_eq!(states.len(), 3);
+    assert!(states.iter().all(|s| s.as_deref() == Some("resolved")));
+    drop(store);
+    assert_eq!(user_version(&path), 3);
+    let copy = path.with_file_name("previous").join("v2").join("beacon.db");
+    assert_eq!(user_version(&copy), 2);
+    let conn = rusqlite::Connection::open(&copy).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT count(*) FROM history", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 3);
+    assert!(!copy.with_file_name("beacon.db.partial").exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&copy).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    // Starting again changes nothing more.
+    drop(Store::open(&path, Settings::default()).unwrap());
+    assert_eq!(user_version(&copy), 2);
+}
+
+#[test]
+fn without_its_copy_the_schema_is_not_upgraded() {
+    let path = version_2_database("no-copy");
+    // Something that isn't a folder where the copy goes.
+    std::fs::write(path.with_file_name("previous"), "in the way").unwrap();
+    let error = Store::open(&path, Settings::default()).err().expect("refused");
+    let problem = error.problem();
+    assert!(
+        problem.message.contains("can't keep a copy of the database"),
+        "{problem}"
+    );
+    assert!(problem.fix.contains("nothing was changed"));
+    assert_eq!(user_version(&path), 2);
+}
+
+#[test]
+fn a_database_from_a_newer_beacon_is_refused_with_the_way_back() {
+    let dir = temp_dir("newer");
+    let path = dir.join("beacon.db");
+    drop(Store::open(&path, Settings::default()).unwrap());
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("PRAGMA user_version = 99")
+        .unwrap();
+    let problem = Store::open(&path, Settings::default())
+        .err()
+        .expect("refused")
+        .problem();
+    assert!(problem.message.contains("schema version 99"), "{problem}");
+    assert!(problem.fix.contains("previous/v3/beacon.db"), "{problem}");
 }

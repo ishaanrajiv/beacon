@@ -46,6 +46,18 @@ pub(crate) fn meta(conn: &Connection, key: &str) -> Result<Option<i64>> {
         .flatten())
 }
 
+/// Fills each history row this write made with its item as the write leaves it: what the change
+/// made the item, kept for the copy to Trail (`migrate_3.sql`). Runs just before every commit.
+pub(crate) fn stamp_history(conn: &Connection) -> Result<()> {
+    conn.prepare_cached(
+        "UPDATE history SET state = i.state, title = i.title, push_level = i.push_level, \
+         push_status = i.push_status, push_reason = i.push_reason \
+         FROM items i WHERE history.title IS NULL AND i.id = history.item",
+    )?
+    .execute([])?;
+    Ok(())
+}
+
 pub(crate) fn set_meta(conn: &Connection, key: &str, value: Option<i64>) -> Result<()> {
     conn.prepare_cached(
         "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = ?2",

@@ -396,6 +396,7 @@ fn health(app: &App) -> Reply {
             "apns": if app.apns.is_some() { "ok" } else { "unconfigured" },
             "devices": devices.map_or(0, |d| d.len()),
             "unreadable_sources": unreadable.map_or(0, |u| u.len()),
+            "sink_dropped": app.store.sink_dropped_count().unwrap_or(0),
         }),
     )
 }

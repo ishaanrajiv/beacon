@@ -570,7 +570,7 @@ impl Tx<'_, '_> {
 }
 
 /// One item change for the copy to Trail (`spec/config.md`, "The copy to Trail"): a history
-/// step, with the item as it is now.
+/// step, with the item as that step left it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SinkRecord {
     /// The history row's id: the event's id is `beacon-<id>`, and the cursor moves past it.
@@ -594,9 +594,10 @@ impl Store {
         self.read(|tx, _| {
             let after = meta(tx, "sink_cursor")?.unwrap_or(0);
             let mut stmt = tx.prepare_cached(
-                "SELECT h.id, h.at, h.item, h.what, i.kind, i.class, i.source, i.state, i.title, i.push_level, \
-                 i.push_status, i.push_reason FROM history h JOIN items i ON i.id = h.item WHERE h.id > ?1 \
-                 ORDER BY h.id LIMIT ?2",
+                "SELECT h.id, h.at, h.item, h.what, i.kind, i.class, i.source, h.state, \
+                 coalesce(h.title, i.title), coalesce(h.push_level, i.push_level), \
+                 coalesce(h.push_status, i.push_status), h.push_reason \
+                 FROM history h JOIN items i ON i.id = h.item WHERE h.id > ?1 ORDER BY h.id LIMIT ?2",
             )?;
             let rows = stmt.query_map(params![after, limit], |r| {
                 Ok(SinkRecord {
@@ -621,5 +622,21 @@ impl Store {
     /// Moves the copy's cursor past history row `id`, once Trail has taken it.
     pub fn sink_done(&self, id: i64, now: i64) -> Result<()> {
         self.write(now, |w| set_meta(w.conn, "sink_cursor", Some(id)))
+    }
+
+    /// Moves the copy's cursor past history row `id`, which Trail refused (a `4xx` that will never
+    /// succeed), and counts it. Answers how many have been dropped so far.
+    pub fn sink_dropped(&self, id: i64, now: i64) -> Result<i64> {
+        self.write(now, |w| {
+            let dropped = meta(w.conn, "sink_dropped")?.unwrap_or(0) + 1;
+            set_meta(w.conn, "sink_dropped", Some(dropped))?;
+            set_meta(w.conn, "sink_cursor", Some(id))?;
+            Ok(dropped)
+        })
+    }
+
+    /// How many item changes Trail refused, and were dropped from the copy.
+    pub fn sink_dropped_count(&self) -> Result<i64> {
+        self.read(|tx, _| Ok(meta(tx, "sink_dropped")?.unwrap_or(0)))
     }
 }
