@@ -30,6 +30,12 @@ pub const TRAIL_SEVERE_NOTICE: &str = "trail.severe_notice";
 pub const TRAIL_WARNING: &str = "trail.warning";
 /// Trail's info rules: records.
 pub const TRAIL_INFO: &str = "trail.info";
+/// The source Trail's alerts become. Beacon owns its four kinds above; a declarations folder with
+/// `source = "trail"` may add more, which Trail's rules name with `kind` (`spec/api.md`,
+/// `POST /v1/trail`).
+pub const TRAIL_SOURCE: &str = "trail";
+/// Trail's built-in kinds: always there, and no published kind may take one of their names.
+pub const TRAIL_BUILTIN: [&str; 4] = [TRAIL_SEVERE, TRAIL_SEVERE_NOTICE, TRAIL_WARNING, TRAIL_INFO];
 
 /// Beacon's and Trail's declarations, parsed and checked.
 pub fn declarations() -> Result<Vec<Declarations>, Vec<Problem>> {

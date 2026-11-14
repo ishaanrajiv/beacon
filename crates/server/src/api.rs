@@ -13,11 +13,11 @@ use beacon_core::delivery::SilenceMatch;
 use beacon_core::duration::Duration;
 use beacon_core::model::Class;
 use beacon_core::problem::closest;
-use beacon_store::{Event, Heartbeat, InboxQuery, NewSilence, SeenTarget, Snapshot, SnapshotEntry};
+use beacon_store::{Event, Fallback, Heartbeat, InboxQuery, NewSilence, SeenTarget, Snapshot, TrailAlert};
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
 pub(crate) struct Api {
     pub app: Arc<App>,
@@ -384,7 +384,8 @@ fn body<T: DeserializeOwned>(
 
 fn health(app: &App) -> Reply {
     let devices = app.store.devices();
-    let ok = app.store.version().is_ok() && devices.is_ok();
+    let unreadable = app.store.unreadable();
+    let ok = app.store.version().is_ok() && devices.is_ok() && unreadable.is_ok();
     Reply::json(
         if ok { 200 } else { 503 },
         json!({
@@ -394,6 +395,8 @@ fn health(app: &App) -> Reply {
             "push": app.config.settings.push,
             "apns": if app.apns.is_some() { "ok" } else { "unconfigured" },
             "devices": devices.map_or(0, |d| d.len()),
+            "unreadable_sources": unreadable.map_or(0, |u| u.len()),
+            "sink_dropped": app.store.sink_dropped_count().unwrap_or(0),
         }),
     )
 }
@@ -401,6 +404,18 @@ fn health(app: &App) -> Reply {
 // ---------- the registry ----------
 
 fn publish(app: &App, req: &Request, source: &str) -> Answer {
+    let keep = match req.param("keep") {
+        None | Some("false" | "0") => false,
+        Some("true" | "1") => true,
+        Some(other) => {
+            return Err(Reply::problem(
+                400,
+                "registry keep",
+                format!("`{other}` is not true or false"),
+                "send ?keep=true to keep kinds the body lacks, or leave keep out to replace them",
+            ));
+        }
+    };
     let value: Value = Value::Object(object(req, "declarations")?);
     let check = Check {
         banned_words: app.config.banned_words.clone(),
@@ -418,10 +433,17 @@ fn publish(app: &App, req: &Request, source: &str) -> Answer {
             format!("PUT it to /v1/registry/{}", decl.source),
         ));
     }
-    app.store.publish(&decl, app.now()).map_err(store_error)?;
-    Ok(Reply::ok(
-        json!({"ok": true, "source": decl.source, "kinds": decl.kinds.len()}),
-    ))
+    let published = app
+        .store
+        .publish_with(&decl, keep, app.now())
+        .map_err(store_error)?;
+    Ok(Reply::ok(json!({
+        "ok": true,
+        "source": decl.source,
+        "kinds": published.kinds,
+        "kept": published.kept,
+        "closed": published.closed.len(),
+    })))
 }
 
 /// FNV-1a 64, for the kinds' ETag.
@@ -521,9 +543,17 @@ fn snapshots(app: &App, req: &Request) -> Answer {
 }
 
 /// Trail's labels as Beacon keeps them: snake_case names, values cut to 128, at most 16 with
-/// `trail_source` and `trail_alert` first. Others are dropped rather than refusing the body.
+/// `service`, `trail_source` and `trail_alert` first. Others are dropped rather than refusing the body.
 fn trail_labels(labels: Option<&Value>, source: &str, alert: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
+    // The service it is about: Trail's own `service` label, else the source Trail heard it from.
+    let service = labels
+        .and_then(|l| l.get("service"))
+        .and_then(Value::as_str)
+        .unwrap_or(source);
+    if !service.is_empty() {
+        out.insert("service".to_string(), cut(service, 128));
+    }
     if !source.is_empty() {
         out.insert("trail_source".to_string(), cut(source, 128));
     }
@@ -613,16 +643,45 @@ fn trail_kind(severity: &str, notice: bool) -> &'static str {
     }
 }
 
-fn trail_slots(v: &Map<String, Value>) -> Map<String, Value> {
-    let text = |field: &str| v.get(field).and_then(Value::as_str).unwrap_or_default();
-    let mut slots = Map::new();
-    slots.insert("title".into(), json!(text("title")));
-    slots.insert("body".into(), json!(text("body")));
-    slots
+/// One of Trail's entries or notices as the store maps it: `key_field` is `key` or `id`.
+fn trail_alert(v: &Map<String, Value>, key_field: &str, notice: bool) -> TrailAlert {
+    let text = |f: &str| v.get(f).and_then(Value::as_str).unwrap_or_default().to_string();
+    let object = |value: Option<&Value>| match value {
+        Some(Value::Object(map)) => map.clone(),
+        _ => Map::new(),
+    };
+    TrailAlert {
+        key: text(key_field),
+        kind: v.get("kind").filter(|k| !k.is_null()).cloned(),
+        builtin: trail_kind(&text("severity"), notice).to_string(),
+        title: text("title"),
+        body: text("body"),
+        labels: trail_labels(v.get("labels"), &text("source"), &text("alert")),
+        trail_labels: object(v.get("labels")),
+        source: text("source"),
+        alert: text("alert"),
+        value: v.get("value").cloned(),
+        since: v.get("since").cloned(),
+        props: object(v.get("event").and_then(|e| e.get("props"))),
+    }
+}
+
+/// Says once per (kind, problem) on stderr that a Trail rule's kind fell back to its severity's.
+fn log_fallbacks(fallbacks: &[Fallback]) {
+    static SAID: Mutex<BTreeSet<(String, String)>> = Mutex::new(BTreeSet::new());
+    let mut said = crate::lock(&SAID);
+    for f in fallbacks {
+        if said.insert((f.kind.clone(), f.problem.message.clone())) {
+            eprintln!(
+                "beacon: a Trail alert naming `{}` became `{}`: {}",
+                f.kind, f.became, f.problem
+            );
+        }
+    }
 }
 
 /// Trail's webhook. Trail retries 408, 429 and 5xx and drops anything else, so a body Beacon
-/// can't use is 400, never 422.
+/// can't use is 400, never 422, and a `kind` that doesn't fit falls back rather than refusing.
 fn trail(app: &App, req: &Request) -> Answer {
     let map = object(req, "trail")?;
     let now = app.now();
@@ -661,25 +720,17 @@ fn trail(app: &App, req: &Request) -> Answer {
                     continue;
                 };
                 problems.extend(trail_fields(&at, v, "key", 200));
-                let text = |f: &str| v.get(f).and_then(Value::as_str).unwrap_or_default().to_string();
-                entries.push(SnapshotEntry {
-                    kind: trail_kind(&text("severity"), false).to_string(),
-                    key: text("key"),
-                    slots: trail_slots(v),
-                    labels: trail_labels(v.get("labels"), &text("source"), &text("alert")),
-                    ..SnapshotEntry::default()
-                });
+                entries.push(trail_alert(v, "key", false));
             }
             if !problems.is_empty() {
                 return Err(bad(problems));
             }
-            // Trail may list one key twice; the store would refuse that.
-            let mut seen = std::collections::BTreeSet::new();
-            entries.retain(|e| seen.insert((e.kind.clone(), e.key.clone())));
-            app.store
+            let (_, fallbacks) = app
+                .store
                 .apply_trail_snapshot(sent_at.unwrap_or_default(), entries, now)
                 .map_err(trail_error)?;
-            json!({"ok": true})
+            log_fallbacks(&fallbacks);
+            json!({"ok": true, "fallbacks": fallbacks})
         }
         Some("notice") => {
             let mut problems = trail_fields("trail", &map, "id", 256);
@@ -694,22 +745,14 @@ fn trail(app: &App, req: &Request) -> Answer {
             if !problems.is_empty() {
                 return Err(bad(problems));
             }
-            let text = |f: &str| map.get(f).and_then(Value::as_str).unwrap_or_default().to_string();
-            let id = text("id");
-            let event = Event {
-                kind: trail_kind(&text("severity"), true).to_string(),
-                key: id.clone(),
-                slots: Some(trail_slots(&map)),
-                facts: Some(Map::new()),
-                labels: trail_labels(map.get("labels"), &text("source"), &text("alert")),
-                ..Event::default()
-            };
+            let notice = trail_alert(&map, "id", true);
             let late = ts.is_some_and(|ts| now - ts > app.config.settings.late);
-            let answer = app
+            let (answer, fallbacks) = app
                 .store
-                .apply_trail_notice(&id, &event, late, now)
+                .apply_trail_notice(&notice, late, now)
                 .map_err(trail_error)?;
-            json!({"ok": true, "item": answer.item.map(|i| i.id), "repeat": answer.repeat})
+            log_fallbacks(&fallbacks);
+            json!({"ok": true, "item": answer.item.map(|i| i.id), "repeat": answer.repeat, "fallbacks": fallbacks})
         }
         other => {
             return Err(Reply::problem(
@@ -1070,9 +1113,12 @@ mod tests {
     fn trail_labels_are_kept_valid() {
         let labels = json!({"Bad Name": "x", "queue": "y".repeat(300)});
         let out = trail_labels(Some(&labels), "web", "errors");
+        assert_eq!(out["service"], "web", "the source Trail heard it from");
         assert_eq!(out["trail_source"], "web");
         assert_eq!(out["trail_alert"], "errors");
         assert_eq!(out["queue"].len(), 128);
         assert!(!out.contains_key("Bad Name"));
+        let own = json!({"service": "shop-api"});
+        assert_eq!(trail_labels(Some(&own), "web", "errors")["service"], "shop-api");
     }
 }

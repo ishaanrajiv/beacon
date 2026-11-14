@@ -115,7 +115,7 @@ the bare prefix (`/beacon/`) gets a `200` rather than a `404`.
 ### `GET /v1/health`
 
 ```json
-{"ok": true, "version": "0.1.0", "started": 1794571200000, "push": true, "apns": "ok", "devices": 1}
+{"ok": true, "version": "0.1.0", "started": 1794571200000, "push": true, "apns": "ok", "devices": 1, "unreadable_sources": 0, "sink_dropped": 0}
 ```
 
 | Field | |
@@ -124,6 +124,8 @@ the bare prefix (`/beacon/`) gets a `200` rather than a `404`.
 | `push` | `push` in beacon.toml: false means decisions are made and recorded but nothing is sent |
 | `apns` | `ok`, or `unconfigured` when there is no signing key |
 | `devices` | registered devices |
+| `unreadable_sources` | published sources whose stored declarations, or some of whose kinds, Beacon can't read back (`spec/declarations.md`, "Reading back what was stored"); `GET /v1/registry` says which |
+| `sink_dropped` | item changes Trail refused with a `4xx`, so the copy to Trail dropped them (`spec/config.md`, "The copy to Trail"); 0 without `[sink]` |
 
 ## The registry
 
@@ -138,21 +140,30 @@ the bare prefix (`/beacon/`) gets a `200` rather than a `404`.
       "source": "backup",
       "name": "Backups",
       "icon": "archive",
+      "service": "backup",
       "kinds": 4,
       "builtin": false,
       "published": 1794571200000,
       "observed": true,
       "reason": null,
       "last_snapshot": 1794571100000,
-      "stale_after": "30m"
+      "stale_after": "30m",
+      "problem": null
     }
   ]
 }
 ```
 
-Sorted by `source`. `beacon` and `trail` are listed with `builtin: true` and `published: null`.
+Sorted by `source`. `service` is the label its items carry (`spec/declarations.md`). `beacon` and
+`trail` are listed with `builtin: true`; `published` is null for
+`beacon`, and for `trail` until kinds are published for it (`spec/declarations.md`, "Kinds for
+Trail's rules"), when it is that time and `kinds` counts both.
 `observed` is false while the source is unobserved (`spec/delivery.md`, "Sources"), and `reason`
 says why. `last_snapshot` and `stale_after` are null for a source that has never posted a snapshot.
+`problem` is null, or `{at, message, fix}` when Beacon can't read back what was published for the
+source, or some of its kinds (`spec/declarations.md`, "Reading back what was stored"): `kinds`
+counts only those it can read (0 when it can read none, and then `name` is the source and `icon`
+`bell`), and the fix says to publish it again.
 
 ### `GET /v1/registry/{source}`
 
@@ -163,15 +174,32 @@ nobody published.
 
 Body: the declarations in their JSON form. `beacon publish` sends this.
 
-- `200` `{"ok": true, "source": "backup", "kinds": 4}`: stored, replacing the source's earlier
-  declarations entirely.
+| Parameter | Default | |
+|---|---|---|
+| `keep` | `false` | `true`: the body's kinds are added, or replace the kinds of the same name, and kinds already published that the body lacks stay. The source's own fields (`name`, `icon`…) take the body's values. `beacon publish --keep` sends it. |
+
+A deploy publishes with `?keep=true` *before* it restarts a service, so neither the old code still
+running nor the new code about to start can send a kind Beacon doesn't know; after the restart a
+plain publish removes what the new code no longer declares.
+
+- `200` `{"ok": true, "source": "backup", "kinds": 4, "kept": [], "closed": 0}`: stored. `kinds` is
+  how many the source now has; `kept` names the kinds a `keep` publish kept that the body lacks.
+  Without `keep` the body replaces the source's earlier declarations entirely, and each alert or
+  action of a kind it no longer has that is still open (alert `open` or `dismissed`, action `open`
+  or `snoozed`) closes in the same transaction: it resolves, with history step `kind_removed`, and
+  keeps its text (nothing recovered, so no recovery text is written). No push goes out but the
+  usual recovery of an alert a device has or may have the firing push of (`spec/delivery.md`,
+  "Sending"), which replaces that banner. `closed` counts them; a `keep` publish closes nothing.
 - `400` with every problem, when they fail a check (`spec/declarations.md`), including the
-  server's `banned_words`.
-- `409` when `{source}` is `beacon` or `trail`, or differs from the body's `source`.
+  server's `banned_words`; or `keep` isn't `true`, `false`, `1` or `0`.
+- `409` when `{source}` is `beacon`, or differs from the body's `source`. `trail` may be published:
+  its kinds join the built-in ones (`spec/declarations.md`, "Kinds for Trail's rules"), and a plain
+  publish never closes an item of a built-in kind.
 
 ### `DELETE /v1/registry/{source}`
 
 `200` `{"ok": true}`, or `404`. The source's items stay; new events for its kinds are refused.
+For `trail`, only the published kinds go; the built-in ones stay.
 
 ### `GET /v1/kinds`
 
@@ -227,7 +255,7 @@ One notification of a declared kind.
 | `key` | string | `""` | 0 to 128 printable ASCII characters, no spaces. Which alert or action this is, across events: `(kind, key)` names one. |
 | `facts` | object | `{}` | Every required fact of the kind, of its type; no undeclared ones (`422`). |
 | `slots` | object | `{}` | Every slot of the kind, each a string; no undeclared ones (`422`). Longer text is cut, not refused. |
-| `labels` | object of strings | `{}` | At most 16. Names snake_case (at most 32 characters), values at most 128 characters. Silences match on them. |
+| `labels` | object of strings | `{}` | At most 16. Names snake_case (at most 32 characters), values at most 128 characters. Silences match on them. Without a `service` label, the item gets `service` = its source's `service` (`spec/declarations.md`), which may make it 17. |
 | `state` | string | `"firing"` for an alert, `"open"` for an action | Alert: `"firing"` or `"resolved"`. Action: `"open"` or `"resolved"`. Update and record: must be absent (`400`). |
 | `context` | string or null | null | Required (1 to 128 characters) when the kind declares `context = true`; must be null or absent otherwise (`400`). Like `assistant:thread:42`. |
 | `url` | string or null | the kind's rendered `open` | Overrides the link. Starts with `/` or `https://`, at most 1024 characters. |
@@ -315,7 +343,9 @@ With `observed: true`, in one transaction:
    covered kind of this source, that has no entry, resolves. It doesn't matter whether an event or
    a snapshot opened it.
 3. An action you closed (done or dismissed) whose `(kind, key)` is still listed stays closed. It
-   opens again as a new item only after a snapshot without it, followed by one with it.
+   opens again as a new item only after a snapshot covering its kind without it, followed by one
+   with it. What was listed is kept per kind: a snapshot touches only the kinds it covers, so two
+   checks of one source can each post a snapshot for their own kinds.
 4. The source is observed again (if it wasn't, its open `beacon.source_stopped` resolves, or with
    none open Beacon records `beacon.source_observed`), its
    `last_snapshot` is now and its `stale_after` is the one given.
@@ -340,7 +370,7 @@ Trail's alert webhook (Trail's `spec/alerts.md`): point Trail's `alerts.webhook`
 else in Trail changes. Local access only. Every item it makes belongs to source `trail`
 (`spec/declarations.md`, "Beacon's own kinds").
 
-**`snapshot`** (`{"type": "snapshot", "sent_at", "firing": [{key, source, alert, severity, title, body, labels, value, since}]}`):
+**`snapshot`** (`{"type": "snapshot", "sent_at", "firing": [{key, source, alert, severity, title, body, labels, value, since, kind}]}`):
 
 | Trail severity | Kind | What a firing entry does |
 |---|---|---|
@@ -348,11 +378,13 @@ else in Trail changes. Local access only. Every item it makes belongs to source 
 | `warning` | `trail.warning` (update, silent) | Records one update when the key appears; nothing while it stays; again only after a snapshot without it. |
 | `info` | `trail.info` (record) | The same, as a record. |
 
-- An empty `firing` list resolves every open `trail.severe` alert.
+- An empty `firing` list resolves every open `trail.severe` alert, and every open alert or action
+  of a kind published for `trail`.
 - Trail's keys and notice ids are used as item keys as they are (up to 200 and 256 characters, any
   text): the key rule of `POST /v1/events` doesn't apply to them.
 - Each item's slots are Trail's `title` (cut to 40) and `body` (cut to 150). Its labels are
-  `trail_source` (Trail's `source`) and `trail_alert` (Trail's `alert`), then Trail's `labels`:
+  `service` (Trail's `service` label, else Trail's `source`), `trail_source` (Trail's `source`)
+  and `trail_alert` (Trail's `alert`), then Trail's `labels`:
   a label whose name isn't snake_case is dropped, values are cut to 128 characters, and at most 16
   are kept. A notice's labels are the same. Its link is `[trail] open`.
 - Trail listing one key twice in a snapshot counts once.
@@ -360,7 +392,7 @@ else in Trail changes. Local access only. Every item it makes belongs to source 
   Trail re-posts every 5 minutes). If Trail stops posting, `trail` becomes unobserved, its
   alerts are muted, and `beacon.source_stopped` (key `trail`) opens and pushes.
 
-**`notice`** (`{"type": "notice", "id", "source", "alert", "severity", "title", "body", "ts", "event"}`):
+**`notice`** (`{"type": "notice", "id", "source", "alert", "severity", "title", "body", "ts", "event", "kind"}`):
 
 | Trail severity | Kind |
 |---|---|
@@ -372,26 +404,60 @@ else in Trail changes. Local access only. Every item it makes belongs to source 
 - A notice whose `ts` is more than `delivery.late` (an hour) old is recorded and not pushed:
   whatever the decision would have been, its push is suppressed `late` (a `trail.info` record stays
   `none`).
-- `event` is not read.
+- `event` is read only for a notice that names a `kind` (below): its `props`.
+
+**`kind`** (optional, a string, on a firing entry or a notice): a kind published for `trail`
+(`spec/declarations.md`, "Kinds for Trail's rules"). When it names one that fits, the entry becomes
+that kind instead of its severity's: its class, push level, text, actions and repeats come from the
+kind, and `severity` is not read for it.
+
+- Facts, by name, for each fact the kind declares: `value` from the entry's `value`, `since` from
+  its `since`, `alert` from Trail's `alert`, `trail_source` from Trail's `source`, and any other
+  name from the entry's `labels` (a notice: from `event.props`, which also give `value` and
+  `since`). A string is read as the fact's type (`int` and `float` as numbers, `duration` as
+  milliseconds or `5m`, `time` as milliseconds or an RFC 3339 time); a whole number sent as a
+  float fills an `int`. Slots `title` and `body` take Trail's title and body, cut at the slot's
+  length; another slot is read like a fact, as text.
+- The key is Trail's `key` (a notice's `id`), the labels as above.
+- By class: an `alert` kind opens or updates, and resolves when absent from a later snapshot; an
+  `action` kind likewise opens and resolves; an `update` or `record` kind is recorded once when
+  its key appears and again only after a snapshot without it, as `trail.warning` is. A notice
+  names a one-off alert (opened once per `id`, closed by acknowledging or dismissing it), an
+  update or a record.
+- **It never loses an alert.** An entry whose `kind` isn't a string, isn't published for `trail`,
+  doesn't fit (a one-off alert in a snapshot; a lifecycle alert or an action from a notice), or
+  whose facts don't fit it, becomes its severity's built-in kind exactly as without `kind`. The
+  `200` answer lists each such fallback, and the server says each (kind, problem) once on stderr:
+
+  ```json
+  {"ok": true, "fallbacks": [{"key": "shop.disk{disk=data}", "kind": "trail.disk_ful", "became": "trail.severe",
+    "problem": {"at": "trail firing[0] kind", "message": "`trail.disk_ful` is not a kind published for trail", "fix": "did you mean `trail.disk_full`? …"}}]}
+  ```
+
+  `kind` in a fallback is the text Trail sent (or its JSON, when it isn't a string). A deploy check
+  can read `fallbacks` to see a rule whose kind isn't published.
+- A post without `kind` behaves exactly as before it existed.
 
 Validation: `type` is `snapshot` or `notice`; `sent_at`/`ts` positive integers; each entry's
 `key` (or the notice's `id`) a non-empty string of at most 200 (256 for `id`) characters;
 `severity` one of `info`, `warning`, `severe`; `title` a non-empty string of at most 500
 characters; `body` a string of at most 4096 characters or absent; `labels` an object of strings
-or absent. `source`, `alert`, `value` and `since` are read where said above and otherwise ignored.
+or absent. `source`, `alert`, `value`, `since`, `kind` and `event` are read where said above and
+otherwise ignored, as is any other field.
 
 Trail retries `408`, `429` and `5xx`, and treats every other status as "never send this body
 again". So:
 
 | Status | When | Trail then |
 |---|---|---|
-| `200` `{"ok": true}` (a notice adds `"item"` and `"repeat"`) | taken, including a repeated notice | moves on |
+| `200` `{"ok": true, "fallbacks": [...]}` (a notice adds `"item"` and `"repeat"`) | taken, including a repeated notice and an entry whose `kind` fell back | moves on |
 | `400` | malformed | drops it |
 | `403` | not local | drops it |
 | `409` | a snapshot older than the last one taken from Trail, more than 5 minutes old, or more than 1 minute in the future | replaces it with a fresh one at its next pass; the notices behind it still go |
 | `503` | storage failed | retries |
 
-`422` is never sent: every Trail severity maps to a built-in kind.
+`422` is never sent: every Trail severity maps to a built-in kind, and a `kind` that doesn't fit
+falls back to it.
 
 ## Clients
 
@@ -609,7 +675,8 @@ The item, plus:
 `history[].what` is one of `recorded` (an update or record made), `opened`, `reopened`, `updated`, `resolved`, `acknowledged`,
 `dismissed`, `done`, `snoozed`, `woke` (a snooze ended), `seen`, `action` (a custom action; see
 `acted`), `push_held`, `push_released`, `push_sent`, `push_failed`, `push_suppressed`, `repeated`,
-`recovery_sent`, `flapping`, `settled`. `attempts[].status` is `accepted`, `rejected` or
+`recovery_sent`, `flapping`, `settled`, `kind_removed` (resolved because a publish removed its kind:
+`PUT /v1/registry/{source}`). A client shows a step it doesn't know by its name. `attempts[].status` is `accepted`, `rejected` or
 `uncertain` (`spec/apns.md`). `device` is the token's last six characters. `404` for an unknown id.
 
 ### `POST /v1/items/{id}/actions`

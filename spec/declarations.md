@@ -16,6 +16,7 @@ facts and slots; Beacon writes the words. A service keeps its declarations in on
 source = "backup"          # required: the service's name
 name = "Backups"           # required: what people see as the source's name
 icon = "archive"           # optional, default "bell": one of the icons below
+service = "backup"         # optional, default the source: the label `service` on every item
 
 [kinds."backup.failed"]    # one table per kind
 class = "alert"
@@ -36,9 +37,10 @@ repeat = ["2h", "6h"]
 
 | Field | Type | Required | Rule |
 |---|---|---|---|
-| `source` | string | yes | Lowercase letters, digits and hyphens, starting with a letter, at most 32 characters. `beacon` and `trail` are reserved. |
+| `source` | string | yes | Lowercase letters, digits and hyphens, starting with a letter, at most 32 characters. `beacon` is reserved. `trail` adds kinds for Trail's rules ("Kinds for Trail's rules"). |
 | `name` | string | yes | 1 to 24 characters. Shown beside every item from this source. |
 | `icon` | string | no, `bell` | One of the icon names below. |
+| `service` | string | no, the source | The service this source's items are about: lowercase letters and digits, words joined by `_` or `-`, starting with a letter, at most 64 characters (`backup`, `mail-worker`). Every item of the source gets it as the label `service` unless the event or snapshot entry set that label itself, so a deploy's silence matching `labels.service` (`spec/api.md`, "Silences") mutes everything the service sends. For `trail` it is ignored: each Trail item's `service` is Trail's `service` label, else Trail's `source`. |
 | `kinds` | table | yes, at least one | `[kinds."<source>.<name>"]` tables. |
 
 Any other top-level field is an error, with the name you probably meant.
@@ -259,8 +261,8 @@ An alert that isn't `one_off` recovers: its row and its banner change to the rec
 
 `crates/core/builtin/beacon.toml` and `crates/core/builtin/trail.toml` are always loaded, with the
 same parser and checks, except that their sources are reserved and their titles may be a slot on
-its own. A service can't publish source `beacon` or `trail`. `spec/delivery.md` says when each is
-posted.
+its own. A service can't publish source `beacon`; source `trail` can only be added to (below).
+`spec/delivery.md` says when each is posted.
 
 | Kind | Class | Push | Title | When |
 |---|---|---|---|---|
@@ -278,6 +280,37 @@ posted.
 Trail's kinds carry Trail's title and body in slots `title` (40) and `body` (150). Their link is
 `[trail] open` in `beacon.toml`.
 
+### Kinds for Trail's rules
+
+The four built-in Trail kinds give every severe rule one push level and Trail's free text. To give
+a rule its own class, push level, copy, facts, actions and repeats, declare a kind for it in a
+folder with `source = "trail"` and name it in the rule's `kind` (`spec/api.md`, `POST /v1/trail`).
+`examples/homelab-ish/trail/beacon/kinds.toml` declares an urgent and a normal alert.
+
+- Its kinds are named `trail.<name>`, may not take a built-in's name (`trail.severe`,
+  `trail.severe_notice`, `trail.warning`, `trail.info`), and are checked like any other kind, copy
+  rules included (a title needs words of its own). `beacon check`, `beacon gen` and
+  `beacon publish` take the folder; `PUT /v1/registry/trail` stores it.
+- The built-in kinds are always there as well. `GET /v1/registry/trail` and `GET /v1/kinds` list
+  both; `DELETE /v1/registry/trail` removes only the published ones.
+- `name` and `icon` are required by the file format and **ignored**: Trail's items keep Beacon's
+  ("Monitoring", `gauge`).
+- A kind without `open` gets `[trail] open`, like the built-in ones.
+- Facts are filled by name from Trail's post: `value` and `since` from a firing entry's `value`
+  (a number) and `since` (a time), `alert` from Trail's `alert`, `trail_source` from Trail's
+  `source`, and any other name from the entry's `labels`, or for a notice from its event's
+  `props` (a notice has no `value` or `since` of its own, so those come from `props` too). Slots
+  `title` and `body` take Trail's title and body; any other slot is read like a fact, as text.
+  Declare a fact optional (`"string?"`) when a rule may not send it.
+- A metric rule (a snapshot entry) names an alert, action, update or record that isn't a one-off
+  alert; an event rule (a notice) names a one-off alert, an update or a record. Anything else
+  falls back to the severity's built-in kind.
+- A firing entry keeps the kind its alert opened as until it clears. A rule that gains, loses or
+  changes its `kind` while it is firing (a deploy) is the same incident under Trail's key: the
+  open alert is updated, nothing recovers and nothing new is pushed, and the rule's new kind
+  applies from its next firing. Only when the entry can no longer be the old kind (a publish
+  removed it, or a fact it needs is gone) does the old alert close and a new one open.
+
 ## Reaching the server
 
 Like Trail, declarations live in the service's repository and are published to the server, which
@@ -288,14 +321,39 @@ keeps them:
    fields as the TOML with every default filled in (below).
 2. The server checks them again (with its `banned_words`), stores them in SQLite in one
    transaction, and answers `200`. A source's new declarations replace its old ones entirely.
+   What it stores is the JSON form below stamped with `"format": 1`, so a later version can tell
+   what wrote it; each item keeps the kind it was made with the same way.
 3. An event or snapshot entry of a kind the registry doesn't have is refused with `422`, and the
    fix names the closest declared kind and says to declare and publish it.
 4. Items already stored keep the text, class and push they were given. Republishing never
-   rewrites history. An open alert or action whose kind was removed stays open until its
-   producer resolves it or you close it; events for that kind are refused.
+   rewrites history. An alert or action still open whose kind a publish removed can never be
+   resolved by its producer (events for that kind are refused), so the publish closes it: it
+   resolves with history step `kind_removed` and keeps its text (`spec/api.md`,
+   `PUT /v1/registry/{source}`).
 
-A deploy pipeline runs `beacon publish` for a service after deploying it, so the server always
-knows the kinds the running code sends.
+A deploy pipeline publishes in two steps, so neither the old code still running nor the new code
+about to start can send a kind the server doesn't know: `beacon publish --keep` before it restarts
+the service (the new kinds are added, and kinds the folder no longer has stay), then a plain
+`beacon publish` once the new code runs (the source's declarations become exactly the folder's).
+
+### Reading back what was stored
+
+The checks run when declarations are published, and stay as strict as above. Reading back what
+Beacon itself stored (at start, after each publish, and each item's kind) is tolerant, so a
+rollback, or an upgrade that changed a field, never takes a source down:
+
+- A field this version doesn't know is ignored, at every level (the source, a kind, a custom
+  action), and so is `format`.
+- A missing field takes its default (the table above; `name` defaults to the source, `icon` to
+  `bell`, `push` to `none` on a record). Stored declarations aren't checked again.
+- A kind that still can't be read (no `class` or `title`, a value this version can't read) is kept
+  out of the registry, and so is a source that can't be read at all (not an object, no `source`).
+  Neither is dropped silently: the source is listed by `GET /v1/registry` with a `problem`
+  (`spec/api.md`), `GET /v1/health` counts it in `unreadable_sources`, the server says so once on
+  stderr at start, and an event, snapshot or snapshot `kinds` entry naming what can't be read is
+  refused (`422`) with a fix that says to publish the source again. Its other kinds work as usual.
+- An item whose stored kind can't be read still loads: it keeps its text, push level and buttons,
+  and is said once on stderr.
 
 ### The JSON form
 
@@ -308,6 +366,7 @@ default, except that a missing `throttle` means `"10m"` and `null` means `"none"
   "source": "backup",
   "name": "Backups",
   "icon": "archive",
+  "service": "backup",
   "kinds": {
     "backup.failed": {
       "class": "alert",
@@ -335,5 +394,7 @@ default, except that a missing `throttle` means `"10m"` and `null` means `"none"
 
 A custom action is an object in `actions`: `{"id": "review", "label": "Review", "url": "/code/pulls/{number}/review"}`
 (`url` null or absent when it has none). `open`, `preview`, `recovered` and `recovered_body` are
-null when the kind has none. Durations are written in the largest unit that divides them (`"2h"`,
+null when the kind has none. `beacon publish` leaves `service` out when it is the source's name
+(missing means the source), so a server from before `service` takes the body; the declarations
+hash of a generated emitter (`spec/clients.md`) is over that same JSON. Durations are written in the largest unit that divides them (`"2h"`,
 not `"120m"`).

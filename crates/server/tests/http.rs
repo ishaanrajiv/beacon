@@ -616,6 +616,7 @@ fn snapshots_resolve_what_is_absent_and_an_unobserved_source_mutes_its_alerts() 
         .unwrap()
         .clone();
     assert_eq!(lab_source["observed"], false);
+    assert_eq!(lab_source["problem"], Value::Null);
     lab.later(31 * MINUTE);
     let muted = lab.down().json["item"].clone();
     assert_eq!(muted["push"]["reason"], "unobserved");
@@ -650,7 +651,7 @@ fn trails_webhook_becomes_trail_items() {
     });
     let r = lab.post("/v1/trail", &snapshot);
     assert_eq!(r.status, 200, "{:?}", r.json);
-    assert_eq!(r.json, json!({"ok": true}));
+    assert_eq!(r.json, json!({"ok": true, "fallbacks": []}));
     let inbox = lab.get("/v1/inbox").json;
     let severe = &inbox["alerts"]["open"][0];
     assert_eq!(severe["kind"], "trail.severe");
@@ -658,7 +659,7 @@ fn trails_webhook_becomes_trail_items() {
     assert_eq!(severe["title"], "Errors are high");
     assert_eq!(
         severe["labels"],
-        json!({"queue": "email", "trail_alert": "errors", "trail_source": "web"})
+        json!({"queue": "email", "service": "web", "trail_alert": "errors", "trail_source": "web"})
     );
     assert_eq!(severe["url"], "/");
     let warning = &inbox["activity"]["items"][0];
@@ -711,6 +712,91 @@ fn trails_webhook_becomes_trail_items() {
         Some(&notice),
     );
     assert_eq!(proxied.status, 403);
+}
+
+#[test]
+fn trail_rules_can_name_a_published_kind() {
+    let lab = start();
+    let folder =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/homelab-ish/trail/beacon");
+    let decl = beacon_core::decl::load(&folder, &Default::default()).unwrap();
+    let r = lab.put("/v1/registry/trail", &decl.to_json());
+    assert_eq!(r.status, 200, "{:?}", r.json);
+    assert_eq!(r.json["kinds"], 2);
+    let kinds: Vec<Value> = lab.get("/v1/kinds").json["kinds"].as_array().unwrap().clone();
+    let trail: Vec<&str> = kinds
+        .iter()
+        .filter(|k| k["source"] == "trail")
+        .map(|k| k["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        trail,
+        [
+            "trail.disk_full",
+            "trail.info",
+            "trail.queue_backlog",
+            "trail.severe",
+            "trail.severe_notice",
+            "trail.warning"
+        ]
+    );
+    assert_eq!(
+        lab.get("/v1/registry/trail").json["kinds"]
+            .as_object()
+            .unwrap()
+            .len(),
+        6
+    );
+    let entry = |key: &str, kind: Option<&str>| {
+        let mut e = json!({"key": key, "source": "shop", "alert": "disk_full", "severity": "severe", "title": "Disk is nearly full", "labels": {"disk": "data"}, "value": 96.0, "since": T0});
+        if let Some(kind) = kind {
+            e["kind"] = json!(kind);
+        }
+        e
+    };
+    let r = lab.post(
+        "/v1/trail",
+        &json!({"type": "snapshot", "sent_at": T0, "firing": [entry("a", Some("trail.disk_full")), entry("b", None), entry("c", Some("trail.nope"))]}),
+    );
+    assert_eq!(r.status, 200, "{:?}", r.json);
+    let fallbacks = r.json["fallbacks"].as_array().unwrap();
+    assert_eq!(fallbacks.len(), 1);
+    assert_eq!(
+        (fallbacks[0]["key"].clone(), fallbacks[0]["kind"].clone()),
+        (json!("c"), json!("trail.nope"))
+    );
+    assert!(
+        fallbacks[0]["problem"]["fix"]
+            .as_str()
+            .unwrap()
+            .contains("beacon publish")
+    );
+    let open = lab.get("/v1/inbox").json["alerts"]["open"].clone();
+    let kind_of =
+        |key: &str| open.as_array().unwrap().iter().find(|i| i["key"] == key).unwrap()["kind"].clone();
+    assert_eq!(kind_of("a"), "trail.disk_full");
+    assert_eq!(kind_of("b"), "trail.severe");
+    assert_eq!(kind_of("c"), "trail.severe");
+    assert_eq!(
+        lab.post(
+            "/v1/trail",
+            &json!({"type": "snapshot", "sent_at": T0, "firing": []})
+        )
+        .status,
+        200
+    );
+    // DELETE removes only what was published.
+    assert_eq!(
+        raw(lab.addr(), "DELETE", "/v1/registry/trail", &[JSON], None).status,
+        200
+    );
+    assert_eq!(
+        lab.get("/v1/registry/trail").json["kinds"]
+            .as_object()
+            .unwrap()
+            .len(),
+        4
+    );
 }
 
 #[test]
@@ -829,6 +915,7 @@ fn dead_tokens_are_pruned_and_retries_are_scheduled() {
     );
     let health = lab.get("/v1/health").json;
     assert_eq!(health["devices"], 0);
+    assert_eq!(health["unreadable_sources"], 0);
     lab.later(MINUTE);
     let note = lab
         .post("/v1/events", &json!({"kind": "lab.note", "slots": {"text": "x"}}))
@@ -1210,4 +1297,165 @@ fn readable_db_opens_beacon_db_but_never_the_devices() {
     assert_eq!(mode(&readable, "beacon.db"), 0o644);
     assert_eq!(mode(&readable, "beacon.db-wal"), 0o644);
     assert_eq!(mode(&readable, "devices.db"), 0o600);
+}
+
+#[test]
+fn a_keep_publish_keeps_kinds_and_a_plain_one_closes_what_it_removed() {
+    let lab = start();
+    let down = lab.down().json["item"]["id"].clone();
+    let mut fewer = beacon_core::decl::parse(KINDS, &Default::default()).unwrap();
+    fewer.kinds.remove("lab.down");
+    let r = lab.put("/v1/registry/lab?keep=true", &fewer.to_json());
+    assert_eq!(r.status, 200, "{:?}", r.json);
+    assert_eq!(r.json["kept"], json!(["lab.down"]));
+    assert_eq!(
+        (r.json["kinds"].clone(), r.json["closed"].clone()),
+        (json!(3), json!(0))
+    );
+    assert_eq!(lab.item(&down)["state"], "open");
+    assert_eq!(
+        lab.put("/v1/registry/lab?keep=maybe", &fewer.to_json()).status,
+        400
+    );
+    let r = lab.put("/v1/registry/lab", &fewer.to_json());
+    assert_eq!(
+        (r.json["kinds"].clone(), r.json["closed"].clone()),
+        (json!(2), json!(1))
+    );
+    let item = lab.item(&down);
+    assert_eq!(
+        (item["state"].clone(), item["title"].clone()),
+        (json!("resolved"), json!("Website is down"))
+    );
+    let history = lab.get(&format!("/v1/items/{down}")).json["history"].clone();
+    assert!(
+        history
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["what"] == "kind_removed")
+    );
+}
+
+// ---------- the copy to Trail ----------
+
+/// A Trail that records each ingest body and answers from a script of statuses, then 200.
+fn fake_trail(script: Vec<u16>) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let bodies = seen.clone();
+    std::thread::spawn(move || {
+        let mut script = script.into_iter();
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
+                let line = line.trim_end();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            bodies
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(&body).unwrap_or(Value::Null));
+            let status = script.next().unwrap_or(200);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            );
+        }
+    });
+    (url, seen)
+}
+
+/// The ids of the events in each body Trail was sent.
+fn ingested(seen: &Mutex<Vec<Value>>) -> Vec<Vec<String>> {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .map(|body| {
+            body["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["id"].as_str().unwrap().to_string())
+                .collect()
+        })
+        .collect()
+}
+
+fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !done() {
+        assert!(std::time::Instant::now() < until, "waited 20 s for {what}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_copy_trail_refuses_is_dropped_and_counted_not_retried() {
+    let (url, seen) = fake_trail(vec![400]);
+    let lab = start_with(&format!("[sink]\ntrail_url = \"{url}\"\n"), false);
+    let note = |text: &str| {
+        let sent = lab.post(
+            "/v1/events",
+            &json!({"kind": "lab.note", "key": text, "slots": {"text": text}}),
+        );
+        assert_eq!(sent.status, 200, "{:?}", sent.json);
+    };
+    note("first");
+    wait_for("the first copy", || !ingested(&seen).is_empty());
+    note("second");
+    wait_for("the second copy", || ingested(&seen).len() >= 2);
+    let bodies = ingested(&seen);
+    let refused = &bodies[0];
+    assert_eq!(refused.len(), 1);
+    // A 4xx will never be taken: the copies behind it go on without it.
+    assert!(
+        !bodies[1].contains(&refused[0]),
+        "the refused copy was sent again: {bodies:?}"
+    );
+    assert_eq!(lab.get("/v1/health").json["sink_dropped"], 1);
+}
+
+#[test]
+fn a_refused_batch_is_sent_again_one_change_at_a_time() {
+    // Down for the first try, so two changes wait; then the batch of both is refused, the first
+    // alone is taken and the second alone refused.
+    let (url, seen) = fake_trail(vec![503, 400, 200, 400]);
+    let lab = start_with(&format!("[sink]\ntrail_url = \"{url}\"\n"), false);
+    let note = |text: &str| {
+        let body = json!({"kind": "lab.note", "key": text, "slots": {"text": text}});
+        assert_eq!(lab.post("/v1/events", &body).status, 200);
+    };
+    note("first");
+    wait_for("the first try", || !ingested(&seen).is_empty());
+    note("second");
+    wait_for("both, one at a time", || ingested(&seen).len() >= 4);
+    let one = "beacon-1".to_string();
+    let two = "beacon-2".to_string();
+    assert_eq!(
+        ingested(&seen),
+        [
+            vec![one.clone()],
+            vec![one.clone(), two.clone()],
+            vec![one],
+            vec![two]
+        ]
+    );
+    wait_for("the drop to be counted", || {
+        lab.get("/v1/health").json["sink_dropped"] == 1
+    });
 }

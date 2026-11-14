@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import time
 import urllib.error
@@ -14,6 +15,15 @@ from datetime import datetime, timedelta, timezone
 from typing import Literal, Mapping, Sequence, cast
 
 DEFAULT_URL = "http://127.0.0.1:8210"
+# The spool's limits (spec/clients.md, "The spool").
+SPOOL_MAX_FILES = 1000
+SPOOL_MAX_BYTES = 8 * 1024 * 1024
+SPOOL_MAX_AGE_MS = 24 * 60 * 60 * 1000
+SNAPSHOT_MAX_AGE_MS = 5 * 60 * 1000
+SPOOL_LAST_SEQUENCE = 999_999
+SPOOL_NAME_TRIES = 20
+# `<ms>-<sequence>.json`, or the older `<ms>-<sequence>-<hex>.json`.
+_SPOOL_NAME = re.compile(r"(\d{15})-(\d{6})(?:-[0-9a-f]+)?\.json")
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _MS = timedelta(milliseconds=1)
 
@@ -24,12 +34,28 @@ class BeaconError(Exception):
 
 @dataclass(frozen=True)
 class Sent:
-    """What Beacon answered. `ok` is true for a 2xx; otherwise `problem` says what went wrong."""
+    """What Beacon answered. `ok` is true for a 2xx; otherwise `problem` says what went wrong.
+
+    `queued` is true when Beacon couldn't take it and it was written to the spool instead: `ok` is
+    true, `status` is the last answer (0 for none) and `problem` says why it waits.
+    """
 
     ok: bool
     status: int
     outcome: str | None
     item: int | None
+    problem: str | None
+    queued: bool = False
+
+
+@dataclass(frozen=True)
+class Flushed:
+    """What a `flush()` did: requests delivered, still waiting, and dropped (now and since start)."""
+
+    sent: int
+    left: int
+    dropped: int
+    dropped_total: int
     problem: str | None
 
 
@@ -47,6 +73,7 @@ class _Settings:
     token: str | None = None
     strict: bool | None = None
     disabled: bool | None = None
+    spool_dir: str | None = None
 
 
 _settings = _Settings()
@@ -58,8 +85,12 @@ def configure(
     token: str | None = None,
     strict: bool | None = None,
     disabled: bool | None = None,
+    spool_dir: str | None = None,
 ) -> None:
-    """Overrides `BEACON_URL`, `BEACON_TOKEN`, `BEACON_STRICT` and `BEACON_DISABLED`. None keeps the current choice."""
+    """Overrides `BEACON_URL`, `BEACON_TOKEN`, `BEACON_STRICT`, `BEACON_DISABLED` and `BEACON_SPOOL_DIR`.
+
+    None keeps the current choice; `spool_dir=""` turns the spool off.
+    """
     if url is not None:
         _settings.url = url
     if token is not None:
@@ -68,6 +99,8 @@ def configure(
         _settings.strict = strict
     if disabled is not None:
         _settings.disabled = disabled
+    if spool_dir is not None:
+        _settings.spool_dir = spool_dir
 
 
 def _env_flag(name: str) -> bool:
@@ -75,10 +108,11 @@ def _env_flag(name: str) -> bool:
 
 
 class _Runtime:
-    """Sends events and snapshots: one request per call, retried after 1 s and 3 s."""
+    """Sends events and snapshots: one request per call, retried after 1 s and 3 s, and spooled when asked."""
 
     retry_delays = (1.0, 3.0)
     timeout = 5.0
+    dropped_total = 0
 
     def url(self) -> str:
         url = _settings.url or os.environ.get("BEACON_URL") or DEFAULT_URL
@@ -92,6 +126,11 @@ class _Runtime:
 
     def disabled(self) -> bool:
         return _settings.disabled if _settings.disabled is not None else _env_flag("BEACON_DISABLED")
+
+    def spool_dir(self) -> str | None:
+        if _settings.spool_dir is not None:
+            return _settings.spool_dir or None
+        return os.environ.get("BEACON_SPOOL_DIR") or None
 
     def time_ms(self, value: int | datetime | None) -> int | None:
         if value is None or isinstance(value, int):
@@ -197,20 +236,196 @@ class _Runtime:
     def post(self, path: str, body: Mapping[str, object]) -> Sent:
         if self.disabled():
             return Sent(ok=True, status=0, outcome=None, item=None, problem=None)
-        sent = self.attempt_all(path, json.dumps(body).encode())
+        key = secrets.token_hex(16)
+        spool = self.spool_dir()
+        if spool is not None:
+            # What waits goes first; while anything still waits, this waits behind it, in order.
+            flushed = self.flush()
+            if flushed.left:
+                sent = Sent(ok=False, status=0, outcome=None, item=None, problem=flushed.problem)
+                return self.finish(self.queue(spool, path, key, body, sent))
+        sent = self.attempt_all(path, json.dumps(body).encode(), key)
+        if spool is not None and self.retryable(sent.status):
+            sent = self.queue(spool, path, key, body, sent)
+        return self.finish(sent)
+
+    def finish(self, sent: Sent) -> Sent:
         if not sent.ok and self.strict():
             raise BeaconError(sent.problem or f"Beacon answered {sent.status}")
         return sent
 
-    def attempt_all(self, path: str, data: bytes) -> Sent:
-        key = secrets.token_hex(16)
+    def retryable(self, status: int) -> bool:
+        return status == 0 or status in (408, 429) or status >= 500
+
+    def attempt_all(self, path: str, data: bytes, key: str) -> Sent:
         delays = list(self.retry_delays)
         while True:
             sent = self.attempt(path, data, key)
-            retry = sent.status == 0 or sent.status in (408, 429) or sent.status >= 500
-            if not retry or not delays:
+            if not self.retryable(sent.status) or not delays:
                 return sent
             time.sleep(delays.pop(0))
+
+    def now_ms(self) -> int:
+        return time.time_ns() // 1_000_000
+
+    def position(self, name: str) -> tuple[int, int] | None:
+        """When a request file was queued, and its place among those queued in that millisecond."""
+        match = _SPOOL_NAME.fullmatch(name)
+        return (int(match[1]), int(match[2])) if match else None
+
+    def spooled(self, spool: str) -> list[str]:
+        """The spool's request files, oldest first: by the time and sequence their names start with, as numbers."""
+        try:
+            names = os.listdir(spool)
+        except OSError:
+            return []
+        requests = (name for name in names if name.endswith(".json") and not name.startswith("."))
+        return sorted(requests, key=lambda name: (self.position(name) is None, self.position(name) or (0, 0), name))
+
+    def next_name(self, spool: str, now: int) -> str:
+        """After every file already there, whatever process wrote it, and never before the clock."""
+        ms, sequence = now, 0
+        last = max(filter(None, map(self.position, self.spooled(spool))), default=None)
+        if last is not None and last[0] >= now:
+            ms, sequence = last[0], last[1] + 1
+        if sequence > SPOOL_LAST_SEQUENCE:
+            ms, sequence = ms + 1, 0
+        return f"{ms:015d}-{sequence:06d}.json"
+
+    def publish(self, spool: str, data: bytes, now: int) -> None:
+        """Writes `data` under a temporary name, then hard-links it to the next name, which fails if another
+        process took that name first; then it looks again. So no two processes take one name, and no reader
+        sees half a file."""
+        temporary = os.path.join(spool, f".{secrets.token_hex(8)}.tmp")
+        # Readable by this user only: it holds notification text. A hard link shares the mode.
+        with open(temporary, "xb", opener=lambda name, flags: os.open(name, flags, 0o600)) as file:
+            file.write(data)
+        try:
+            for _ in range(SPOOL_NAME_TRIES):
+                try:
+                    os.link(temporary, os.path.join(spool, self.next_name(spool, now)))
+                    return
+                except FileExistsError:
+                    continue
+            raise OSError(f"another process took each of {SPOOL_NAME_TRIES} names in a row")
+        finally:
+            self.drop(spool, os.path.basename(temporary))
+
+    def read_spooled(self, spool: str, name: str) -> Mapping[str, object] | None:
+        try:
+            with open(os.path.join(spool, name), "rb") as file:
+                value: object = json.loads(file.read())
+        except (OSError, ValueError):
+            return None
+        request = self.object(value)
+        if not isinstance(request.get("path"), str) or not isinstance(request.get("key"), str):
+            return None
+        if not isinstance(request.get("queued_at"), int) or not isinstance(request.get("body"), dict):
+            return None
+        return request
+
+    def size(self, spool: str, name: str) -> int:
+        try:
+            return os.path.getsize(os.path.join(spool, name))
+        except OSError:
+            return 0
+
+    def drop(self, spool: str, name: str) -> None:
+        try:
+            os.remove(os.path.join(spool, name))
+        except OSError:
+            pass  # Already gone, or not ours to remove: never an error for the caller.
+
+    def expired(self, request: Mapping[str, object], now: int) -> bool:
+        """Past 24 hours (the server's idempotency window), or a snapshot past what `sent_at` allows."""
+        queued_at = cast(int, request["queued_at"])
+        if now - queued_at > SPOOL_MAX_AGE_MS:
+            return True
+        sent_at = self.object(request["body"]).get("sent_at")
+        return request["path"] == "/v1/snapshots" and isinstance(sent_at, int) and now - sent_at > SNAPSHOT_MAX_AGE_MS
+
+    def same_snapshot(self, a: Mapping[str, object], b: Mapping[str, object]) -> bool:
+        """Two snapshots of one source covering the same kinds: the newer says all the older did."""
+        kinds_a, kinds_b = a.get("kinds"), b.get("kinds")
+        same_kinds = (
+            sorted(cast("list[str]", kinds_a)) == sorted(cast("list[str]", kinds_b))
+            if isinstance(kinds_a, list) and isinstance(kinds_b, list)
+            else kinds_a is None and kinds_b is None
+        )
+        return a.get("source") == b.get("source") and same_kinds
+
+    def queue(self, spool: str, path: str, key: str, body: Mapping[str, object], sent: Sent) -> Sent:
+        """Writes the request to the spool and answers `queued`; a spool that can't be written leaves `sent` as it was."""
+        now = self.now_ms()
+        data = json.dumps({"path": path, "key": key, "queued_at": now, "body": dict(body)}).encode()
+        why = sent.problem or f"Beacon answered {sent.status}"
+        if len(data) > SPOOL_MAX_BYTES:
+            # It could never fit, and making room for it would drop everything waiting: drop it alone.
+            self.dropped_total += 1
+            problem = (
+                f"{why}\n  and the spool {spool} can't keep it: it is {len(data)} bytes"
+                f"\n  fix: the request is larger than the spool's limit of {SPOOL_MAX_BYTES} bytes on its own; send less in it"
+            )
+            return Sent(ok=False, status=sent.status, outcome=None, item=None, problem=problem)
+        try:
+            # Made for this user only; a folder that is already there keeps its mode.
+            os.makedirs(spool, mode=0o700, exist_ok=True)
+            names = self.spooled(spool)
+            # Removed only once the new file is written, so a failed write loses nothing.
+            replaced: list[str] = []
+            if path == "/v1/snapshots":
+                for name in names:
+                    older = self.read_spooled(spool, name)
+                    if older is not None and older["path"] == path and self.same_snapshot(self.object(older["body"]), body):
+                        replaced.append(name)
+                names = [name for name in names if name not in replaced]
+            sizes = [self.size(spool, name) for name in names]
+            evicted: list[str] = []
+            while names and (len(names) >= SPOOL_MAX_FILES or sum(sizes) + len(data) > SPOOL_MAX_BYTES):
+                evicted.append(names.pop(0))
+                sizes.pop(0)
+            self.publish(spool, data, now)
+        except OSError as error:
+            problem = f"{why}\n  and the spool {spool} can't be written: {error}"
+            return Sent(ok=False, status=sent.status, outcome=None, item=None, problem=problem)
+        for old in replaced + evicted:
+            self.drop(spool, old)
+        dropped = len(evicted)
+        self.dropped_total += dropped
+        if dropped:
+            why += f"\n  the spool was full: dropped the {dropped} oldest"
+        return Sent(ok=True, status=sent.status, outcome=None, item=None, problem=why, queued=True)
+
+    def flush(self) -> Flushed:
+        """Sends what the spool holds, oldest first, once each; stops at the first that still can't go."""
+        spool = self.spool_dir()
+        if spool is None or self.disabled():
+            return Flushed(sent=0, left=0, dropped=0, dropped_total=self.dropped_total, problem=None)
+        # Two snapshots of one source and kinds can both be here for a moment (a newer one is written
+        # before the older one it replaces is removed): sending the older, then the newer, is right.
+        names = self.spooled(spool)
+        sent = dropped = 0
+        for index, name in enumerate(names):
+            request = self.read_spooled(spool, name)
+            if request is None or self.expired(request, self.now_ms()):
+                if request is not None or os.path.exists(os.path.join(spool, name)):
+                    dropped += 1
+                self.drop(spool, name)
+                continue
+            data = json.dumps(request["body"]).encode()
+            answer = self.attempt(cast(str, request["path"]), data, cast(str, request["key"]))
+            if self.retryable(answer.status):
+                self.dropped_total += dropped
+                left = len(names) - index
+                return Flushed(sent=sent, left=left, dropped=dropped, dropped_total=self.dropped_total, problem=answer.problem)
+            self.drop(spool, name)
+            if answer.ok:
+                sent += 1
+            else:
+                # A refusal (4xx) will never be taken: it doesn't hold up what is behind it.
+                dropped += 1
+        self.dropped_total += dropped
+        return Flushed(sent=sent, left=0, dropped=dropped, dropped_total=self.dropped_total, problem=None)
 
     def attempt(self, path: str, data: bytes, key: str) -> Sent:
         url = self.url()
@@ -260,6 +475,13 @@ class _Runtime:
 
 
 _beacon = _Runtime()
+
+
+def flush() -> Flushed:
+    """Sends what the spool holds (`spool_dir` or `BEACON_SPOOL_DIR`), oldest first. Call it on a timer."""
+    return _beacon.flush()
+
+
 
 
 # ---------- the kinds `backup` declares ----------

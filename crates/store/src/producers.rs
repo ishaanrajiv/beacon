@@ -3,12 +3,12 @@
 //! transaction; a snapshot is all or nothing.
 
 use crate::Store;
-use crate::engine::{NewItem, Tx, open_input};
+use crate::engine::{NewItem, SERVICE_LABEL, Tx, open_input};
 use crate::error::{Error, ErrorKind, Result};
 use crate::rows::{self, Row};
 use beacon_core::Problem;
 use beacon_core::builtin;
-use beacon_core::decl::{Check, Declarations, Kind};
+use beacon_core::decl::{Declarations, Kind};
 use beacon_core::duration::{Duration, MINUTE};
 use beacon_core::item::Item;
 use beacon_core::lifecycle::{FireTarget, Input, Life, Outcome, fire_target};
@@ -141,18 +141,96 @@ const REASON_MAX: usize = 100;
 /// The reason a source that stopped posting snapshots is unobserved.
 pub const STALE_REASON: &str = "It stopped reporting.";
 
-/// Every published source's declarations; one that no longer reads is left out.
-pub(crate) fn load_registry(conn: &Connection) -> Result<Vec<Declarations>> {
-    let mut stmt = conn.prepare("SELECT decl FROM registry ORDER BY source")?;
-    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-    let mut out = Vec::new();
-    for row in rows {
-        let value: Value = serde_json::from_str(&row?)?;
-        if let Ok(decl) = Declarations::from_json(value, &Check::default()) {
-            out.push(decl);
+/// What a publish did: how many kinds the source now has, which it kept (`keep`), and the open
+/// alerts and actions it closed because their kind is gone.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Published {
+    pub kinds: usize,
+    pub kept: Vec<String>,
+    pub closed: Vec<i64>,
+}
+
+/// A published source whose stored declarations, or some of whose kinds, Beacon can't read back
+/// (written by a version that stored them differently). It is kept and reported, never dropped:
+/// `GET /v1/registry` shows its `problem`, `GET /v1/health` counts it, and events for what can't
+/// be read are refused with a fix that says to publish it again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Unreadable {
+    pub source: String,
+    /// The kinds that can't be read; empty when the source itself can't be.
+    pub kinds: Vec<String>,
+    pub problem: Problem,
+    /// Why, in a few words.
+    #[serde(skip)]
+    pub why: String,
+    pub published: i64,
+}
+
+impl Unreadable {
+    fn new(source: &str, kinds: Vec<String>, why: &str, published: i64) -> Unreadable {
+        let what = if kinds.is_empty() {
+            format!("its declarations as stored can't be read: {why}")
+        } else {
+            let names: Vec<String> = kinds.iter().map(|k| format!("`{k}`")).collect();
+            format!("{} as stored can't be read: {why}", names.join(", "))
+        };
+        Unreadable {
+            source: source.to_string(),
+            kinds,
+            problem: Problem::new(
+                format!("registry source {source}"),
+                what,
+                format!(
+                    "publish `{source}` again (`beacon publish <its folder>`); until then its events are refused"
+                ),
+            ),
+            why: why.to_string(),
+            published,
         }
     }
-    Ok(out)
+
+    /// Whether events of `kind` are refused because of it.
+    pub fn covers(&self, kind: &str) -> bool {
+        self.kinds.is_empty() || self.kinds.iter().any(|k| k == kind)
+    }
+}
+
+/// Every published source's declarations, read tolerantly, and the sources that can't all be
+/// read. Nothing stored can fail the start.
+pub(crate) fn load_registry(conn: &Connection) -> Result<(Vec<Declarations>, Vec<Unreadable>)> {
+    let mut stmt = conn.prepare("SELECT source, decl, published FROM registry ORDER BY source")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    let mut unreadable = Vec::new();
+    for row in rows {
+        let (source, text, published) = row?;
+        let read = serde_json::from_str::<Value>(&text)
+            .map_err(|e| format!("it is not JSON: {e}"))
+            .and_then(|value| Declarations::from_stored(&value));
+        match read {
+            Err(why) => unreadable.push(Unreadable::new(&source, Vec::new(), &why, published)),
+            Ok(stored) if stored.decl.source != source => unreadable.push(Unreadable::new(
+                &source,
+                Vec::new(),
+                &format!("they name source `{}`", stored.decl.source),
+                published,
+            )),
+            Ok(stored) => {
+                if let Some((_, why)) = stored.unreadable.iter().next() {
+                    let kinds = stored.unreadable.keys().cloned().collect();
+                    unreadable.push(Unreadable::new(&source, kinds, why, published));
+                }
+                out.push(stored.decl);
+            }
+        }
+    }
+    Ok((out, unreadable))
 }
 
 impl Store {
@@ -160,8 +238,18 @@ impl Store {
 
     /// `PUT /v1/registry/{source}`: stores declarations that passed their checks (the server
     /// runs them with its `banned_words`), replacing the source's earlier ones.
-    pub fn publish(&self, decl: &Declarations, now: i64) -> Result<()> {
-        if RESERVED_SOURCES.contains(&decl.source.as_str()) {
+    pub fn publish(&self, decl: &Declarations, now: i64) -> Result<Published> {
+        self.publish_with(decl, false, now)
+    }
+
+    /// `PUT /v1/registry/{source}`, with `keep` (`?keep=true`): the body's kinds are added or
+    /// replaced by name, and kinds already published that the body lacks stay. Without it the
+    /// body replaces the source's declarations, and every alert or action still open of a kind
+    /// it no longer has closes in the same transaction (`Input::KindRemoved`): nothing could
+    /// resolve it any more.
+    pub fn publish_with(&self, decl: &Declarations, keep: bool, now: i64) -> Result<Published> {
+        // `trail` may be published: its kinds join Beacon's own Trail kinds.
+        if RESERVED_SOURCES.contains(&decl.source.as_str()) && decl.source != builtin::TRAIL_SOURCE {
             return Err(Error::new(
                 ErrorKind::Conflict,
                 "registry source",
@@ -170,16 +258,24 @@ impl Store {
             ));
         }
         let mut inner = self.lock()?;
-        let text = decl.to_json().to_string();
-        inner
-            .conn
-            .prepare_cached(
-                "INSERT INTO registry (source, decl, published) VALUES (?1, ?2, ?3) \
-                 ON CONFLICT (source) DO UPDATE SET decl = ?2, published = ?3",
-            )?
-            .execute(params![decl.source, text, now])?;
-        bump(&inner.conn)?;
-        inner.reload_registry()
+        let crate::Inner {
+            conn,
+            registry,
+            unreadable,
+            ..
+        } = &mut *inner;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| Error::sql("can't start a write", &e))?;
+        let published = {
+            let mut w = Tx::new(&tx, &self.settings, registry, now);
+            w.unreadable = unreadable;
+            w.store_declarations(decl, keep)?
+        };
+        crate::engine::stamp_history(&tx)?;
+        tx.commit().map_err(|e| Error::sql("can't commit", &e))?;
+        inner.reload_registry()?;
+        Ok(published)
     }
 
     /// `DELETE /v1/registry/{source}`: false when nobody published it. Its items stay.
@@ -204,6 +300,11 @@ impl Store {
     /// Every source's declarations, Beacon's own first, then by source.
     pub fn all_declarations(&self) -> Result<Vec<Declarations>> {
         Ok(self.lock()?.registry.values().cloned().collect())
+    }
+
+    /// The published sources Beacon can't (all) read back, by source.
+    pub fn unreadable(&self) -> Result<Vec<Unreadable>> {
+        Ok(self.lock()?.unreadable.values().cloned().collect())
     }
 
     // ---------- events ----------
@@ -269,63 +370,6 @@ impl Store {
             ));
         }
         self.write(now, |w| w.snapshot(snapshot, false))
-    }
-
-    /// `POST /v1/trail` with `type: "snapshot"`, after the server mapped each firing entry to
-    /// `trail.severe`, `trail.warning` or `trail.info` (slots `title` and `body`, labels). Covers
-    /// those three kinds: severe alerts open and resolve; a warning or info entry is recorded
-    /// once per appearance. Observes `trail` with `[trail] stale_after`.
-    pub fn apply_trail_snapshot(
-        &self,
-        sent_at: i64,
-        firing: Vec<SnapshotEntry>,
-        now: i64,
-    ) -> Result<SnapshotAnswer> {
-        let snapshot = Snapshot {
-            source: "trail".into(),
-            observed: true,
-            reason: None,
-            stale_after: Duration::from_ms(self.settings().trail_stale_after),
-            sent_at: Some(sent_at),
-            kinds: Some(vec![
-                builtin::TRAIL_SEVERE.into(),
-                builtin::TRAIL_WARNING.into(),
-                builtin::TRAIL_INFO.into(),
-            ]),
-            firing,
-        };
-        self.write(now, |w| w.snapshot(&snapshot, true))
-    }
-
-    /// `POST /v1/trail` with `type: "notice"`, mapped by the server to an event of
-    /// `trail.severe_notice`, `trail.warning` or `trail.info` keyed by the notice id. Recorded
-    /// once per id: a repeat answers the item with `repeat: true`. A `late` notice (its `ts` more
-    /// than `delivery.late` old) is recorded with its push suppressed `late`.
-    pub fn apply_trail_notice(&self, id: &str, event: &Event, late: bool, now: i64) -> Result<EventAnswer> {
-        self.write(now, |w| {
-            let known: Option<i64> = w
-                .conn
-                .prepare_cached("SELECT item FROM notices WHERE id = ?1")?
-                .query_row([id], |r| r.get(0))
-                .optional()?;
-            if let Some(item) = known {
-                let item = rows::load(w.conn, item)?.map(|row| row.item(now, w.s));
-                return Ok(EventAnswer {
-                    outcome: EventOutcome::Ignored,
-                    item,
-                    repeat: true,
-                });
-            }
-            w.late = late;
-            let answer = w.event(event, "notice", false)?;
-            w.late = false;
-            if let Some(item) = &answer.item {
-                w.conn
-                    .prepare_cached("INSERT INTO notices (id, item) VALUES (?1, ?2)")?
-                    .execute(params![id, item.id])?;
-            }
-            Ok(answer)
-        })
     }
 }
 
@@ -412,6 +456,23 @@ fn check_shape(
     problems
 }
 
+/// Every problem one snapshot entry has against its kind: its shape, its category, its values.
+pub(crate) fn entry_problems(at: &str, entry: &SnapshotEntry, kind: &Kind, check_key: bool) -> Vec<Problem> {
+    let mut problems = check_shape(
+        at,
+        &entry.kind,
+        kind,
+        &entry.key,
+        check_key,
+        &entry.labels,
+        entry.context.as_deref(),
+        entry.url.as_deref(),
+    );
+    problems.extend(check_category(at, &entry.kind, kind, entry.category.as_deref()));
+    problems.extend(check_values(at, &entry.kind, kind, &entry.facts, &entry.slots));
+    problems
+}
+
 /// A chosen category must be one the kind declares (`422`).
 fn check_category(at: &str, kind_name: &str, kind: &Kind, category: Option<&str>) -> Vec<Problem> {
     let Some(category) = category else {
@@ -436,6 +497,7 @@ fn check_category(at: &str, kind_name: &str, kind: &Kind, category: Option<&str>
     )]
 }
 
+/// `at` names the field, like `event kind`.
 fn undeclared(at: &str, name: &str, registry: &BTreeMap<String, Declarations>) -> Error {
     let all: Vec<&str> = registry
         .values()
@@ -449,17 +511,93 @@ fn undeclared(at: &str, name: &str, registry: &BTreeMap<String, Declarations>) -
     };
     Error::new(
         ErrorKind::Undeclared,
-        format!("{at} kind"),
+        at,
         format!("`{name}` is not a declared kind"),
         fix,
     )
 }
 
 impl Tx<'_, '_> {
+    /// Stores a source's declarations (merged with what it had, with `keep`), and closes what a
+    /// replacing publish removed the kind of.
+    fn store_declarations(&mut self, decl: &Declarations, keep: bool) -> Result<Published> {
+        let mut stored = decl.to_stored();
+        let mut kept = Vec::new();
+        if keep {
+            let old: Option<String> = self
+                .conn
+                .prepare_cached("SELECT decl FROM registry WHERE source = ?1")?
+                .query_row([&decl.source], |r| r.get(0))
+                .optional()?;
+            let old: Option<Value> = old.and_then(|text| serde_json::from_str(&text).ok());
+            if let (Some(Value::Object(old_kinds)), Some(Value::Object(kinds))) =
+                (old.as_ref().and_then(|v| v.get("kinds")), stored.get_mut("kinds"))
+            {
+                // Kept as stored, even one this version can't read: `keep` removes nothing.
+                for (name, kind) in old_kinds {
+                    if !kinds.contains_key(name) {
+                        kinds.insert(name.clone(), kind.clone());
+                        kept.push(name.clone());
+                    }
+                }
+            }
+        }
+        let kinds = stored.get("kinds").and_then(Value::as_object).map_or(0, Map::len);
+        self.conn
+            .prepare_cached(
+                "INSERT INTO registry (source, decl, published) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT (source) DO UPDATE SET decl = ?2, published = ?3",
+            )?
+            .execute(params![decl.source, stored.to_string(), self.now])?;
+        self.version()?;
+        let mut closed = Vec::new();
+        if !keep {
+            let open = rows::query(
+                self.conn,
+                "WHERE source = ?1 AND state IN ('open', 'dismissed', 'snoozed') ORDER BY id",
+                [&decl.source],
+            )?;
+            for mut row in open {
+                let stays = decl.kinds.contains_key(&row.kind)
+                    || (decl.source == builtin::TRAIL_SOURCE
+                        && builtin::TRAIL_BUILTIN.contains(&row.kind.as_str()));
+                if !row.life.is_open() || stays {
+                    continue;
+                }
+                self.apply(&mut row, Input::KindRemoved, None)?;
+                closed.push(row.id);
+            }
+        }
+        Ok(Published { kinds, kept, closed })
+    }
+
+    /// The problem of a stored source that can't be read, when it covers `kind`.
+    fn unreadable_kind(&self, at: &str, kind: &str) -> Option<Problem> {
+        let unreadable = self.unreadable.get(source_of(kind))?;
+        unreadable.covers(kind).then(|| {
+            Problem::new(
+                at,
+                format!(
+                    "`{kind}` was published, but Beacon can't read it as stored: {}",
+                    unreadable.why
+                ),
+                unreadable.problem.fix.clone(),
+            )
+        })
+    }
+
+    /// The error for a kind the registry doesn't have: unreadable as stored, or undeclared.
+    fn refuse_kind(&self, at: &str, kind: &str) -> Error {
+        match self.unreadable_kind(at, kind) {
+            Some(problem) => Error::many(ErrorKind::Undeclared, vec![problem]),
+            None => undeclared(at, kind, self.registry),
+        }
+    }
+
     /// Checks and applies one event.
     pub(crate) fn event(&mut self, event: &Event, at: &str, check_key: bool) -> Result<EventAnswer> {
         let Some((decl, kind)) = self.kind(&event.kind) else {
-            return Err(undeclared(at, &event.kind, self.registry));
+            return Err(self.refuse_kind(&format!("{at} kind"), &event.kind));
         };
         if let Some(source) = &event.source
             && source != &decl.source
@@ -523,7 +661,7 @@ impl Tx<'_, '_> {
         let fields = Fields {
             facts: (!keep).then_some(facts),
             slots: (!keep).then_some(slots),
-            labels: event.labels.clone(),
+            labels: with_service(event.labels.clone(), decl),
             context: event.context.clone(),
             url: event.url.clone(),
             category: event.category.clone(),
@@ -625,8 +763,13 @@ impl Tx<'_, '_> {
 
     /// Checks and applies a snapshot. `builtin` is Trail's, which may cover update and record
     /// kinds and has already been mapped.
-    fn snapshot(&mut self, snap: &Snapshot, builtin: bool) -> Result<SnapshotAnswer> {
+    pub(crate) fn snapshot(&mut self, snap: &Snapshot, builtin: bool) -> Result<SnapshotAnswer> {
         let Some(decl) = self.registry.get(&snap.source) else {
+            if let Some(unreadable) = self.unreadable.get(&snap.source) {
+                let mut problem = unreadable.problem.clone();
+                problem.at = "snapshot source".into();
+                return Err(Error::many(ErrorKind::Undeclared, vec![problem]));
+            }
             return Err(Error::new(
                 ErrorKind::Undeclared,
                 "snapshot source",
@@ -692,10 +835,14 @@ impl Tx<'_, '_> {
         };
         let mut unfit = Vec::new();
         for (i, name) in covered.iter().enumerate() {
+            let at = format!("snapshot kinds[{i}]");
             match decl.kinds.get(name) {
                 Some(kind) if builtin || kind.class.has_lifecycle() => {}
+                None if self.unreadable_kind(&at, name).is_some() => {
+                    unfit.extend(self.unreadable_kind(&at, name));
+                }
                 _ => unfit.push(invalid(
-                    format!("snapshot kinds[{i}]"),
+                    at,
                     format!(
                         "`{name}` is not an alert or action kind of source `{}`",
                         snap.source
@@ -779,7 +926,7 @@ impl Tx<'_, '_> {
             let fields = Fields {
                 facts: Some(entry.facts.clone()),
                 slots: Some(entry.slots.clone()),
-                labels: entry.labels.clone(),
+                labels: with_service(entry.labels.clone(), decl),
                 context: entry.context.clone(),
                 url: entry.url.clone(),
                 category: entry.category.clone(),
@@ -835,10 +982,13 @@ impl Tx<'_, '_> {
                 answer.resolved.push(row.id);
             }
         }
-        // The listed set becomes this snapshot's.
-        self.conn
-            .prepare_cached("DELETE FROM listed WHERE source = ?1")?
-            .execute([&snap.source])?;
+        // The listed set of each covered kind becomes this snapshot's; another check's kinds of
+        // the same source keep theirs.
+        for name in &covered {
+            self.conn
+                .prepare_cached("DELETE FROM listed WHERE source = ?1 AND kind = ?2")?
+                .execute(params![snap.source, name])?;
+        }
         for (kind, key) in &present {
             self.conn
                 .prepare_cached("INSERT INTO listed (source, kind, key) VALUES (?1, ?2, ?3)")?
@@ -862,6 +1012,13 @@ impl Tx<'_, '_> {
         self.registry
             .get(source)
             .map_or_else(|| source.to_string(), |decl| decl.name.clone())
+    }
+
+    /// The labels of Beacon's own items about `source`: its service, so a deploy's silence of
+    /// the service mutes "Can't check" too.
+    fn about(&self, source: &str) -> BTreeMap<String, String> {
+        let service = self.registry.get(source).map_or(source, Declarations::service);
+        BTreeMap::from([(SERVICE_LABEL.to_string(), service.to_string())])
     }
 
     /// A snapshot was taken: the source is observed, with a fresh `last_snapshot`. If it wasn't,
@@ -898,6 +1055,7 @@ impl Tx<'_, '_> {
                 let mut new = NewItem::new(builtin::SOURCE_OBSERVED, source);
                 new.facts
                     .insert("source_name".into(), json!(self.source_name(source)));
+                new.labels = self.about(source);
                 self.record_builtin(new)?;
             }
         }
@@ -945,7 +1103,7 @@ impl Tx<'_, '_> {
                     json!(self.source_name(source)),
                 )])),
                 slots: Some(Map::from_iter([("reason".to_string(), json!(reason))])),
-                labels: BTreeMap::new(),
+                labels: self.about(source),
                 context: None,
                 url: None,
                 category: None,
@@ -956,6 +1114,7 @@ impl Tx<'_, '_> {
         let mut new = NewItem::new(builtin::SOURCE_UNOBSERVED, source);
         new.facts
             .insert("source_name".into(), json!(self.source_name(source)));
+        new.labels = self.about(source);
         new.slots.insert("reason".into(), json!(reason));
         self.record_builtin(new)?;
         Ok(())
@@ -969,6 +1128,14 @@ impl Tx<'_, '_> {
         self.suppress(row, reason)?;
         Ok(true)
     }
+}
+
+/// An event's labels with `service` added when it set none: its source's service.
+fn with_service(mut labels: BTreeMap<String, String>, decl: &Declarations) -> BTreeMap<String, String> {
+    if !labels.contains_key(SERVICE_LABEL) {
+        labels.insert(SERVICE_LABEL.into(), decl.service().to_string());
+    }
+    labels
 }
 
 /// The values an event or snapshot entry sets on an item.

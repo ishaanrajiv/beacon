@@ -41,14 +41,65 @@ pub(crate) fn event(sink: &Sink, record: &SinkRecord) -> Value {
     })
 }
 
-/// Sends batches until the server stops.
+/// What Trail made of one body.
+enum Sent {
+    Taken,
+    /// A `4xx` other than `408` and `429`: sending it again can't succeed.
+    Refused(u16),
+    /// No answer, `408`, `429`, `5xx` or anything else: try again later.
+    Away(String),
+}
+
+struct Trail<'a> {
+    agent: ureq::Agent,
+    url: String,
+    sink: &'a Sink,
+}
+
+impl Trail<'_> {
+    fn send(&self, records: &[SinkRecord]) -> Sent {
+        let events: Vec<Value> = records.iter().map(|r| event(self.sink, r)).collect();
+        let body = json!({"source": self.sink.source, "version": crate::VERSION, "events": events});
+        let sent = self
+            .agent
+            .post(&self.url)
+            .header("Content-Type", "application/json")
+            .send(body.to_string());
+        match sent {
+            Ok(response) => match response.status().as_u16() {
+                200..=299 => Sent::Taken,
+                status @ (408 | 429) => Sent::Away(format!("HTTP {status}")),
+                status @ 400..=499 => Sent::Refused(status),
+                status => Sent::Away(format!("HTTP {status}")),
+            },
+            Err(e) => Sent::Away(e.to_string()),
+        }
+    }
+}
+
+/// Drops a record Trail refused, so it doesn't hold up the copies behind it, and says so.
+fn drop_refused(app: &App, record: &SinkRecord, status: u16) {
+    match app.store.sink_dropped(record.id, app.now()) {
+        Ok(count) => eprintln!(
+            "beacon: Trail refused the copy of item {} ({}, HTTP {status}); dropped it ({count} dropped so far)",
+            record.item, record.what
+        ),
+        Err(e) => eprintln!("beacon: the copy to Trail can't move its cursor: {e}"),
+    }
+}
+
+/// Sends batches until the server stops. A batch Trail refuses (`4xx`) is sent again one change at
+/// a time, so only the change it can't take is dropped (and counted), not the ones beside it.
 pub(crate) fn run(app: &App, sink: &Sink) {
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(10)))
-        .http_status_as_error(false)
-        .build()
-        .new_agent();
-    let url = format!("{}/v1/ingest", sink.trail_url);
+    let trail = Trail {
+        agent: ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(10)))
+            .http_status_as_error(false)
+            .build()
+            .new_agent(),
+        url: format!("{}/v1/ingest", sink.trail_url),
+        sink,
+    };
     let mut backoff = Duration::from_secs(1);
     while !app.stop.load(Ordering::Relaxed) {
         let batch = match app.store.sink_batch(BATCH) {
@@ -63,27 +114,30 @@ pub(crate) fn run(app: &App, sink: &Sink) {
             std::thread::sleep(IDLE);
             continue;
         };
-        let events: Vec<Value> = batch.iter().map(|r| event(sink, r)).collect();
-        let body = json!({"source": sink.source, "version": crate::VERSION, "events": events});
-        let sent = agent
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .send(body.to_string());
-        match sent {
-            Ok(response) if response.status().is_success() => {
-                backoff = Duration::from_secs(1);
+        let away = match trail.send(&batch) {
+            Sent::Taken => {
                 if let Err(e) = app.store.sink_done(last, app.now()) {
                     eprintln!("beacon: the copy to Trail can't move its cursor: {e}");
                 }
+                None
+            }
+            Sent::Refused(status) => match batch.as_slice() {
+                [record] => {
+                    drop_refused(app, record, status);
+                    None
+                }
+                _ => one_at_a_time(app, &trail, &batch),
+            },
+            Sent::Away(why) => Some(why),
+        };
+        match away {
+            None => {
+                backoff = Duration::from_secs(1);
                 if batch.len() < BATCH as usize {
                     std::thread::sleep(IDLE);
                 }
             }
-            outcome => {
-                let why = match outcome {
-                    Ok(response) => format!("HTTP {}", response.status()),
-                    Err(e) => e.to_string(),
-                };
+            Some(why) => {
                 eprintln!(
                     "beacon: Trail didn't take the copy ({why}); trying again in {}s",
                     backoff.as_secs()
@@ -93,6 +147,23 @@ pub(crate) fn run(app: &App, sink: &Sink) {
             }
         }
     }
+}
+
+/// Sends each record of a refused batch on its own, in order: taken ones move the cursor, refused
+/// ones are dropped. Stops at the first Trail doesn't answer, and says why.
+fn one_at_a_time(app: &App, trail: &Trail<'_>, batch: &[SinkRecord]) -> Option<String> {
+    for record in batch {
+        match trail.send(std::slice::from_ref(record)) {
+            Sent::Taken => {
+                if let Err(e) = app.store.sink_done(record.id, app.now()) {
+                    eprintln!("beacon: the copy to Trail can't move its cursor: {e}");
+                }
+            }
+            Sent::Refused(status) => drop_refused(app, record, status),
+            Sent::Away(why) => return Some(why),
+        }
+    }
+    None
 }
 
 #[cfg(test)]

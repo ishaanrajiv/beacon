@@ -1,0 +1,34 @@
+# Kinds that Trail's alert rules name with `kind` (spec/api.md, POST /v1/trail): each rule gets its
+# own push level, copy and facts instead of the built-in kind its severity picks. Beacon's own
+# trail.* kinds stay beside these. For source `trail`, `name` and `icon` are required by the file
+# format and ignored by the server: Trail's items keep Beacon's ("Monitoring", gauge).
+source = "trail"
+name = "Monitoring"
+icon = "gauge"
+
+# A rule `disk_full` in Trail's alerts.toml with `kind = "trail.disk_full"` and a `disk` label.
+[kinds."trail.disk_full"]
+class = "alert"
+push = "urgent"
+description = "A disk is nearly full; the rule's value is the percent used."
+title = "Disk {disk} is nearly full"
+body = "{value}% used since {since}. Backups stop when it fills."
+facts = { disk = "string", value = "float", since = "time" }
+preview = "A disk is nearly full"
+open = "/system"
+actions = ["acknowledge", "dismiss", "silence_1h"]
+repeat = ["30m", "2h"]
+recovered = "Disk {disk} has room again"
+
+# A rule `queue_backlog` with `kind = "trail.queue_backlog"` and a `queue` label.
+[kinds."trail.queue_backlog"]
+class = "alert"
+push = "normal"
+description = "A queue is backing up; the rule's value is how many jobs wait."
+title = "The {queue} queue is backing up"
+body = "{value} jobs are waiting. {body}"
+facts = { queue = "string", value = "int" }
+slots = { body = 100 }
+preview = "A queue is backing up"
+actions = ["acknowledge", "silence_1h"]
+recovered = "The {queue} queue is moving again"

@@ -1,10 +1,11 @@
 //! Reads: one item with its history, the inbox, the registry's sources, devices. Reading changes
 //! nothing.
 
-use crate::Store;
 use crate::engine::meta;
 use crate::error::Result;
 use crate::rows::{self, Row};
+use crate::{Store, Unreadable};
+use beacon_core::Problem;
 use beacon_core::decl::Declarations;
 use beacon_core::delivery::Settings;
 use beacon_core::duration::{DAY, Duration};
@@ -125,6 +126,8 @@ pub struct SourceView {
     pub source: String,
     pub name: String,
     pub icon: Icon,
+    /// The service its items are labelled with (`service`).
+    pub service: String,
     pub kinds: usize,
     pub builtin: bool,
     pub published: Option<i64>,
@@ -132,6 +135,9 @@ pub struct SourceView {
     pub reason: Option<String>,
     pub last_snapshot: Option<i64>,
     pub stale_after: Option<Duration>,
+    /// Set when Beacon can't read back what was published for it, or some of its kinds: events
+    /// for those are refused until it is published again.
+    pub problem: Option<Problem>,
 }
 
 /// One device in `GET /v1/devices`.
@@ -283,7 +289,21 @@ impl Store {
 
     /// `GET /v1/registry`: every source, Beacon's own included, sorted by name.
     pub fn sources(&self) -> Result<Vec<SourceView>> {
+        let unreadable: BTreeMap<String, Unreadable> = self
+            .unreadable()?
+            .into_iter()
+            .map(|u| (u.source.clone(), u))
+            .collect();
         self.read(|tx, registry| {
+            let state = |source: &str| -> Result<SourceState> {
+                let state: Option<SourceState> = tx
+                    .prepare_cached(
+                        "SELECT observed, reason, last_snapshot, stale_after FROM sources WHERE source = ?1",
+                    )?
+                    .query_row([source], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                    .optional()?;
+                Ok(state.unwrap_or((true, None, None, None)))
+            };
             let mut out = Vec::new();
             for decl in registry.values() {
                 let builtin = decl.source == "beacon" || decl.source == "trail";
@@ -291,29 +311,45 @@ impl Store {
                     .prepare_cached("SELECT published FROM registry WHERE source = ?1")?
                     .query_row([&decl.source], |r| r.get(0))
                     .optional()?;
-                let state: Option<SourceState> = tx
-                    .prepare_cached(
-                        "SELECT observed, reason, last_snapshot, stale_after FROM sources WHERE source = ?1",
-                    )?
-                    .query_row([&decl.source], |r| {
-                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-                    })
-                    .optional()?;
-                let (observed, reason, last_snapshot, stale_after) =
-                    state.unwrap_or((true, None, None, None));
+                let (observed, reason, last_snapshot, stale_after) = state(&decl.source)?;
                 out.push(SourceView {
                     source: decl.source.clone(),
                     name: decl.name.clone(),
                     icon: decl.icon,
+                    service: decl.service().to_string(),
                     kinds: decl.kinds.len(),
                     builtin,
-                    published: if builtin { None } else { published },
+                    // `trail` is published when kinds were published for it beside Beacon's own.
+                    published: if decl.source == "beacon" { None } else { published },
                     observed: observed || decl.source == "beacon",
                     reason,
                     last_snapshot,
                     stale_after: last_snapshot.and(stale_after).and_then(Duration::from_ms),
+                    problem: unreadable.get(&decl.source).map(|u| u.problem.clone()),
                 });
             }
+            // A source none of whose declarations can be read is still listed, with its problem.
+            for (source, u) in &unreadable {
+                if registry.contains_key(source) {
+                    continue;
+                }
+                let (observed, reason, last_snapshot, stale_after) = state(source)?;
+                out.push(SourceView {
+                    source: source.clone(),
+                    name: source.clone(),
+                    icon: Icon::Bell,
+                    service: source.clone(),
+                    kinds: 0,
+                    builtin: false,
+                    published: Some(u.published),
+                    observed,
+                    reason,
+                    last_snapshot,
+                    stale_after: last_snapshot.and(stale_after).and_then(Duration::from_ms),
+                    problem: Some(u.problem.clone()),
+                });
+            }
+            out.sort_by(|a, b| a.source.cmp(&b.source));
             Ok(out)
         })
     }

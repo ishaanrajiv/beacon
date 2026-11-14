@@ -1512,6 +1512,38 @@ fn a_closed_action_stays_closed_while_the_snapshot_lists_it() {
 }
 
 #[test]
+fn two_checks_of_one_source_keep_their_own_bookkeeping() {
+    // One check of `assistant` covers its reminders, another its questions. A snapshot only
+    // touches the kinds it covers: before, the questions' snapshot forgot that the reminder was
+    // listed, so the next reminders' snapshot opened the reminder you had closed again.
+    let store = store();
+    let reminder = SnapshotEntry {
+        kind: "assistant.reminder".into(),
+        key: "r1".into(),
+        slots: json!({"text": "Call"}).as_object().cloned().unwrap(),
+        ..SnapshotEntry::default()
+    };
+    let covering = |kind: &str, firing: Vec<SnapshotEntry>| Snapshot {
+        source: "assistant".into(),
+        kinds: Some(vec![kind.into()]),
+        ..snapshot(firing)
+    };
+    let first = store
+        .apply_snapshot(&covering("assistant.reminder", vec![reminder.clone()]), T0)
+        .unwrap();
+    let id = first.opened[0];
+    store.press(id, "done", None, "ios", T0 + MINUTE).unwrap();
+    store
+        .apply_snapshot(&covering("assistant.question", vec![]), T0 + 2 * MINUTE)
+        .unwrap();
+    let again = store
+        .apply_snapshot(&covering("assistant.reminder", vec![reminder]), T0 + 3 * MINUTE)
+        .unwrap();
+    assert!(again.opened.is_empty(), "{again:?}");
+    assert_eq!(store.item(id, T0).unwrap().unwrap().state, Some(ItemState::Done));
+}
+
+#[test]
 fn an_unobserved_source_mutes_its_alerts_until_it_reports_again() {
     let store = store();
     let mut s = snapshot(vec![]);
@@ -1718,15 +1750,13 @@ fn trail_going_quiet_opens_source_stopped() {
 
 // ---------- Trail ----------
 
-fn trail_entry(kind: &str, key: &str, title: &str) -> SnapshotEntry {
-    SnapshotEntry {
-        kind: kind.into(),
+fn trail_entry(kind: &str, key: &str, title: &str) -> TrailAlert {
+    TrailAlert {
         key: key.into(),
-        slots: json!({"title": title, "body": "From Trail"})
-            .as_object()
-            .cloned()
-            .unwrap(),
-        ..SnapshotEntry::default()
+        builtin: kind.into(),
+        title: title.into(),
+        body: "From Trail".into(),
+        ..TrailAlert::default()
     }
 }
 
@@ -1738,21 +1768,22 @@ fn trail_snapshots_open_severe_alerts_and_record_warnings_once_per_appearance() 
         trail_entry("trail.severe", "cpu hot", "CPU is hot"),
         trail_entry("trail.warning", "disk 80", "Disk is filling"),
     ];
-    let first = store.apply_trail_snapshot(T0, firing.clone(), T0).unwrap();
+    let (first, fallbacks) = store.apply_trail_snapshot(T0, firing.clone(), T0).unwrap();
+    assert!(fallbacks.is_empty());
     assert_eq!(first.opened.len(), 2);
     let severe = store.item(first.opened[0], T0).unwrap().unwrap();
     assert_eq!(severe.url.as_deref(), Some("/trail"));
     assert_eq!(severe.key, "cpu hot", "Trail's keys are kept as they are");
-    let second = store
+    let (second, _) = store
         .apply_trail_snapshot(T0 + MINUTE, firing.clone(), T0 + MINUTE)
         .unwrap();
     assert!(second.opened.is_empty());
     assert_eq!(second.updated.len(), 1);
-    let gone = store
+    let (gone, _) = store
         .apply_trail_snapshot(T0 + 2 * MINUTE, vec![], T0 + 2 * MINUTE)
         .unwrap();
     assert_eq!(gone.resolved, [severe.id]);
-    let back = store
+    let (back, _) = store
         .apply_trail_snapshot(T0 + 3 * MINUTE, firing, T0 + 3 * MINUTE)
         .unwrap();
     assert_eq!(back.opened.len(), 1, "the warning again");
@@ -1762,28 +1793,339 @@ fn trail_snapshots_open_severe_alerts_and_record_warnings_once_per_appearance() 
 #[test]
 fn trail_notices_are_recorded_once_and_late_ones_not_pushed() {
     let store = store();
-    let notice = |key: &str| {
-        event(
-            "trail.severe_notice",
-            key,
-            json!({}),
-            json!({"title": "Login failed", "body": "Three times"}),
-        )
+    let notice = |id: &str| TrailAlert {
+        key: id.into(),
+        builtin: "trail.severe_notice".into(),
+        title: "Login failed".into(),
+        body: "Three times".into(),
+        ..TrailAlert::default()
     };
-    let first = store
-        .apply_trail_notice("n-1", &notice("n-1"), false, T0)
-        .unwrap();
+    let (first, _) = store.apply_trail_notice(&notice("n-1"), false, T0).unwrap();
     assert_eq!(first.outcome, EventOutcome::Opened);
     assert_eq!(item(&first).push.status, S::Queued);
-    let again = store
-        .apply_trail_notice("n-1", &notice("n-1"), false, T0 + MINUTE)
+    let (again, _) = store
+        .apply_trail_notice(&notice("n-1"), false, T0 + MINUTE)
         .unwrap();
     assert!(again.repeat);
     assert_eq!(item(&again).id, item(&first).id);
-    let late = store
-        .apply_trail_notice("n-2", &notice("n 2 with spaces"), true, T0)
+    let (late, _) = store
+        .apply_trail_notice(&notice("n 2 with spaces"), true, T0)
         .unwrap();
     assert_eq!(item(&late).push.reason, Some(R::Late));
+}
+
+const TRAIL_KINDS: &str = include_str!("../../../examples/homelab-ish/trail/beacon/kinds.toml");
+
+/// The example's rule kinds, and a one-off alert and an update for event rules.
+fn trail_store() -> Store {
+    let store = store();
+    store.set_trail_open("/trail").unwrap();
+    let mut decl = parse(TRAIL_KINDS, &Check::default()).unwrap();
+    let extra = parse(
+        r#"
+source = "trail"
+name = "Monitoring"
+
+[kinds."trail.login_failed"]
+class = "alert"
+push = "urgent"
+one_off = true
+title = "Sign-in failed for {user}"
+body = "{body}"
+facts = { user = "string" }
+slots = { body = 150 }
+preview = "Sign-in failed"
+actions = ["acknowledge"]
+
+[kinds."trail.deploy_noted"]
+class = "update"
+push = "silent"
+title = "A deploy was noted"
+body = "{title}"
+slots = { title = 40 }
+"#,
+        &Check::default(),
+    )
+    .unwrap();
+    decl.kinds.extend(extra.kinds);
+    let published = store.publish(&decl, T0 - DAY).unwrap();
+    assert_eq!(published.kinds, 4);
+    store
+}
+
+fn disk(key: &str, kind: Option<&str>, value: f64) -> TrailAlert {
+    TrailAlert {
+        key: key.into(),
+        kind: kind.map(Value::from),
+        builtin: "trail.severe".into(),
+        title: "Disk is nearly full on the shop server".into(),
+        body: "Free space is low.".into(),
+        labels: [("trail_source".to_string(), "shop".to_string())].into(),
+        trail_labels: json!({"disk": "data"}).as_object().cloned().unwrap(),
+        source: "shop".into(),
+        alert: "disk_full".into(),
+        value: Some(json!(value)),
+        since: Some(json!(T0 - HOUR)),
+        ..TrailAlert::default()
+    }
+}
+
+#[test]
+fn trail_kinds_join_the_built_in_ones_and_can_be_removed() {
+    let store = trail_store();
+    let trail = store.declarations("trail").unwrap().unwrap();
+    assert_eq!(trail.name, "Monitoring");
+    for name in [
+        "trail.severe",
+        "trail.info",
+        "trail.disk_full",
+        "trail.login_failed",
+    ] {
+        assert!(trail.kinds.contains_key(name), "{name}");
+    }
+    assert_eq!(trail.kinds["trail.disk_full"].open.as_deref(), Some("/system"));
+    assert_eq!(trail.kinds["trail.queue_backlog"].open.as_deref(), Some("/trail"));
+    let view = store.sources().unwrap();
+    let view = view.iter().find(|s| s.source == "trail").unwrap();
+    assert_eq!((view.builtin, view.published), (true, Some(T0 - DAY)));
+    // A built-in name can't be published.
+    let mut bad = parse(TRAIL_KINDS, &Check::default()).unwrap();
+    let severe = bad.kinds["trail.disk_full"].clone();
+    bad.kinds.insert("trail.severe".into(), severe);
+    assert!(
+        beacon_core::decl::validate(&bad, &Check::default())
+            .iter()
+            .any(|p| p.message.contains("Beacon's own Trail kinds"))
+    );
+    // Removing the published kinds leaves Beacon's own.
+    let (answer, _) = store
+        .apply_trail_snapshot(T0, vec![disk("d", Some("trail.disk_full"), 96.0)], T0)
+        .unwrap();
+    assert!(store.unpublish("trail").unwrap());
+    let trail = store.declarations("trail").unwrap().unwrap();
+    assert_eq!(trail.kinds.len(), 4);
+    assert!(trail.kinds.contains_key("trail.severe_notice"));
+    assert_eq!(
+        store.item(answer.opened[0], T0).unwrap().unwrap().kind,
+        "trail.disk_full"
+    );
+}
+
+#[test]
+fn a_trail_entry_naming_a_kind_becomes_that_kind() {
+    let store = trail_store();
+    let (answer, fallbacks) = store
+        .apply_trail_snapshot(
+            T0,
+            vec![disk("shop.disk{disk=data}", Some("trail.disk_full"), 96.5)],
+            T0,
+        )
+        .unwrap();
+    assert!(fallbacks.is_empty(), "{fallbacks:?}");
+    let it = store.item(answer.opened[0], T0).unwrap().unwrap();
+    assert_eq!(it.kind, "trail.disk_full");
+    assert_eq!(it.title, "Disk data is nearly full");
+    assert_eq!(it.body, "96.5% used since 11:00. Backups stop when it fills.");
+    assert_eq!(it.push.level, PushLevel::Urgent);
+    assert_eq!(it.url.as_deref(), Some("/system"));
+    assert_eq!(it.labels["trail_source"], "shop");
+    assert_eq!(it.alert.as_ref().unwrap().next_repeat, Some(T0 + 30 * MINUTE));
+    let detail = store.item_detail(it.id, T0).unwrap().unwrap();
+    assert_eq!(detail.facts["value"], 96.5);
+    assert_eq!(detail.facts["since"], T0 - HOUR);
+    // Ongoing: it updates; absent: it resolves with the kind's recovery text.
+    let (again, _) = store
+        .apply_trail_snapshot(
+            T0 + MINUTE,
+            vec![disk("shop.disk{disk=data}", Some("trail.disk_full"), 97.0)],
+            T0 + MINUTE,
+        )
+        .unwrap();
+    assert_eq!(again.updated, [it.id]);
+    let (gone, _) = store
+        .apply_trail_snapshot(T0 + 2 * MINUTE, vec![], T0 + 2 * MINUTE)
+        .unwrap();
+    assert_eq!(gone.resolved, [it.id]);
+    assert_eq!(
+        store.item(it.id, T0).unwrap().unwrap().title,
+        "Disk data has room again"
+    );
+
+    // The normal one: a label converted to the fact's type, a float value made whole, Trail's
+    // body in the body slot.
+    let mut backlog = disk("shop.queue{queue=email}", Some("trail.queue_backlog"), 150.0);
+    backlog.trail_labels = json!({"queue": "email"}).as_object().cloned().unwrap();
+    backlog.body = "Mail goes out late.".into();
+    let (answer, fallbacks) = store
+        .apply_trail_snapshot(T0 + 3 * MINUTE, vec![backlog], T0 + 3 * MINUTE)
+        .unwrap();
+    assert!(fallbacks.is_empty(), "{fallbacks:?}");
+    let it = store.item(answer.opened[0], T0).unwrap().unwrap();
+    assert_eq!(it.title, "The email queue is backing up");
+    assert_eq!(it.body, "150 jobs are waiting. Mail goes out late.");
+    assert_eq!(it.push.level, PushLevel::Normal);
+}
+
+#[test]
+fn a_firing_trail_alert_keeps_its_kind_until_it_clears() {
+    let store = trail_store();
+    let key = "shop.disk{disk=data}";
+    // Firing as the severity's built-in kind, before the rule named one.
+    let (first, _) = store
+        .apply_trail_snapshot(T0, vec![disk(key, None, 96.0)], T0)
+        .unwrap();
+    let severe = store.item(first.opened[0], T0).unwrap().unwrap();
+    assert_eq!(severe.kind, "trail.severe");
+    // The rule gains a kind while it fires. It is the same incident: nothing opens, nothing
+    // resolves, and so nothing is pushed for a rule that only changed its words.
+    let (during, fallbacks) = store
+        .apply_trail_snapshot(
+            T0 + MINUTE,
+            vec![disk(key, Some("trail.disk_full"), 97.0)],
+            T0 + MINUTE,
+        )
+        .unwrap();
+    assert!(fallbacks.is_empty(), "{fallbacks:?}");
+    assert!(
+        during.opened.is_empty() && during.resolved.is_empty(),
+        "{during:?}"
+    );
+    assert_eq!(during.updated, [severe.id]);
+    // Once it clears, the next firing is the kind the rule names.
+    let (gone, _) = store
+        .apply_trail_snapshot(T0 + 2 * MINUTE, vec![], T0 + 2 * MINUTE)
+        .unwrap();
+    assert_eq!(gone.resolved, [severe.id]);
+    let (back, _) = store
+        .apply_trail_snapshot(
+            T0 + 3 * MINUTE,
+            vec![disk(key, Some("trail.disk_full"), 98.0)],
+            T0 + 3 * MINUTE,
+        )
+        .unwrap();
+    let named = store.item(back.opened[0], T0 + 3 * MINUTE).unwrap().unwrap();
+    assert_eq!(named.kind, "trail.disk_full");
+    // And the other way: a rule that drops its kind while firing stays the kind it opened as.
+    let (dropped, _) = store
+        .apply_trail_snapshot(T0 + 4 * MINUTE, vec![disk(key, None, 98.5)], T0 + 4 * MINUTE)
+        .unwrap();
+    assert!(
+        dropped.opened.is_empty() && dropped.resolved.is_empty(),
+        "{dropped:?}"
+    );
+    assert_eq!(dropped.updated, [named.id]);
+    // Another series of the same rule is its own incident, and opens as the rule's kind now.
+    let (other, _) = store
+        .apply_trail_snapshot(
+            T0 + 5 * MINUTE,
+            vec![disk(key, None, 98.5), disk("shop.disk{disk=logs}", None, 91.0)],
+            T0 + 5 * MINUTE,
+        )
+        .unwrap();
+    assert_eq!(other.opened.len(), 1);
+    assert_eq!(
+        store
+            .item(other.opened[0], T0 + 5 * MINUTE)
+            .unwrap()
+            .unwrap()
+            .kind,
+        "trail.severe"
+    );
+}
+
+#[test]
+fn a_trail_entry_whose_kind_doesnt_fit_falls_back_to_its_severity() {
+    let store = trail_store();
+    let mut no_label = disk("b", Some("trail.disk_full"), 96.0);
+    no_label.trail_labels = serde_json::Map::new();
+    let mut not_a_string = disk("d", None, 96.0);
+    not_a_string.kind = Some(json!(3));
+    let firing = vec![
+        disk("a", Some("trail.disk_ful"), 96.0),
+        no_label,
+        disk("c", Some("trail.login_failed"), 96.0),
+        not_a_string,
+        disk("e", Some("trail.warning"), 96.0),
+    ];
+    let (answer, fallbacks) = store.apply_trail_snapshot(T0, firing, T0).unwrap();
+    assert_eq!(answer.opened.len(), 5, "no alert is lost");
+    for id in &answer.opened {
+        assert_eq!(store.item(*id, T0).unwrap().unwrap().kind, "trail.severe");
+    }
+    let keys: Vec<&str> = fallbacks.iter().map(|f| f.key.as_str()).collect();
+    assert_eq!(keys, ["a", "b", "c", "d", "e"]);
+    assert!(
+        fallbacks[0]
+            .problem
+            .fix
+            .contains("did you mean `trail.disk_full`?"),
+        "{:?}",
+        fallbacks[0]
+    );
+    assert!(
+        fallbacks[1].problem.at.ends_with("facts.disk"),
+        "{:?}",
+        fallbacks[1]
+    );
+    assert!(
+        fallbacks[2].problem.message.contains("one-off"),
+        "{:?}",
+        fallbacks[2]
+    );
+    assert_eq!(fallbacks[3].kind, "3");
+    assert!(
+        fallbacks[4]
+            .problem
+            .message
+            .contains("not a kind published for trail")
+    );
+    assert!(fallbacks.iter().all(|f| f.became == "trail.severe"));
+}
+
+#[test]
+fn a_trail_notice_naming_a_kind_becomes_that_kind() {
+    let store = trail_store();
+    let notice = |id: &str, kind: &str, props: Value| TrailAlert {
+        key: id.into(),
+        kind: Some(json!(kind)),
+        builtin: "trail.severe_notice".into(),
+        title: "Sign-in failed".into(),
+        body: "Three wrong passwords.".into(),
+        source: "shop".into(),
+        alert: "login_failed".into(),
+        props: props.as_object().cloned().unwrap(),
+        ..TrailAlert::default()
+    };
+    let (answer, fallbacks) = store
+        .apply_trail_notice(
+            &notice("n-1", "trail.login_failed", json!({"user": "sam"})),
+            false,
+            T0,
+        )
+        .unwrap();
+    assert!(fallbacks.is_empty(), "{fallbacks:?}");
+    let it = item(&answer);
+    assert_eq!(
+        (it.kind.as_str(), it.title.as_str()),
+        ("trail.login_failed", "Sign-in failed for sam")
+    );
+    assert!(it.alert.as_ref().unwrap().one_off);
+    // An update kind is recorded once per notice.
+    let (answer, _) = store
+        .apply_trail_notice(&notice("n-2", "trail.deploy_noted", json!({})), false, T0)
+        .unwrap();
+    assert_eq!(item(&answer).kind, "trail.deploy_noted");
+    // An alert that stays open, or a missing property, falls back.
+    let (answer, fallbacks) = store
+        .apply_trail_notice(&notice("n-3", "trail.disk_full", json!({})), false, T0)
+        .unwrap();
+    assert_eq!(item(&answer).kind, "trail.severe_notice");
+    assert!(fallbacks[0].problem.message.contains("stays open"));
+    let (answer, fallbacks) = store
+        .apply_trail_notice(&notice("n-4", "trail.login_failed", json!({})), false, T0)
+        .unwrap();
+    assert_eq!(item(&answer).kind, "trail.severe_notice");
+    assert!(fallbacks[0].problem.fix.contains("props"), "{:?}", fallbacks[0]);
 }
 
 // ---------- the inbox ----------
@@ -2140,7 +2482,7 @@ fn a_version_1_database_moves_its_devices_out() {
     assert!(!every_text(&path).contains(&token));
     let conn = rusqlite::Connection::open(&path).unwrap();
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let device: String = conn
         .query_row("SELECT device FROM attempts", [], |r| r.get(0))
         .unwrap();
@@ -2235,4 +2577,627 @@ fn a_silence_with_an_idempotency_key_opens_once() {
     assert_eq!(err.kind, ErrorKind::Conflict);
     let err = store.open_silence_once(&new, "a key", "{}", T0).unwrap_err();
     assert_eq!(err.kind, ErrorKind::Invalid);
+}
+
+// ---------- stored declarations ----------
+
+/// Rewrites a stored declarations row (or an item's kind) with `edit`, as another version might
+/// have written it, with the store closed.
+fn rewrite_stored(path: &std::path::Path, sql: &str, edit: impl Fn(&mut Value)) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let rows: Vec<(String, String)> = conn
+        .prepare(sql)
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    for (id, text) in rows {
+        let mut value: Value = serde_json::from_str(&text).unwrap();
+        edit(&mut value);
+        let table = if sql.contains("registry") {
+            "registry SET decl"
+        } else {
+            "items SET kind_decl"
+        };
+        let column = if sql.contains("registry") { "source" } else { "id" };
+        conn.execute(
+            &format!("UPDATE {table} = ?1 WHERE {column} = ?2"),
+            [value.to_string(), id],
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn stored_declarations_carry_a_format_and_read_back_tolerantly() {
+    let dir = temp_dir("stored");
+    let path = dir.join("beacon.db");
+    {
+        let store = Store::open(&path, Settings::default()).unwrap();
+        store
+            .publish(&parse(BACKUP, &Check::default()).unwrap(), T0)
+            .unwrap();
+        store.apply_event(&failed(), None, T0).unwrap();
+    }
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let stored: String = conn
+        .query_row("SELECT decl FROM registry WHERE source = 'backup'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&stored).unwrap()["format"], 1);
+    let kind: String = conn
+        .query_row("SELECT kind_decl FROM items", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&kind).unwrap()["format"], 1);
+    drop(conn);
+
+    // A newer version wrote fields this one doesn't know: before, the whole source was dropped.
+    rewrite_stored(&path, "SELECT source, decl FROM registry", |v| {
+        v["colour"] = "teal".into();
+        v["kinds"]["backup.failed"]["escalate_after"] = "1h".into();
+    });
+    rewrite_stored(&path, "SELECT CAST(id AS TEXT), kind_decl FROM items", |v| {
+        v["escalate_after"] = "1h".into();
+    });
+    let store = Store::open(&path, Settings::default()).unwrap();
+    assert!(store.unreadable().unwrap().is_empty());
+    let answer = store.apply_event(&failed(), None, T0 + MINUTE).unwrap();
+    assert_eq!(answer.outcome, EventOutcome::Updated);
+    let backup = store.declarations("backup").unwrap().unwrap();
+    assert_eq!(backup, parse(BACKUP, &Check::default()).unwrap());
+}
+
+#[test]
+fn a_stored_source_that_cant_be_read_is_kept_and_reported() {
+    let dir = temp_dir("unreadable");
+    let path = dir.join("beacon.db");
+    let id;
+    {
+        let store = Store::open(&path, Settings::default()).unwrap();
+        for text in [BACKUP, SHIP] {
+            store
+                .publish(&parse(text, &Check::default()).unwrap(), T0)
+                .unwrap();
+        }
+        id = item(&store.apply_event(&failed(), None, T0).unwrap()).id;
+    }
+    // One kind of backup can't be read; ship can't be read at all; an item's kind is garbage.
+    rewrite_stored(&path, "SELECT source, decl FROM registry", |v| {
+        if v["source"] == "backup" {
+            v["kinds"]["backup.failed"]["class"] = "page".into();
+        } else {
+            *v = json!(["not", "declarations"]);
+        }
+    });
+    rewrite_stored(&path, "SELECT CAST(id AS TEXT), kind_decl FROM items", |v| {
+        *v = json!({"class": 3});
+    });
+    let store = Store::open(&path, Settings::default()).unwrap();
+    let unreadable = store.unreadable().unwrap();
+    assert_eq!(unreadable.len(), 2);
+    assert_eq!(unreadable[0].kinds, ["backup.failed"]);
+    assert!(unreadable[1].kinds.is_empty());
+
+    // Both still show in the registry, with their problem.
+    let sources = store.sources().unwrap();
+    let backup = sources.iter().find(|s| s.source == "backup").unwrap();
+    assert!(backup.problem.as_ref().unwrap().message.contains("backup.failed"));
+    assert_eq!(
+        backup.kinds,
+        parse(BACKUP, &Check::default()).unwrap().kinds.len() - 1
+    );
+    let ship = sources.iter().find(|s| s.source == "ship").unwrap();
+    assert!(
+        ship.problem
+            .as_ref()
+            .unwrap()
+            .fix
+            .contains("publish `ship` again")
+    );
+    assert_eq!((ship.kinds, ship.published), (0, Some(T0)));
+
+    // Events for what can't be read are refused with the fix; the rest of the source works.
+    let e = store.apply_event(&failed(), None, T0).unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Undeclared);
+    assert!(
+        e.problems[0].message.contains("can't read it as stored"),
+        "{:?}",
+        e.problems
+    );
+    assert!(e.problems[0].fix.contains("publish `backup` again"));
+    let e = store.apply_event(&ready(1), None, T0).unwrap_err();
+    assert!(
+        e.problems[0].fix.contains("publish `ship` again"),
+        "{:?}",
+        e.problems
+    );
+    let finished = event(
+        "backup.finished",
+        "",
+        json!({"size": "2 GB", "took": 60_000}),
+        json!({}),
+    );
+    store.apply_event(&finished, None, T0).unwrap();
+    let mut snap = Snapshot {
+        source: "ship".into(),
+        observed: true,
+        reason: None,
+        stale_after: None,
+        sent_at: None,
+        kinds: None,
+        firing: vec![],
+    };
+    let e = store.apply_snapshot(&snap, T0).unwrap_err();
+    assert!(e.problems[0].fix.contains("publish `ship` again"));
+    snap.source = "backup".into();
+    snap.kinds = Some(vec!["backup.failed".into()]);
+    let e = store.apply_snapshot(&snap, T0).unwrap_err();
+    assert!(
+        e.problems[0].fix.contains("publish `backup` again"),
+        "{:?}",
+        e.problems
+    );
+
+    // The item whose kind can't be read still loads, with its text and buttons.
+    let detail = store.item_detail(id, T0).unwrap().unwrap();
+    assert_eq!(detail.item.title, "Backup failed");
+    assert!(!detail.item.actions.is_empty());
+    assert!(
+        !store
+            .inbox(&InboxQuery::default(), T0)
+            .unwrap()
+            .needs_you
+            .is_empty()
+    );
+
+    // Publishing again puts it right.
+    store
+        .publish(&parse(BACKUP, &Check::default()).unwrap(), T0 + MINUTE)
+        .unwrap();
+    assert_eq!(store.unreadable().unwrap().len(), 1);
+    store.apply_event(&failed(), None, T0 + MINUTE).unwrap();
+}
+
+// ---------- publishing ----------
+
+/// The backup example without some of its kinds, and under another display name.
+fn backup_without(kinds: &[&str], name: &str) -> beacon_core::decl::Declarations {
+    let mut decl = parse(BACKUP, &Check::default()).unwrap();
+    for kind in kinds {
+        decl.kinds.remove(*kind);
+    }
+    decl.name = name.into();
+    decl
+}
+
+#[test]
+fn a_keep_publish_adds_and_replaces_kinds_and_keeps_the_rest() {
+    let store = store();
+    let all = parse(BACKUP, &Check::default()).unwrap();
+    let mut body = backup_without(
+        &["backup.failed", "backup.stale", "backup.space"],
+        "Nightly backups",
+    );
+    let mut renamed = all.kinds["backup.space"].clone();
+    renamed.title = "Backup disk is filling".into();
+    body.kinds.insert("backup.disk".into(), renamed);
+    let published = store.publish_with(&body, true, T0).unwrap();
+    assert_eq!(published.kept, ["backup.failed", "backup.space", "backup.stale"]);
+    assert_eq!(published.kinds, all.kinds.len() + 1);
+    assert!(published.closed.is_empty());
+    let now = store.declarations("backup").unwrap().unwrap();
+    assert_eq!(
+        now.name, "Nightly backups",
+        "the source's own fields are the body's"
+    );
+    assert_eq!(now.kinds["backup.failed"], all.kinds["backup.failed"]);
+    assert!(now.kinds.contains_key("backup.disk"));
+    // The old code and the new can both send.
+    store.apply_event(&failed(), None, T0).unwrap();
+    let disk = event("backup.disk", "", json!({"used_percent": 91}), json!({}));
+    store.apply_event(&disk, None, T0).unwrap();
+    // A keep publish of the same kind replaces it by name.
+    let mut changed = parse(BACKUP, &Check::default()).unwrap();
+    changed.kinds.get_mut("backup.failed").unwrap().push = PushLevel::Normal;
+    store.publish_with(&changed, true, T0 + MINUTE).unwrap();
+    assert_eq!(
+        store.declarations("backup").unwrap().unwrap().kinds["backup.failed"].push,
+        PushLevel::Normal
+    );
+}
+
+#[test]
+fn a_replacing_publish_closes_what_it_removed_the_kind_of() {
+    let store = store();
+    store
+        .register_device(&"ab".repeat(32), "production", None, T0)
+        .unwrap();
+    // An alert whose push went out, one that never pushed, and an action, of kinds about to go.
+    let pushed = item(&store.apply_event(&failed(), None, T0).unwrap());
+    sent(&store, T0);
+    phone_active(&store, T0);
+    let quiet = event(
+        "backup.stale",
+        "",
+        json!({"since": DAY, "last_ok": T0 - DAY}),
+        json!({}),
+    );
+    let held = item(&store.apply_event(&quiet, None, T0).unwrap());
+    assert_eq!(held.push.status, S::Held);
+    let asked = item(&store.apply_event(&reminder("r1"), None, T0).unwrap());
+    let done = item(&store.apply_event(&reminder("r2"), None, T0).unwrap());
+    store.press(done.id, "done", None, "api", T0).unwrap();
+    // A kind that stays is untouched.
+    let space = event("backup.space", "", json!({"used_percent": 95}), json!({}));
+    let staying = item(&store.apply_event(&space, None, T0).unwrap());
+
+    let published = store
+        .publish(
+            &backup_without(&["backup.failed", "backup.stale"], "Backups"),
+            T0 + HOUR,
+        )
+        .unwrap();
+    assert_eq!(published.closed, [pushed.id, held.id]);
+    for id in [pushed.id, held.id] {
+        let it = store.item(id, T0 + HOUR).unwrap().unwrap();
+        assert_eq!(it.state, Some(ItemState::Resolved));
+        assert_eq!(it.times.unwrap().resolved, Some(T0 + HOUR));
+        assert!(history(&store, id).contains(&"kind_removed".to_string()));
+    }
+    let after = store.item(pushed.id, T0 + HOUR).unwrap().unwrap();
+    assert_eq!(after.title, pushed.title, "no recovery text is invented");
+    assert_eq!(after.body, pushed.body);
+    // Its firing push reached the phone: the usual recovery replaces the banner, with its text.
+    let jobs = store.pushes_due(T0 + HOUR).unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!((jobs[0].item, jobs[0].purpose.as_str()), (pushed.id, "recovery"));
+    assert_eq!(jobs[0].title, pushed.title);
+    // The held one never pushed: suppressed, closed.
+    let held = store.item(held.id, T0 + HOUR).unwrap().unwrap();
+    assert_eq!(
+        (held.push.status, held.push.reason),
+        (S::Suppressed, Some(R::Closed))
+    );
+    assert!(history(&store, held.id).contains(&"kind_removed".to_string()));
+    // Other sources and kept kinds are untouched.
+    for id in [asked.id, staying.id] {
+        assert!(store.item(id, T0 + HOUR).unwrap().unwrap().state == Some(ItemState::Open));
+    }
+    // The assistant's action closes when its own source drops the kind.
+    let mut assistant = parse(ASSISTANT, &Check::default()).unwrap();
+    assistant.kinds.remove("assistant.reminder");
+    let published = store.publish(&assistant, T0 + 2 * HOUR).unwrap();
+    assert_eq!(published.closed, [asked.id]);
+    let closed = store.item(asked.id, T0 + 2 * HOUR).unwrap().unwrap();
+    assert_eq!(closed.state, Some(ItemState::Resolved));
+    assert_eq!(
+        store.item(done.id, T0 + 2 * HOUR).unwrap().unwrap().state,
+        Some(ItemState::Done)
+    );
+}
+
+// ---------- the service label ----------
+
+#[test]
+fn every_item_carries_its_service_so_a_deploys_silence_matches_it() {
+    let store = store();
+    // A source that names its service; another that doesn't (its source is its service).
+    let mut ship = parse(SHIP, &Check::default()).unwrap();
+    ship.service = "deployer".into();
+    store.publish(&ship, T0).unwrap();
+    assert_eq!(store.sources().unwrap()[1].service, "backup");
+    let silence = store
+        .open_silence(
+            &NewSilence {
+                matcher: SilenceMatch {
+                    labels: [("service".to_string(), "backup".to_string())].into(),
+                    ..SilenceMatch::default()
+                },
+                until: T0 + HOUR,
+                reason: "Deploying backup".into(),
+                client: "api".into(),
+            },
+            T0,
+        )
+        .unwrap();
+    // The event set no label: it gets the source's service, and the silence mutes it.
+    let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+    assert_eq!(it.labels["service"], "backup");
+    assert_eq!(
+        (it.push.status, it.push.reason),
+        (S::Suppressed, Some(R::Silenced))
+    );
+    assert_eq!(store.silence(silence.id, T0).unwrap().unwrap().matched, 1);
+    // An event's own label wins.
+    let mut own = down();
+    own.labels.insert("service".into(), "website".into());
+    assert_eq!(
+        item(&store.apply_event(&own, None, T0).unwrap()).labels["service"],
+        "website"
+    );
+    // The declared service, on a snapshot entry too.
+    let failed_deploy = event(
+        "ship.failed",
+        "web",
+        json!({"app": "web"}),
+        json!({"cause": "The build broke"}),
+    );
+    let deploy = item(&store.apply_event(&failed_deploy, None, T0).unwrap());
+    assert_eq!(deploy.labels["service"], "deployer");
+    let entry = SnapshotEntry {
+        kind: "backup.space".into(),
+        facts: json!({"used_percent": 97}).as_object().cloned().unwrap(),
+        ..SnapshotEntry::default()
+    };
+    let answer = store.apply_snapshot(&snapshot(vec![entry]), T0).unwrap();
+    let space = store.item(answer.opened[0], T0).unwrap().unwrap();
+    assert_eq!(space.labels["service"], "backup");
+    // Beacon's own items about a source carry that source's service.
+    let mut off = snapshot(vec![]);
+    off.observed = false;
+    off.reason = Some("The bucket didn't answer.".into());
+    store.apply_snapshot(&off, T0 + MINUTE).unwrap();
+    let stopped = store
+        .inbox(&InboxQuery::default(), T0 + MINUTE)
+        .unwrap()
+        .alerts
+        .open
+        .into_iter()
+        .find(|i| i.kind == "beacon.source_stopped")
+        .unwrap();
+    assert_eq!(stopped.labels["service"], "backup");
+    assert_eq!(stopped.push.reason, Some(R::Silenced));
+}
+
+#[test]
+fn the_copy_to_trail_says_what_the_item_was_at_each_change() {
+    let store = store();
+    let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+    sent(&store, T0);
+    // The copy hasn't run yet (Trail is down) when the alert resolves.
+    store
+        .apply_event(&resolved(failed()), None, T0 + 90 * MINUTE)
+        .unwrap();
+    let steps: Vec<(String, Option<String>, String, String)> = store
+        .sink_batch(100)
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.what, r.state, r.title, r.push_status))
+        .collect();
+    let open = Some("open".to_string());
+    assert_eq!(
+        steps,
+        [
+            ("opened".into(), open.clone(), it.title.clone(), "queued".into()),
+            ("push_sent".into(), open, it.title.clone(), "sent".into()),
+            (
+                "resolved".into(),
+                Some("resolved".into()),
+                "Backups are working again".into(),
+                "queued".into()
+            ),
+        ]
+    );
+}
+
+/// A beacon.db at schema version 2 with an alert that opened, pushed and resolved: made by this
+/// version, then taken back to what version 2 had.
+fn version_2_database(name: &str) -> std::path::PathBuf {
+    let dir = temp_dir(name);
+    let path = dir.join("beacon.db");
+    let store = Store::open(&path, Settings::default()).unwrap();
+    store
+        .publish(&parse(BACKUP, &Check::default()).unwrap(), T0 - DAY)
+        .unwrap();
+    store.apply_event(&failed(), None, T0).unwrap();
+    sent(&store, T0);
+    store.apply_event(&resolved(failed()), None, T0 + HOUR).unwrap();
+    drop(store);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "DROP VIEW IF EXISTS items_v1; DROP VIEW IF EXISTS history_v1; DROP INDEX history_unstamped; \
+         ALTER TABLE history DROP COLUMN state; ALTER TABLE history DROP COLUMN title; \
+         ALTER TABLE history DROP COLUMN push_level; ALTER TABLE history DROP COLUMN push_status; \
+         ALTER TABLE history DROP COLUMN push_reason; PRAGMA user_version = 2;",
+    )
+    .unwrap();
+    path
+}
+
+fn user_version(path: &std::path::Path) -> i64 {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap()
+}
+
+#[test]
+fn upgrading_the_schema_keeps_a_whole_copy_of_the_version_before() {
+    let path = version_2_database("upgrade");
+    let store = Store::open(&path, Settings::default()).unwrap();
+    // The rows from before have the item as it is now: what the copy to Trail sent for them.
+    let states: Vec<Option<String>> = store
+        .sink_batch(100)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.state)
+        .collect();
+    assert_eq!(states.len(), 3);
+    assert!(states.iter().all(|s| s.as_deref() == Some("resolved")));
+    drop(store);
+    assert_eq!(user_version(&path), 3);
+    let copy = path.with_file_name("previous").join("v2").join("beacon.db");
+    assert_eq!(user_version(&copy), 2);
+    let conn = rusqlite::Connection::open(&copy).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT count(*) FROM history", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 3);
+    assert!(!copy.with_file_name("beacon.db.partial").exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&copy).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    // Starting again changes nothing more.
+    drop(Store::open(&path, Settings::default()).unwrap());
+    assert_eq!(user_version(&copy), 2);
+}
+
+#[test]
+fn without_its_copy_the_schema_is_not_upgraded() {
+    let path = version_2_database("no-copy");
+    // Something that isn't a folder where the copy goes.
+    std::fs::write(path.with_file_name("previous"), "in the way").unwrap();
+    let error = Store::open(&path, Settings::default()).err().expect("refused");
+    let problem = error.problem();
+    assert!(
+        problem.message.contains("can't keep a copy of the database"),
+        "{problem}"
+    );
+    assert!(problem.fix.contains("nothing was changed"));
+    assert_eq!(user_version(&path), 2);
+}
+
+#[test]
+fn a_database_from_a_newer_beacon_is_refused_with_the_way_back() {
+    let dir = temp_dir("newer");
+    let path = dir.join("beacon.db");
+    drop(Store::open(&path, Settings::default()).unwrap());
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("PRAGMA user_version = 99")
+        .unwrap();
+    let problem = Store::open(&path, Settings::default())
+        .err()
+        .expect("refused")
+        .problem();
+    assert!(problem.message.contains("schema version 99"), "{problem}");
+    assert!(problem.fix.contains("previous/v3/beacon.db"), "{problem}");
+}
+
+/// Each column of a view, with the type SQLite reports for it (what DuckDB's reader goes by).
+fn view_columns(store: &Store, view: &str) -> Vec<String> {
+    store
+        .read(|tx, _| {
+            let mut stmt = tx.prepare(&format!("SELECT name, type FROM pragma_table_info('{view}')"))?;
+            let rows = stmt.query_map([], |r| {
+                Ok(format!("{} {}", r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .unwrap()
+}
+
+/// The contract for programs that read beacon.db (spec/config.md, "Reading the database"). A `_v1`
+/// view only gains columns: if this test fails because one was removed, renamed or retyped, put
+/// it back and make a `_v2` view beside it instead.
+#[test]
+fn the_views_for_readers_keep_their_columns() {
+    let store = store();
+    let items = [
+        "id INT",
+        "source TEXT",
+        "source_name TEXT",
+        "kind TEXT",
+        "key TEXT",
+        "class TEXT",
+        "state TEXT",
+        "push_level TEXT",
+        "push_status TEXT",
+        "push_reason TEXT",
+        "title TEXT",
+        "body TEXT",
+        "url TEXT",
+        "context TEXT",
+        "labels TEXT",
+        "service TEXT",
+        "seen INT",
+        "created INT",
+        "updated INT",
+        "opened INT",
+        "acknowledged INT",
+        "dismissed INT",
+        "snoozed_until INT",
+        "done INT",
+        "resolved INT",
+    ];
+    let history = [
+        "id INT",
+        "item INT",
+        "at INT",
+        "what TEXT",
+        "client TEXT",
+        "source TEXT",
+        "kind TEXT",
+        "class TEXT",
+        "service TEXT",
+        "state TEXT",
+        "title TEXT",
+        "push_level TEXT",
+        "push_status TEXT",
+        "push_reason TEXT",
+    ];
+    let have_items = view_columns(&store, "items_v1");
+    let have_history = view_columns(&store, "history_v1");
+    // Only gains: what v1 promised is still there, in its place, with its type.
+    assert_eq!(
+        &have_items[..items.len()],
+        items,
+        "items_v1 lost or changed a column"
+    );
+    assert_eq!(
+        &have_history[..history.len()],
+        history,
+        "history_v1 lost or changed a column"
+    );
+    // And a column added since is listed above and in the spec, not slipped in.
+    assert_eq!(
+        have_items.len(),
+        items.len(),
+        "items_v1 has a column not listed here"
+    );
+    assert_eq!(
+        have_history.len(),
+        history.len(),
+        "history_v1 has a column not listed here"
+    );
+}
+
+#[test]
+fn the_views_read_what_the_tables_hold() {
+    let store = store();
+    let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+    store.apply_event(&resolved(failed()), None, T0 + HOUR).unwrap();
+    let (service, state, resolved_at, labels): (String, String, i64, String) = store
+        .read(|tx, _| {
+            Ok(tx.query_row(
+                "SELECT service, state, resolved, labels FROM items_v1 WHERE id = ?1",
+                [it.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(service, "backup");
+    assert_eq!(state, "resolved");
+    assert_eq!(resolved_at, T0 + HOUR);
+    assert_eq!(
+        serde_json::from_str::<Value>(&labels).unwrap()["service"],
+        "backup"
+    );
+    let steps: Vec<(String, String)> = store
+        .read(|tx, _| {
+            let mut stmt = tx.prepare("SELECT what, state FROM history_v1 WHERE item = ?1 ORDER BY id")?;
+            let rows = stmt.query_map([it.id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .unwrap();
+    assert_eq!(
+        steps[..2],
+        [
+            ("opened".to_string(), "open".to_string()),
+            ("resolved".to_string(), "resolved".to_string())
+        ]
+    );
 }

@@ -26,11 +26,16 @@ pub(crate) struct Tx<'a, 'r> {
     pub conn: &'a Connection,
     pub s: &'r Settings,
     pub registry: &'r BTreeMap<String, Declarations>,
+    /// Sources whose stored declarations can't all be read: their events are refused with a fix.
+    pub unreadable: &'r BTreeMap<String, crate::Unreadable>,
     pub now: i64,
     /// A late Trail notice: its decision becomes `late` (`spec/api.md`, `POST /v1/trail`).
     pub late: bool,
     version: Option<i64>,
 }
+
+/// The label every item carries naming the service it is about (`spec/declarations.md`).
+pub(crate) const SERVICE_LABEL: &str = "service";
 
 /// Reads a value from `meta`.
 pub(crate) fn meta(conn: &Connection, key: &str) -> Result<Option<i64>> {
@@ -39,6 +44,18 @@ pub(crate) fn meta(conn: &Connection, key: &str) -> Result<Option<i64>> {
         .query_row([key], |r| r.get::<_, Option<i64>>(0))
         .optional()?
         .flatten())
+}
+
+/// Fills each history row this write made with its item as the write leaves it: what the change
+/// made the item, kept for the copy to Trail (`migrate_3.sql`). Runs just before every commit.
+pub(crate) fn stamp_history(conn: &Connection) -> Result<()> {
+    conn.prepare_cached(
+        "UPDATE history SET state = i.state, title = i.title, push_level = i.push_level, \
+         push_status = i.push_status, push_reason = i.push_reason \
+         FROM items i WHERE history.title IS NULL AND i.id = history.item",
+    )?
+    .execute([])?;
+    Ok(())
 }
 
 pub(crate) fn set_meta(conn: &Connection, key: &str, value: Option<i64>) -> Result<()> {
@@ -89,10 +106,12 @@ impl<'a, 'r> Tx<'a, 'r> {
         registry: &'r BTreeMap<String, Declarations>,
         now: i64,
     ) -> Self {
+        static NONE: BTreeMap<String, crate::Unreadable> = BTreeMap::new();
         Tx {
             conn,
             s,
             registry,
+            unreadable: &NONE,
             now,
             late: false,
             version: None,
@@ -144,6 +163,10 @@ impl<'a, 'r> Tx<'a, 'r> {
         })?;
         let version = self.version()?;
         let class = life.class;
+        let mut labels = new.labels;
+        if !labels.contains_key(SERVICE_LABEL) {
+            labels.insert(SERVICE_LABEL.into(), decl.service().to_string());
+        }
         let level = if class == Class::Record {
             PushLevel::None
         } else {
@@ -164,7 +187,7 @@ impl<'a, 'r> Tx<'a, 'r> {
             url_override: new.url.is_some(),
             context: new.context,
             category: new.category,
-            labels: new.labels,
+            labels,
             facts: new.facts,
             slots: new.slots,
             decl: kind.clone(),
@@ -634,6 +657,9 @@ impl<'a, 'r> Tx<'a, 'r> {
         new.facts.insert("stable".into(), json!(self.s.flap_stable));
         let title = render::render(&alert.decl, &alert.facts, &alert.slots, &self.clock()).title;
         new.slots.insert("alert".into(), json!(title));
+        if let Some(service) = alert.labels.get(SERVICE_LABEL) {
+            new.labels.insert(SERVICE_LABEL.into(), service.clone());
+        }
         new.collapse_id = Some(alert.collapse_id.clone());
         self.record_builtin(new)?;
         Ok(())

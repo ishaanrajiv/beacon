@@ -23,6 +23,7 @@ mod jobs;
 mod producers;
 mod reads;
 mod rows;
+mod trail;
 
 #[cfg(test)]
 mod tests;
@@ -30,11 +31,16 @@ mod tests;
 pub use clients::{Heartbeat, NewSilence, PressAnswer, SeenTarget, SilenceView};
 pub use error::{Error, ErrorKind, Result};
 pub use jobs::{Attempt, Due, PushJob, PushNext, Ran, SinkRecord};
-pub use producers::{Event, EventAnswer, EventOutcome, EventState, Snapshot, SnapshotAnswer, SnapshotEntry};
+pub use producers::{
+    Event, EventAnswer, EventOutcome, EventState, Published, Snapshot, SnapshotAnswer, SnapshotEntry,
+    Unreadable,
+};
 pub use reads::{
     Acted, AttemptView, DeviceView, HistoryEntry, Inbox, InboxQuery, ItemDetail, SourceView, VisitSummary,
 };
+pub use trail::{Fallback, TrailAlert};
 
+use beacon_core::builtin;
 use beacon_core::decl::Declarations;
 use beacon_core::delivery::Settings;
 use rusqlite::{Connection, Transaction, TransactionBehavior};
@@ -44,7 +50,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 /// The schema version this crate writes (`PRAGMA user_version`).
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Beacon's store. Open it once and share it; it is `Send + Sync`. Calls are serialized on one
@@ -59,8 +65,13 @@ pub(crate) struct Inner {
     /// Every source's declarations: Beacon's own, then the published ones. Read from the
     /// database at open and after each publish.
     pub registry: BTreeMap<String, Declarations>,
+    /// Published sources whose stored declarations (or some of whose kinds) can't be read, by
+    /// source: kept and reported, never dropped silently.
+    pub unreadable: BTreeMap<String, Unreadable>,
     /// Beacon's own declarations, with `[trail] open` applied.
     pub builtin: Vec<Declarations>,
+    /// `[trail] open`: the link of every `trail.*` kind that declares none.
+    pub trail_open: Option<String>,
 }
 
 impl Store {
@@ -84,7 +95,7 @@ impl Store {
         })?;
         conn.execute("ATTACH DATABASE ?1 AS dev", [devices])
             .map_err(|e| Error::sql("can't open devices.db", &e))?;
-        Store::start(conn, settings, true)
+        Store::start(conn, settings, Some(&path.with_file_name("previous")))
     }
 
     /// A store in memory, for tests and `beacon check`.
@@ -92,13 +103,15 @@ impl Store {
         let conn = Connection::open_in_memory().map_err(|e| Error::sql("can't open a database", &e))?;
         conn.execute_batch("ATTACH DATABASE ':memory:' AS dev")
             .map_err(|e| Error::sql("can't open a database", &e))?;
-        Store::start(conn, settings, false)
+        Store::start(conn, settings, None)
     }
 
-    fn start(mut conn: Connection, settings: Settings, wal: bool) -> Result<Store> {
+    /// `previous` is where a copy of beacon.db is kept before a migration: a file database's
+    /// `<data_dir>/previous`, or none in memory (which also means no WAL).
+    fn start(mut conn: Connection, settings: Settings, previous: Option<&Path>) -> Result<Store> {
         conn.busy_timeout(BUSY_TIMEOUT)
             .map_err(|e| Error::sql("can't set the busy timeout", &e))?;
-        migrate(&mut conn, wal)?;
+        migrate(&mut conn, previous)?;
         let builtin = beacon_core::builtin::declarations().map_err(|problems| {
             Error::new(
                 ErrorKind::Storage,
@@ -117,7 +130,9 @@ impl Store {
         let mut inner = Inner {
             conn,
             registry: BTreeMap::new(),
+            unreadable: BTreeMap::new(),
             builtin,
+            trail_open: None,
         };
         inner.reload_registry()?;
         Ok(Store {
@@ -136,6 +151,7 @@ impl Store {
                 }
             }
         }
+        inner.trail_open = Some(open.to_string());
         inner.reload_registry()
     }
 
@@ -165,15 +181,18 @@ impl Store {
         let Inner {
             conn,
             registry,
-            builtin: _,
+            unreadable,
+            ..
         } = &mut *inner;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| Error::sql("can't start a write", &e))?;
         let value = {
             let mut w = engine::Tx::new(&tx, &self.settings, registry, now);
+            w.unreadable = unreadable;
             f(&mut w)?
         };
+        engine::stamp_history(&tx)?;
         tx.commit().map_err(|e| Error::sql("can't commit", &e))?;
         Ok(value)
     }
@@ -203,16 +222,34 @@ impl Inner {
         for decl in &self.builtin {
             registry.insert(decl.source.clone(), decl.clone());
         }
-        for decl in producers::load_registry(&self.conn)? {
+        let (published, unreadable) = producers::load_registry(&self.conn)?;
+        for decl in published {
+            // Kinds published for `trail` join Beacon's own; its name and icon stay Beacon's.
+            if decl.source == builtin::TRAIL_SOURCE
+                && let Some(trail) = registry.get_mut(builtin::TRAIL_SOURCE)
+            {
+                for (name, mut kind) in decl.kinds {
+                    if builtin::TRAIL_BUILTIN.contains(&name.as_str()) {
+                        continue;
+                    }
+                    if kind.open.is_none() {
+                        kind.open.clone_from(&self.trail_open);
+                    }
+                    trail.kinds.insert(name, kind);
+                }
+                continue;
+            }
             registry.insert(decl.source.clone(), decl);
         }
         self.registry = registry;
+        self.unreadable = unreadable.into_iter().map(|u| (u.source.clone(), u)).collect();
         Ok(())
     }
 }
 
 /// Sets the connection up and brings the schema to [`SCHEMA_VERSION`].
-fn migrate(conn: &mut Connection, wal: bool) -> Result<()> {
+fn migrate(conn: &mut Connection, previous: Option<&Path>) -> Result<()> {
+    let wal = previous.is_some();
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(|e| Error::sql("can't read the schema version", &e))?;
@@ -221,8 +258,16 @@ fn migrate(conn: &mut Connection, wal: bool) -> Result<()> {
             ErrorKind::Storage,
             "beacon.db",
             format!("the database is schema version {version}; this Beacon knows up to {SCHEMA_VERSION}"),
-            "run the newer Beacon that wrote it, or restore a backup made before the upgrade",
+            format!(
+                "run the newer Beacon that wrote it, or put back the copy it kept before upgrading, previous/v{SCHEMA_VERSION}/beacon.db beside beacon.db (spec/config.md, \"Going back a version\")"
+            ),
         ));
+    }
+    if let Some(previous) = previous
+        && version > 0
+        && version < SCHEMA_VERSION
+    {
+        keep_previous(conn, &previous.join(format!("v{version}")))?;
     }
     if wal {
         for schema in ["main", "dev"] {
@@ -259,16 +304,73 @@ fn migrate(conn: &mut Connection, wal: bool) -> Result<()> {
         tx.execute_batch(include_str!("migrate_2.sql"))
             .map_err(|e| Error::sql("can't move to schema version 2", &e))?;
     }
+    if version < 3 {
+        tx.execute_batch(include_str!("migrate_3.sql"))
+            .map_err(|e| Error::sql("can't move to schema version 3", &e))?;
+    }
     if version < SCHEMA_VERSION {
         tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
             .map_err(|e| Error::sql("can't set the schema version", &e))?;
     }
+    tx.execute_batch(include_str!("views.sql"))
+        .map_err(|e| Error::sql("can't create the views for readers", &e))?;
     tx.commit()
         .map_err(|e| Error::sql("can't commit the schema", &e))?;
     if wal && version > 0 && version < 2 {
         // The moved tokens' old pages leave the log too.
         conn.execute_batch("PRAGMA main.wal_checkpoint(TRUNCATE)")
             .map_err(|e| Error::sql("can't checkpoint beacon.db", &e))?;
+    }
+    Ok(())
+}
+
+/// Keeps a consistent copy of beacon.db as it is before a migration, at
+/// `<data_dir>/previous/v<old>/beacon.db`, so going back to the Beacon that wrote it is a file copy
+/// (`spec/config.md`, "Going back a version"). Written under another name and renamed, so the copy
+/// is whole or absent. Without it, Beacon doesn't migrate: it stops with the problem.
+fn keep_previous(conn: &Connection, dir: &Path) -> Result<()> {
+    let fail = |what: String| {
+        Error::new(
+            ErrorKind::Storage,
+            "beacon.db",
+            format!(
+                "can't keep a copy of the database before upgrading its schema, in {}: {what}",
+                dir.display()
+            ),
+            format!(
+                "make {} writable by Beacon's user, with room for a copy of beacon.db, and start again; nothing was changed",
+                dir.display()
+            ),
+        )
+    };
+    // Which folders this makes, so their own entries can be made durable below.
+    let made: Vec<&Path> = dir.ancestors().take(2).filter(|d| !d.exists()).collect();
+    std::fs::create_dir_all(dir).map_err(|e| fail(e.to_string()))?;
+    let partial = dir.join("beacon.db.partial");
+    let _ = std::fs::remove_file(&partial);
+    let target = partial
+        .to_str()
+        .ok_or_else(|| fail("the path is not UTF-8".to_string()))?;
+    conn.execute("VACUUM main INTO ?1", [target])
+        .map_err(|e| fail(e.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // It may hold what beacon.db held: only Beacon's user reads it.
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o600));
+    }
+    // On disk before the migration may commit: the copy's bytes, then its name, then the names of
+    // the folders made for it. A power cut after the upgrade must not find the upgraded database
+    // without the copy this promised.
+    let sync = |path: &Path| std::fs::File::open(path).and_then(|file| file.sync_all());
+    sync(&partial).map_err(|e| fail(e.to_string()))?;
+    std::fs::rename(&partial, dir.join("beacon.db")).map_err(|e| fail(e.to_string()))?;
+    sync(dir).map_err(|e| fail(e.to_string()))?;
+    for folder in made {
+        if let Some(parent) = folder.parent() {
+            sync(parent).map_err(|e| fail(e.to_string()))?;
+        }
     }
     Ok(())
 }

@@ -582,3 +582,55 @@ fn open_and_pushable() {
     life.apply(Input::Press(Press::Done), T0, &s());
     assert!(!life.is_open());
 }
+
+// ---------- a kind removed by a publish ----------
+
+#[test]
+fn a_removed_kind_closes_an_open_alert_keeping_its_text() {
+    let mut life = alert();
+    life.seen = true;
+    let step = life.apply(Input::KindRemoved, T0 + MINUTE, &s());
+    assert_eq!(step.outcome, Outcome::KindRemoved);
+    assert_eq!(step.outcome.as_str(), "kind_removed");
+    assert_eq!(life.state, Some(Resolved));
+    assert_eq!(life.times.resolved, Some(T0 + MINUTE));
+    assert_eq!(life.next_repeat, None);
+    assert_eq!(step.text, Text::Keep, "no recovery text is invented");
+    assert!(step.close_held && step.recovery && step.decide.is_none());
+    assert!(life.seen, "nothing new to see");
+
+    let mut dismissed = alert();
+    dismissed.apply(Input::Press(Press::Dismiss), T0, &s());
+    assert_eq!(
+        dismissed.apply(Input::KindRemoved, T0 + MINUTE, &s()).outcome,
+        Outcome::KindRemoved
+    );
+    let mut one_off = one_off();
+    assert!(!one_off.apply(Input::KindRemoved, T0, &s()).recovery);
+    let mut resolved = alert();
+    resolved.apply(Input::Resolve, T0, &s());
+    assert_eq!(
+        resolved.apply(Input::KindRemoved, T0 + MINUTE, &s()).outcome,
+        Outcome::Ignored
+    );
+}
+
+#[test]
+fn a_removed_kind_closes_an_open_or_snoozed_action() {
+    for snoozed in [false, true] {
+        let mut life = action();
+        if snoozed {
+            life.apply(Input::Press(Press::Snooze { until: T0 + HOUR }), T0, &s());
+        }
+        let step = life.apply(Input::KindRemoved, T0 + MINUTE, &s());
+        assert_eq!(step.outcome, Outcome::KindRemoved);
+        assert_eq!(life.state, Some(Resolved));
+        assert!(step.close_held && !step.recovery);
+    }
+    let mut done = action();
+    done.apply(Input::Press(Press::Done), T0, &s());
+    assert_eq!(
+        done.apply(Input::KindRemoved, T0 + MINUTE, &s()).outcome,
+        Outcome::Ignored
+    );
+}

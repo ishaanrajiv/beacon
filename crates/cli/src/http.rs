@@ -98,8 +98,18 @@ impl Http {
         }
     }
 
+    /// This invocation's Idempotency-Key.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// One `POST` with a key of its own (a spooled request's), not retried. `Err` is no answer.
+    pub fn once(&self, path: &str, body: &str, key: &str) -> Result<Answer, String> {
+        self.attempt("POST", path, Some(body), key)
+    }
+
     /// One attempt. `Err` is no answer.
-    fn attempt(&self, method: &str, path: &str, body: Option<&str>) -> Result<Answer, String> {
+    fn attempt(&self, method: &str, path: &str, body: Option<&str>, key: &str) -> Result<Answer, String> {
         if self.url.starts_with("https://") {
             return Err("this command speaks plain HTTP, and the address is https".to_string());
         }
@@ -125,7 +135,7 @@ impl Http {
                 };
                 request = request
                     .header("Content-Type", "application/json")
-                    .header("Idempotency-Key", &self.key);
+                    .header("Idempotency-Key", key);
                 if let Some(auth) = &auth {
                     request = request.header("Authorization", auth);
                 }
@@ -148,10 +158,10 @@ impl Http {
         let text = body.map(Value::to_string);
         let mut delays = RETRY_DELAYS.iter();
         loop {
-            let result = self.attempt(method, path, text.as_deref());
+            let result = self.attempt(method, path, text.as_deref(), &self.key);
             let retry = match &result {
                 Err(_) => true,
-                Ok(answer) => matches!(answer.status, 408 | 429) || answer.status >= 500,
+                Ok(answer) => crate::spool::retryable(answer.status),
             };
             match (retry, delays.next()) {
                 (true, Some(delay)) => std::thread::sleep(*delay),

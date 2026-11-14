@@ -25,8 +25,9 @@ CREATE TABLE sources (
     last_sent_at INTEGER
 );
 
--- The (kind, key) pairs the source's last observed snapshot listed: a closed action stays closed
--- while they still list it, and a Trail warning is recorded once per appearance.
+-- The (kind, key) pairs the last observed snapshot covering each kind listed: a closed action stays
+-- closed while they still list it, and a Trail warning is recorded once per appearance. Kept per
+-- (source, kind): a snapshot replaces only the rows of the kinds it covers.
 CREATE TABLE listed (
     source TEXT NOT NULL,
     kind TEXT NOT NULL,

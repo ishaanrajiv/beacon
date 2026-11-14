@@ -4,7 +4,8 @@
 //! - `args`: reading the command line, with the option you probably meant when one is unknown.
 //! - `http`: one request to Beacon, retried like the emitters.
 //! - `decls`: `check`, `gen`, `publish`.
-//! - `send`: `send`, `resolve`, `snapshot`, checked against the kind before anything is sent.
+//! - `send`: `send`, `resolve`, `snapshot` and `flush`, checked against the kind before anything is sent.
+//! - `spool`: where a request Beacon couldn't take waits (`--spool`, `BEACON_SPOOL_DIR`).
 //! - `silence`: `silence add`, `extend`, `end`, `list`.
 //! - `serve`: runs the server.
 
@@ -14,6 +15,7 @@ mod http;
 mod send;
 mod serve;
 mod silence;
+mod spool;
 
 #[cfg(test)]
 mod tests;
@@ -34,6 +36,7 @@ Declare what a service sends (spec/declarations.md)
   beacon gen <folder> --lang python|typescript [--out FILE] [--check]
                                             write typed emitters; --check fails if FILE is stale
   beacon publish <folder>... [--server URL] check, then load the declarations into Beacon
+              [--keep]                      keep published kinds a folder lacks (before a restart)
 
 Send from a script (checked against the published kinds, or a local folder with --decls)
   beacon send <kind> [name=value]... [--key K] [--resolve] [--label name=value]...
@@ -42,6 +45,10 @@ Send from a script (checked against the published kinds, or a local folder with 
   beacon snapshot <source> [--fire '<kind> [key=K] name=value...']... [--kinds K,K]
               [--stale-after D] [--unobserved REASON] [--label name=value]...
               [--decls FOLDER] [--server URL] [--json]
+  beacon flush [--spool DIR] [--server URL] [--json]
+                                            send what the spool holds, oldest first
+  send, resolve and snapshot take --spool DIR (or BEACON_SPOOL_DIR): when Beacon can't take the
+  request (no answer, 408, 429, 5xx) it is kept there and sent first next time.
 
 Silence pushes
   beacon silence add [--source S] [--kind K [--key K]] [--label name=value]...
@@ -57,8 +64,8 @@ float; 90s, 5m, 2h, 7d or whole milliseconds for a duration; now, -15m, +2h, mil
 Exit status: 0 done, 1 refused (each problem on stderr with its fix), 2 the command line is wrong,
 3 Beacon didn't answer, or answered 5xx, after three attempts.";
 
-const COMMANDS: [&str; 9] = [
-    "serve", "check", "gen", "publish", "send", "resolve", "snapshot", "silence", "help",
+const COMMANDS: [&str; 10] = [
+    "serve", "check", "gen", "publish", "send", "resolve", "snapshot", "flush", "silence", "help",
 ];
 
 /// Prints a line to stdout. A closed pipe (`beacon silence list | head`) is not an error.
@@ -123,6 +130,7 @@ pub(crate) fn run(mut raw: Vec<String>, now_ms: i64) -> Done {
         "send" => send::send(raw, now_ms),
         "resolve" => send::resolve(raw, now_ms),
         "snapshot" => send::snapshot(raw, now_ms),
+        "flush" => send::flush(raw, now_ms),
         "silence" => silence::silence(raw, now_ms),
         other => {
             let hint = closest(other, COMMANDS)

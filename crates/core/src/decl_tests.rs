@@ -133,6 +133,127 @@ fn round_trips_through_json() {
 }
 
 #[test]
+fn service_defaults_to_the_source_and_is_checked() {
+    let backup = example("backup");
+    assert_eq!((backup.service.as_str(), backup.service()), ("backup", "backup"));
+    assert_eq!(backup.to_json()["service"], "backup");
+    assert!(
+        backup.to_publish_json().get("service").is_none(),
+        "an older server takes it"
+    );
+    let named = parse(
+        &format!("service = \"mail-worker\"\n{}", one_kind(UPDATE)),
+        &Check::default(),
+    )
+    .unwrap();
+    assert_eq!(named.service, "mail-worker");
+    assert_eq!(named.to_publish_json()["service"], "mail-worker");
+    let back = Declarations::from_json(named.to_publish_json(), &Check::default()).unwrap();
+    assert_eq!(back, named);
+    // Missing from JSON: the source.
+    let back = Declarations::from_json(backup.to_publish_json(), &Check::default()).unwrap();
+    assert_eq!(back.service, "backup");
+    for bad in [
+        "Mail",
+        "mail worker",
+        "mail--worker",
+        "-mail",
+        "mail_",
+        &"m".repeat(65),
+    ] {
+        let text = format!("service = \"{bad}\"\n{}", one_kind(UPDATE));
+        assert!(problems(&text).contains("is not a service name"), "{bad}");
+    }
+    for good in ["mail_worker", "mail-worker", "m2"] {
+        assert!(is_service(good), "{good}");
+    }
+}
+
+#[test]
+fn trail_may_be_extended_with_kinds_of_its_own() {
+    let trail = example("trail");
+    assert_eq!(trail.source, "trail");
+    assert_eq!(trail.kinds["trail.disk_full"].push, PushLevel::Urgent);
+    assert_eq!(trail.kinds["trail.queue_backlog"].push, PushLevel::Normal);
+    // Checked like any other kind: copy rules included.
+    let text = "source = \"trail\"\nname = \"Monitoring\"\n[kinds.\"trail.hot\"]\nclass = \"alert\"\npush = \"urgent\"\ntitle = \"{title}\"\nslots = { title = 40 }\none_off = true\nactions = [\"acknowledge\"]\npreview = \"Hot\"\n";
+    assert!(problems(text).contains("words of its own"), "{}", problems(text));
+}
+
+#[test]
+fn stored_declarations_are_stamped_and_read_back() {
+    for name in ["backup", "assistant", "ship"] {
+        let decl = example(name);
+        let stored = decl.to_stored();
+        assert_eq!(stored["format"], STORED_FORMAT);
+        let back = Declarations::from_stored(&stored).unwrap();
+        assert_eq!(back.decl, decl);
+        assert_eq!(back.format, Some(STORED_FORMAT));
+        assert!(back.unreadable.is_empty());
+    }
+    let kind = &example("ship").kinds["ship.pr_ready"];
+    let stored = kind.to_stored();
+    assert_eq!(stored["format"], STORED_FORMAT);
+    assert_eq!(&Kind::from_stored(&stored).unwrap(), kind);
+}
+
+#[test]
+fn stored_declarations_from_another_version_still_read() {
+    // A newer version's fields are ignored, at every level.
+    let mut json = example("ship").to_stored();
+    json["format"] = 7.into();
+    json["colour"] = "teal".into();
+    json["kinds"]["ship.pr_ready"]["escalate_after"] = "1h".into();
+    json["kinds"]["ship.pr_ready"]["actions"][0]["style"] = "primary".into();
+    let back = Declarations::from_stored(&json).unwrap();
+    assert_eq!(back.format, Some(7));
+    assert_eq!(back.decl, example("ship"));
+
+    // An older version's: missing fields take their defaults.
+    let json = serde_json::json!({
+        "source": "backup",
+        "kinds": {
+            "backup.finished": {"class": "record", "title": "Backup finished"},
+            "backup.failed": {"class": "alert", "push": "urgent", "title": "Backup failed", "recovered": "Backups are back"}
+        }
+    });
+    let back = Declarations::from_stored(&json).unwrap();
+    assert_eq!(back.format, None);
+    assert_eq!(back.decl.name, "backup");
+    assert_eq!(back.decl.icon, Icon::Bell);
+    let finished = &back.decl.kinds["backup.finished"];
+    assert_eq!((finished.class, finished.push), (Class::Record, PushLevel::None));
+    assert_eq!(
+        back.decl.kinds["backup.failed"].throttle.map(Duration::ms),
+        Some(THROTTLE_DEFAULT)
+    );
+
+    // A kind that still can't be read is reported, and the others are kept.
+    let mut json = example("backup").to_stored();
+    json["kinds"]["backup.failed"]["class"] = "page".into();
+    json["kinds"]["backup.space"]
+        .as_object_mut()
+        .unwrap()
+        .remove("title");
+    let back = Declarations::from_stored(&json).unwrap();
+    assert_eq!(
+        back.unreadable.keys().collect::<Vec<_>>(),
+        ["backup.failed", "backup.space"]
+    );
+    assert!(
+        back.unreadable["backup.space"].contains("title"),
+        "{:?}",
+        back.unreadable
+    );
+    assert_eq!(back.decl.kinds.len(), example("backup").kinds.len() - 2);
+
+    // Only a source that isn't one at all can't be read.
+    assert!(Declarations::from_stored(&Value::from("backup")).is_err());
+    assert!(Declarations::from_stored(&serde_json::json!({"kinds": {}})).is_err());
+    assert!(Declarations::from_stored(&serde_json::json!({"source": "x", "kinds": []})).is_err());
+}
+
+#[test]
 fn json_is_checked_like_toml() {
     let mut json = example("backup").to_json();
     json["kinds"]["backup.failed"]["push"] = "loud".into();
@@ -183,6 +304,10 @@ fn file_level_problems() {
         (
             "source = \"beacon\"\nname = \"Mine\"\n[kinds.\"beacon.thing\"]\nclass = \"record\"\ntitle = \"Thing happened\"".to_string(),
             "Beacon's own source",
+        ),
+        (
+            "source = \"trail\"\nname = \"Monitoring\"\n[kinds.\"trail.warning\"]\nclass = \"record\"\ntitle = \"Thing happened\"".to_string(),
+            "one of Beacon's own Trail kinds",
         ),
         (format!("source = \"backup\"{kind}"), "no display name"),
         (format!("source = \"backup\"\nname = \"Backups of every disk in the house\"{kind}"), "at most 24"),
