@@ -563,6 +563,11 @@ impl Tx<'_, '_> {
             Class::Alert => {
                 let target = fire_target(latest.as_ref().map(|row| &row.life), self.now, self.s);
                 match (target, latest) {
+                    (FireTarget::Latest, Some(row))
+                        if row.life.is_open() && self.unchanged(&row, &fields) =>
+                    {
+                        Ok((EventOutcome::Updated, Some(row)))
+                    }
                     (FireTarget::Latest, Some(mut row)) => {
                         fields.apply_to(&mut row);
                         let step = self.apply(&mut row, Input::Fire, None)?;
@@ -582,6 +587,9 @@ impl Tx<'_, '_> {
                 }
             }
             Class::Action => match latest {
+                Some(row) if row.life.is_open() && self.unchanged(&row, &fields) => {
+                    Ok((EventOutcome::Updated, Some(row)))
+                }
                 Some(mut row) if row.life.is_open() => {
                     fields.apply_to(&mut row);
                     self.apply(&mut row, open_input(Class::Action), None)?;
@@ -594,6 +602,25 @@ impl Tx<'_, '_> {
                 }
             },
         }
+    }
+
+    /// Whether an event or snapshot entry for an open item would change nothing it shows or
+    /// stores: facts, slots, labels, rendered text and buttons, link, category, context. Then it
+    /// writes nothing (`spec/delivery.md`, "Alerts"): no history, no version, no copy to Trail.
+    fn unchanged(&self, row: &Row, fields: &Fields) -> bool {
+        let mut probe = row.clone();
+        fields.clone().apply_to(&mut probe);
+        self.render_firing(&mut probe);
+        probe.facts == row.facts
+            && probe.slots == row.slots
+            && probe.labels == row.labels
+            && probe.title == row.title
+            && probe.body == row.body
+            && probe.url == row.url
+            && probe.url_override == row.url_override
+            && probe.category == row.category
+            && probe.context == row.context
+            && probe.buttons == row.buttons
     }
 
     /// Checks and applies a snapshot. `builtin` is Trail's, which may cover update and record
@@ -945,6 +972,7 @@ impl Tx<'_, '_> {
 }
 
 /// The values an event or snapshot entry sets on an item.
+#[derive(Clone)]
 struct Fields {
     /// None keeps the item's latest (a resolving event without facts or slots).
     facts: Option<Map<String, Value>>,

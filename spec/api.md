@@ -261,6 +261,8 @@ different body is `409`. Generated emitters send one with every call (`spec/clie
 
 `outcome` is `opened`, `reopened`, `updated`, `resolved`, `recorded` or `ignored` (`item` is null
 then). The item shows what was decided about its push at once (`push.status` may be `held`).
+`updated` is also the answer when the event changes nothing about an open item; then nothing is
+written (`spec/delivery.md`, "Alerts").
 
 `422` for an undeclared kind:
 

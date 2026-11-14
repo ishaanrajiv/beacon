@@ -151,7 +151,7 @@ stop).
 |---|---|---|---|
 | — (no item, or the last resolved `flap_window` or more ago) | fire | `open` | A new item. `openings = 1`. `seen = false`. Repeats scheduled from now. Decide (`opened`). |
 | `resolved`, within `flap_window` of resolving | fire | `open` | The same item reopens: `times.opened` now, `times.resolved`, `acknowledged` and `dismissed` cleared, `seen = false`, text back to the firing text, repeats rescheduled. Count the openings within the window; more than `flap_openings` (3) → flapping (below). Decide (`reopened`). |
-| `open`, `dismissed` | fire | unchanged | Facts, slots, text and labels updated. No push. |
+| `open`, `dismissed` | fire | unchanged | Facts, slots, text and labels updated. No push. When nothing it shows or stores would change (facts, slots, labels, rendered text and buttons, link, category, context), nothing is written: no history row, no new `version`, no copy to Trail; the answer is still `updated` with the item as it is. |
 | `open`, `dismissed` | resolve (an event, or absent from its source's snapshot) | `resolved` | `times.resolved` now. Text becomes the recovery text, with `{lasted}` from `times.opened` to now. `seen = false`. A held push is suppressed (`closed`); a queued one stops ("Sending"). Repeats cancelled. If the item's push was `sent`, or was queued and a device may have it ("Sending"), and it isn't flapping, a **recovery** push: the recovery text, same collapse id, `passive`, no category; the item's `push.status` follows it (`queued`, then `sent`). It is not subject to silences, quiet hours, presence or throttle; only to `push = false` (suppressed, `push_off`). |
 | `resolved` | resolve | unchanged | Nothing (`outcome: "ignored"`). |
 | `open`, `dismissed` | acknowledge | unchanged | `acknowledged` now. Repeats cancelled. A one-off alert resolves instead (no recovery text: it keeps its own). |
@@ -181,7 +181,7 @@ stop).
 | From | Input | To | Effects |
 |---|---|---|---|
 | — (no item in `open` or `snoozed` for the `(kind, key)`) | open | `open` | A new item. `seen = false`. Decide (`opened`). |
-| `open`, `snoozed` | open | unchanged | Facts, slots, text and labels updated. No push. |
+| `open`, `snoozed` | open | unchanged | Facts, slots, text and labels updated. No push. Unchanged, nothing is written, as for alerts. |
 | `open`, `snoozed` | done | `done` | `times.done`. A held push is suppressed (`closed`); a queued one stops ("Sending"). |
 | `open`, `snoozed` | dismiss | `dismissed` | `times.dismissed`. The same. |
 | `open` | snooze until T | `snoozed` | `times.snoozed_until = T`. The same. |
@@ -270,6 +270,8 @@ push is `none`. Nothing is suppressed by the budget: it is a signal to fix a noi
   Keys are scoped to the kind's source.
 - Trail notices are recorded once per notice `id`, for as long as their item is kept.
 - Snapshots are idempotent by nature: posting the same one twice changes nothing the second time.
+  An entry (or event) that would change nothing about an open item writes nothing: no history
+  row, no `version`, so clients' `If-None-Match` still gets `304`.
 - Item actions whose effect already holds answer `200` and change nothing; `POST /v1/seen` and
   presence are idempotent.
 - A push retried after a lost answer from Apple may show twice; the collapse id makes the phone

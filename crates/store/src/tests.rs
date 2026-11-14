@@ -259,6 +259,55 @@ fn firing_again_updates_without_a_push() {
 }
 
 #[test]
+fn firing_again_unchanged_writes_nothing() {
+    let store = store();
+    let first = item(&store.apply_event(&failed(), None, T0).unwrap());
+    let version = store.version().unwrap();
+    let before = history(&store, first.id);
+    let answer = store.apply_event(&failed(), None, T0 + MINUTE).unwrap();
+    assert_eq!(answer.outcome, EventOutcome::Updated);
+    assert_eq!(item(&answer), first, "the item as it is");
+    assert_eq!(store.version().unwrap(), version, "no new inbox ETag");
+    assert_eq!(
+        history(&store, first.id),
+        before,
+        "no history row, so no copy to Trail"
+    );
+    assert_eq!(store.item(first.id, T0).unwrap().unwrap().version, first.version);
+    // A snapshot listing it again writes nothing either.
+    let entry = SnapshotEntry {
+        kind: "backup.failed".into(),
+        key: "nightly".into(),
+        facts: json!({"last_ok": T0 - 10 * HOUR}).as_object().cloned().unwrap(),
+        slots: json!({"reason": "The disk is full"})
+            .as_object()
+            .cloned()
+            .unwrap(),
+        ..SnapshotEntry::default()
+    };
+    let mut snap = snapshot(vec![entry.clone()]);
+    snap.kinds = Some(vec!["backup.failed".into()]);
+    let answer = store.apply_snapshot(&snap, T0 + 2 * MINUTE).unwrap();
+    assert_eq!(answer.updated, [first.id]);
+    assert_eq!(store.version().unwrap(), version);
+    assert_eq!(history(&store, first.id), before);
+    // A label, a fact or a link that changes is an update.
+    let mut labelled = entry.clone();
+    labelled.labels = std::collections::BTreeMap::from([("disk".to_string(), "b".to_string())]);
+    let mut snap = snapshot(vec![labelled]);
+    snap.kinds = Some(vec!["backup.failed".into()]);
+    store.apply_snapshot(&snap, T0 + 3 * MINUTE).unwrap();
+    assert!(store.version().unwrap() > version);
+    assert_eq!(history(&store, first.id).len(), before.len() + 1);
+    // An action too.
+    let r = item(&store.apply_event(&reminder("r1"), None, T0).unwrap());
+    let version = store.version().unwrap();
+    store.apply_event(&reminder("r1"), None, T0 + MINUTE).unwrap();
+    assert_eq!(store.version().unwrap(), version);
+    assert_eq!(history(&store, r.id), ["opened"]);
+}
+
+#[test]
 fn resolving_a_sent_alert_queues_a_passive_recovery() {
     let store = store();
     let it = item(&store.apply_event(&failed(), None, T0).unwrap());
@@ -1005,7 +1054,7 @@ fn actions_snooze_wake_and_close() {
             .needs_you
             .is_empty()
     );
-    // An event for it updates the snoozed item.
+    // An event for it updates the snoozed item (the same one changes nothing, so writes nothing).
     let update = store.apply_event(&reminder("r1"), None, T0 + HOUR).unwrap();
     assert_eq!(update.outcome, EventOutcome::Updated);
     store.run_due(T0 + 2 * HOUR).unwrap();
@@ -1049,7 +1098,6 @@ fn actions_snooze_wake_and_close() {
             "push_sent",
             "seen",
             "snoozed",
-            "updated",
             "woke",
             "done",
             "push_suppressed"
