@@ -67,6 +67,7 @@ impl Row {
             throttle: self.decl.throttle.map(|d| d.ms()),
             flapping: self.life.flapping,
             seen: self.life.seen,
+            seen_only_on_web: false,
             open: self.life.is_pushable(),
         }
     }

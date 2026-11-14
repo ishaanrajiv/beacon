@@ -11,9 +11,9 @@ use beacon_core::builtin;
 use beacon_core::delivery::{self, CatchUpPlan, Held, PRESENCE_KEPT, SILENCE_KEPT};
 use beacon_core::duration::DAY;
 use beacon_core::lifecycle::Input;
-use beacon_core::model::{Class, PushLevel, PushReason, PushStatus, Trigger};
+use beacon_core::model::{Class, ItemState, PushLevel, PushReason, PushStatus, Trigger};
 use beacon_core::quiet::local_day;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -271,15 +271,28 @@ impl Store {
         })
     }
 
+    /// Whether the push is still waiting to be sent. The sender lists every push due and sends
+    /// them one at a time, so it asks again just before each: one cancelled since it was listed
+    /// (its item closed, or a newer push replaced it) is not sent.
+    pub fn push_queued(&self, push: i64) -> Result<bool> {
+        self.read(|tx, _| {
+            let status: Option<String> = tx
+                .prepare_cached("SELECT status FROM pushes WHERE id = ?1")?
+                .query_row([push], |r| r.get(0))
+                .optional()?;
+            Ok(status.as_deref() == Some("queued"))
+        })
+    }
+
     /// Records one round of attempts at a push and what happens next. The item's `push.status`
     /// follows its latest push: `sent` (history `push_sent`, or `recovery_sent`), `failed`
     /// (`push_failed`), or still `queued` for a retry.
     pub fn push_attempted(&self, push: i64, attempts: &[Attempt], next: PushNext, now: i64) -> Result<()> {
         self.write(now, |w| {
-            let (item, purpose, count): (i64, String, i64) = w
+            let (item, purpose, count, status): (i64, String, i64, String) = w
                 .conn
-                .prepare_cached("SELECT item, purpose, attempts FROM pushes WHERE id = ?1")?
-                .query_row([push], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                .prepare_cached("SELECT item, purpose, attempts, status FROM pushes WHERE id = ?1")?
+                .query_row([push], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
             for attempt in attempts {
                 w.conn
                     .prepare_cached(
@@ -301,6 +314,9 @@ impl Store {
                         "UPDATE dev.devices SET last_push = ?2, last_status = ?3 WHERE token = ?1",
                     )?
                     .execute(params![attempt.token, now, attempt.status])?;
+            }
+            if status != "queued" {
+                return w.cancelled_in_flight(push, item, &purpose, next);
             }
             match next {
                 PushNext::RetryAt(at) => {
@@ -346,6 +362,52 @@ impl Tx<'_, '_> {
             row.push.status = status;
             row.push.reason = reason;
             row.push.at = Some(self.now);
+            self.touch(&mut row)?;
+        }
+        Ok(())
+    }
+
+    /// The answer to a push that was cancelled while the sender had it in flight (its item left
+    /// open, or a newer push replaced it). Its attempts are kept and it makes no more. If a
+    /// device may have it, it was the item's push, and the item is an alert that has since
+    /// resolved with nothing newer queued, the recovery owed goes out now to replace its banner.
+    /// If it was a recovery and the alert is open again with its reopening throttled, the
+    /// reopening is decided again.
+    fn cancelled_in_flight(&mut self, push: i64, item: i64, purpose: &str, next: PushNext) -> Result<()> {
+        self.conn
+            .prepare_cached("UPDATE pushes SET attempts = attempts + 1 WHERE id = ?1")?
+            .execute([push])?;
+        if next == PushNext::Sent {
+            self.history(item, "push_sent", None)?;
+        }
+        if !crate::engine::may_have_delivered(self.conn, push)? {
+            return Ok(());
+        }
+        let Some(mut row) = rows::load(self.conn, item)? else {
+            return Ok(());
+        };
+        if purpose == "recovery" {
+            // A recovery a reopening cancelled, which a device has after all: the phone says it
+            // is back while the alert is open. A reopening that was throttled (nothing said then
+            // that a device had the recovery) is decided again, now that something does.
+            let throttled =
+                row.push.status == PushStatus::Suppressed && row.push.reason == Some(PushReason::Throttled);
+            if row.life.class == Class::Alert && row.life.is_pushable() && throttled {
+                self.decide(&mut row, Trigger::Reopened)?;
+                self.touch(&mut row)?;
+            }
+            return Ok(());
+        }
+        if purpose != "item" {
+            return Ok(());
+        }
+        let owed = row.push_job == Some(push)
+            && row.life.class == Class::Alert
+            && row.life.state == Some(ItemState::Resolved)
+            && !row.life.flapping
+            && !row.life.one_off;
+        if owed {
+            self.recovery(&mut row)?;
             self.touch(&mut row)?;
         }
         Ok(())

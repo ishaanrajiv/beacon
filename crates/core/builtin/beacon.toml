@@ -6,15 +6,28 @@ icon = "bell"
 [kinds."beacon.source_unobserved"]
 class = "update"
 push = "none"
-description = "A source stopped reporting, or said it can't see what it watches. Its alerts are muted until it reports again."
+description = "A source with no alert kinds stopped reporting, or said it can't see what it watches."
 title = "Can't check {source_name}"
 body = "{reason} Its alerts are on hold until it reports again."
 facts = { source_name = "string" }
 slots = { reason = 100 }
 
+[kinds."beacon.source_stopped"]
+class = "alert"
+push = "normal"
+description = "A source that sends alerts stopped reporting, or said it can't see what it watches. Its alerts are on hold until it reports again."
+title = "Can't check {source_name}"
+body = "{reason} Its alerts are on hold until it reports again."
+recovered = "Checking {source_name} again"
+recovered_body = "Its alerts are back on. Lasted {lasted}."
+facts = { source_name = "string" }
+slots = { reason = 100 }
+actions = ["acknowledge", "silence_1h"]
+preview = "A source stopped reporting"
+
 [kinds."beacon.source_observed"]
 class = "record"
-description = "A source that was unobserved reported again. Its alerts push again."
+description = "A source with no open beacon.source_stopped reported again."
 title = "Checking {source_name} again"
 facts = { source_name = "string" }
 

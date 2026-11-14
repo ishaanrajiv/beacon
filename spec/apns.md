@@ -135,6 +135,12 @@ the reason is `HTTP <status>`.
 - A push is sent to each registered device separately. The item is `sent` when any device took it,
   `failed` (`rejected` or `expired`) when every device has finished without taking it, and
   `failed` with `no_devices` when none is registered.
+- **Cancelled.** A push waiting to retry makes no more attempts once its item leaves `open`, or a
+  newer push about the same item is queued (`spec/delivery.md`, "Sending"). If an attempt was
+  `accepted` or `uncertain`, the phone may show it, so a resolved alert's recovery follows it with
+  the same `apns-collapse-id` and replaces it. A push in flight when it is cancelled is answered
+  as usual and its result recorded; it is never retried, and if Apple took it or may have, the
+  recovery owed is queued then, behind it on the one sender.
 
 ### Dead tokens
 

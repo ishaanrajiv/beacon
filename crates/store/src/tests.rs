@@ -126,6 +126,21 @@ fn active(store: &Store, now: i64, viewing: Option<&str>) {
         .unwrap();
 }
 
+/// The iPhone app is in the foreground.
+fn phone_active(store: &Store, now: i64) {
+    store
+        .heartbeat(
+            &Heartbeat {
+                client: "ios".into(),
+                device: "ios-1".into(),
+                active: true,
+                viewing: None,
+            },
+            now,
+        )
+        .unwrap();
+}
+
 fn inactive(store: &Store, now: i64) {
     store
         .heartbeat(
@@ -244,6 +259,55 @@ fn firing_again_updates_without_a_push() {
 }
 
 #[test]
+fn firing_again_unchanged_writes_nothing() {
+    let store = store();
+    let first = item(&store.apply_event(&failed(), None, T0).unwrap());
+    let version = store.version().unwrap();
+    let before = history(&store, first.id);
+    let answer = store.apply_event(&failed(), None, T0 + MINUTE).unwrap();
+    assert_eq!(answer.outcome, EventOutcome::Updated);
+    assert_eq!(item(&answer), first, "the item as it is");
+    assert_eq!(store.version().unwrap(), version, "no new inbox ETag");
+    assert_eq!(
+        history(&store, first.id),
+        before,
+        "no history row, so no copy to Trail"
+    );
+    assert_eq!(store.item(first.id, T0).unwrap().unwrap().version, first.version);
+    // A snapshot listing it again writes nothing either.
+    let entry = SnapshotEntry {
+        kind: "backup.failed".into(),
+        key: "nightly".into(),
+        facts: json!({"last_ok": T0 - 10 * HOUR}).as_object().cloned().unwrap(),
+        slots: json!({"reason": "The disk is full"})
+            .as_object()
+            .cloned()
+            .unwrap(),
+        ..SnapshotEntry::default()
+    };
+    let mut snap = snapshot(vec![entry.clone()]);
+    snap.kinds = Some(vec!["backup.failed".into()]);
+    let answer = store.apply_snapshot(&snap, T0 + 2 * MINUTE).unwrap();
+    assert_eq!(answer.updated, [first.id]);
+    assert_eq!(store.version().unwrap(), version);
+    assert_eq!(history(&store, first.id), before);
+    // A label, a fact or a link that changes is an update.
+    let mut labelled = entry.clone();
+    labelled.labels = std::collections::BTreeMap::from([("disk".to_string(), "b".to_string())]);
+    let mut snap = snapshot(vec![labelled]);
+    snap.kinds = Some(vec!["backup.failed".into()]);
+    store.apply_snapshot(&snap, T0 + 3 * MINUTE).unwrap();
+    assert!(store.version().unwrap() > version);
+    assert_eq!(history(&store, first.id).len(), before.len() + 1);
+    // An action too.
+    let r = item(&store.apply_event(&reminder("r1"), None, T0).unwrap());
+    let version = store.version().unwrap();
+    store.apply_event(&reminder("r1"), None, T0 + MINUTE).unwrap();
+    assert_eq!(store.version().unwrap(), version);
+    assert_eq!(history(&store, r.id), ["opened"]);
+}
+
+#[test]
 fn resolving_a_sent_alert_queues_a_passive_recovery() {
     let store = store();
     let it = item(&store.apply_event(&failed(), None, T0).unwrap());
@@ -279,10 +343,273 @@ fn resolving_a_sent_alert_queues_a_passive_recovery() {
     assert!(again.item.is_none());
 }
 
+fn attempt(status: &str) -> Attempt {
+    Attempt {
+        token: "a".repeat(64),
+        environment: "production".into(),
+        status: status.into(),
+        reason: (status != "accepted").then(|| "timeout".into()),
+    }
+}
+
+#[test]
+fn a_queued_push_no_device_took_is_cancelled_when_its_alert_resolves() {
+    let store = store();
+    let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+    assert_eq!(it.push.status, S::Queued);
+    // Apple rejected it with a retryable answer: no device has it.
+    let job = store.pushes_due(T0).unwrap()[0].id;
+    store
+        .push_attempted(
+            job,
+            &[attempt("rejected")],
+            PushNext::RetryAt(T0 + 10 * SECOND),
+            T0,
+        )
+        .unwrap();
+    let after = item(
+        &store
+            .apply_event(&resolved(failed()), None, T0 + 5 * SECOND)
+            .unwrap(),
+    );
+    assert_eq!(after.push.status, S::Suppressed);
+    assert_eq!(after.push.reason, Some(R::Closed));
+    // No retry of the firing text, and no recovery for a banner nobody got.
+    assert!(store.pushes_due(T0 + HOUR / 2).unwrap().is_empty());
+    assert_eq!(history(&store, it.id), ["opened", "resolved", "push_suppressed"]);
+}
+
+#[test]
+fn a_queued_push_a_device_may_have_is_followed_by_the_recovery() {
+    let store = store();
+    let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+    let job = store.pushes_due(T0).unwrap()[0].id;
+    // No clear answer from Apple: it may be on the phone, and is waiting to retry.
+    store
+        .push_attempted(
+            job,
+            &[attempt("uncertain")],
+            PushNext::RetryAt(T0 + 10 * SECOND),
+            T0,
+        )
+        .unwrap();
+    let after = item(
+        &store
+            .apply_event(&resolved(failed()), None, T0 + 5 * SECOND)
+            .unwrap(),
+    );
+    assert_eq!(after.push.status, S::Queued);
+    let due = store.pushes_due(T0 + HOUR / 2).unwrap();
+    assert_eq!(
+        due.len(),
+        1,
+        "only the recovery: the firing push makes no more attempts"
+    );
+    assert_eq!(due[0].purpose, "recovery");
+    assert_eq!(due[0].title, after.title);
+    assert_eq!(due[0].collapse_id, it.collapse_id);
+    sent(&store, T0 + 10 * SECOND);
+    let done = store.item(it.id, T0).unwrap().unwrap();
+    assert_eq!(done.push.status, S::Sent);
+    assert!(history(&store, it.id).contains(&"recovery_sent".to_string()));
+}
+
+#[test]
+fn a_push_in_flight_when_its_alert_resolves_is_followed_by_the_recovery_if_taken() {
+    for (answer, next, recovery) in [
+        ("accepted", PushNext::Sent, true),
+        ("uncertain", PushNext::RetryAt(T0 + 10 * SECOND), true),
+        ("rejected", PushNext::Failed(R::Rejected), false),
+    ] {
+        let store = store();
+        let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+        // The sender has taken the job and is talking to Apple...
+        let job = store.pushes_due(T0).unwrap()[0].id;
+        // ...when the alert resolves: no attempt is recorded yet, so it is cancelled.
+        let after = item(&store.apply_event(&resolved(failed()), None, T0 + SECOND).unwrap());
+        assert_eq!(after.push.status, S::Suppressed);
+        // Then Apple answers.
+        store
+            .push_attempted(job, &[attempt(answer)], next, T0 + 2 * SECOND)
+            .unwrap();
+        let due = store.pushes_due(T0 + HOUR / 2).unwrap();
+        if recovery {
+            assert_eq!(due.len(), 1, "{answer}");
+            assert_eq!(due[0].purpose, "recovery");
+            let row = store.item(it.id, T0).unwrap().unwrap();
+            assert_eq!(row.push.status, S::Queued);
+        } else {
+            assert!(due.is_empty(), "{answer}");
+            let row = store.item(it.id, T0).unwrap().unwrap();
+            assert_eq!(row.push.status, S::Suppressed);
+        }
+    }
+}
+
+#[test]
+fn a_reopening_after_its_recovery_was_sent_is_not_throttled() {
+    let store = store();
+    let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+    sent(&store, T0);
+    store.apply_event(&resolved(failed()), None, T0 + MINUTE).unwrap();
+    sent(&store, T0 + MINUTE);
+    // Within the kind's 10-minute throttle: the phone says it recovered, so it pushes.
+    let back = item(&store.apply_event(&failed(), None, T0 + 2 * MINUTE).unwrap());
+    assert_eq!(back.id, it.id);
+    assert_eq!(back.state, Some(ItemState::Open));
+    assert_eq!(back.push.status, S::Queued);
+    let due = store.pushes_due(T0 + 2 * MINUTE).unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].purpose, "item");
+    assert_eq!(due[0].title, back.title);
+
+    // A recovery that never went out leaves the firing banner up: the throttle applies.
+    let store = self::store();
+    store.apply_event(&failed(), None, T0).unwrap();
+    sent(&store, T0);
+    store.apply_event(&resolved(failed()), None, T0 + MINUTE).unwrap();
+    let back = item(&store.apply_event(&failed(), None, T0 + 2 * MINUTE).unwrap());
+    assert_eq!(
+        (back.push.status, back.push.reason),
+        (S::Suppressed, Some(R::Throttled))
+    );
+}
+
+#[test]
+fn a_recovery_in_flight_when_its_alert_reopens_is_put_right_if_taken() {
+    for (answer, next, taken) in [
+        ("accepted", PushNext::Sent, true),
+        ("uncertain", PushNext::RetryAt(T0 + 3 * MINUTE), true),
+        ("rejected", PushNext::Failed(R::Rejected), false),
+    ] {
+        let store = store();
+        let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+        sent(&store, T0);
+        store.apply_event(&resolved(failed()), None, T0 + MINUTE).unwrap();
+        // The sender has taken the recovery and is talking to Apple...
+        let recovery = store.pushes_due(T0 + MINUTE).unwrap()[0].id;
+        // ...when the alert fires again, within its throttle: nothing says a device has the
+        // recovery yet, so the reopening is throttled and the recovery cancelled.
+        let back = item(&store.apply_event(&failed(), None, T0 + 2 * MINUTE).unwrap());
+        assert_eq!(
+            (back.push.status, back.push.reason),
+            (S::Suppressed, Some(R::Throttled))
+        );
+        // Then Apple answers.
+        store
+            .push_attempted(recovery, &[attempt(answer)], next, T0 + 2 * MINUTE + SECOND)
+            .unwrap();
+        let row = store.item(it.id, T0).unwrap().unwrap();
+        let due = store.pushes_due(T0 + 2 * MINUTE + SECOND).unwrap();
+        if taken {
+            // The phone says it is back while it is open: the firing text goes out after all.
+            assert_eq!(row.push.status, S::Queued, "{answer}");
+            assert_eq!(due.len(), 1, "{answer}");
+            assert_eq!(due[0].purpose, "item");
+            assert_eq!(due[0].title, back.title);
+        } else {
+            assert_eq!(
+                (row.push.status, row.push.reason),
+                (S::Suppressed, Some(R::Throttled)),
+                "{answer}"
+            );
+            assert!(due.is_empty(), "{answer}");
+        }
+    }
+}
+
+#[test]
+fn a_reopening_held_after_its_recovery_was_sent_pushes_when_released() {
+    let store = store();
+    let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+    sent(&store, T0);
+    store.apply_event(&resolved(failed()), None, T0 + MINUTE).unwrap();
+    sent(&store, T0 + MINUTE);
+    // The phone is in hand when it fires again: held, then released unseen within the throttle.
+    phone_active(&store, T0 + 2 * MINUTE);
+    let back = item(&store.apply_event(&failed(), None, T0 + 2 * MINUTE).unwrap());
+    assert_eq!(back.push.status, S::Held);
+    store.run_due(T0 + 4 * MINUTE).unwrap();
+    let after = store.item(it.id, T0).unwrap().unwrap();
+    assert_eq!(after.push.status, S::Queued);
+    assert_eq!(store.pushes_due(T0 + 4 * MINUTE).unwrap()[0].purpose, "item");
+}
+
+#[test]
+fn a_dismissed_alert_whose_push_a_device_may_have_still_gets_its_recovery() {
+    let store = store();
+    let it = item(&store.apply_event(&down(), None, T0).unwrap());
+    let job = store.pushes_due(T0).unwrap()[0].id;
+    // No clear answer from Apple: it may be on the phone, and is waiting to retry.
+    store
+        .push_attempted(
+            job,
+            &[attempt("uncertain")],
+            PushNext::RetryAt(T0 + 10 * SECOND),
+            T0,
+        )
+        .unwrap();
+    // Dismissed: the queued push stops, and nothing replaces its banner yet.
+    store.press(it.id, "dismiss", None, "web", T0 + SECOND).unwrap();
+    let dismissed = store.item(it.id, T0).unwrap().unwrap();
+    assert_eq!(
+        (dismissed.push.status, dismissed.push.reason),
+        (S::Suppressed, Some(R::Closed))
+    );
+    assert!(store.pushes_due(T0 + MINUTE).unwrap().is_empty());
+    // Its source resolves it: the banner a device may have is replaced by the recovery.
+    let after = item(&store.apply_event(&resolved(down()), None, T0 + MINUTE).unwrap());
+    assert_eq!(after.push.status, S::Queued);
+    let due = store.pushes_due(T0 + MINUTE).unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].purpose, "recovery");
+
+    // A dismissed alert no device has resolves without one.
+    let store = self::store();
+    let it = item(&store.apply_event(&down(), None, T0).unwrap());
+    store.press(it.id, "dismiss", None, "web", T0 + SECOND).unwrap();
+    let after = item(&store.apply_event(&resolved(down()), None, T0 + MINUTE).unwrap());
+    assert_eq!(after.push.status, S::Suppressed);
+    assert!(store.pushes_due(T0 + MINUTE).unwrap().is_empty());
+}
+
+#[test]
+fn a_push_cancelled_after_the_sender_listed_it_is_no_longer_queued() {
+    let store = store();
+    let first = item(&store.apply_event(&failed(), None, T0).unwrap());
+    let second = item(&store.apply_event(&down(), None, T0).unwrap());
+    // The sender lists both, and is still sending the first...
+    let batch = store.pushes_due(T0).unwrap();
+    assert_eq!(batch.len(), 2);
+    let (a, b) = (&batch[0], &batch[1]);
+    assert_eq!((a.item, b.item), (first.id, second.id));
+    // ...when the second's alert resolves.
+    store.apply_event(&resolved(down()), None, T0 + SECOND).unwrap();
+    assert!(store.push_queued(a.id).unwrap());
+    assert!(!store.push_queued(b.id).unwrap(), "the sender must skip it");
+}
+
+#[test]
+fn a_reopening_cancels_a_recovery_still_waiting() {
+    let store = store();
+    let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+    sent(&store, T0);
+    store.apply_event(&resolved(failed()), None, T0 + MINUTE).unwrap();
+    assert_eq!(store.pushes_due(T0 + MINUTE).unwrap()[0].purpose, "recovery");
+    store.apply_event(&failed(), None, T0 + 2 * MINUTE).unwrap();
+    assert!(
+        store
+            .pushes_due(T0 + 2 * MINUTE)
+            .unwrap()
+            .iter()
+            .all(|job| job.purpose != "recovery" || job.item != it.id)
+    );
+}
+
 #[test]
 fn an_alert_that_never_pushed_recovers_quietly() {
     let store = store();
-    active(&store, T0, None);
+    phone_active(&store, T0);
     store.apply_event(&failed(), None, T0).unwrap();
     let after = item(&store.apply_event(&resolved(failed()), None, T0 + MINUTE).unwrap());
     // The hold was suppressed `closed`; nothing was sent, so no recovery.
@@ -583,6 +910,7 @@ fn a_hold_while_active_releases_and_pushes_if_unseen() {
 fn a_held_item_seen_or_closed_is_suppressed_at_once() {
     let store = store();
     active(&store, T0, None);
+    phone_active(&store, T0);
     let a = item(&store.apply_event(&ready(1), None, T0).unwrap());
     let b = item(&store.apply_event(&reminder("r1"), None, T0).unwrap());
     let c = item(&store.apply_event(&failed(), None, T0).unwrap());
@@ -613,6 +941,69 @@ fn a_held_item_seen_or_closed_is_suppressed_at_once() {
     store.run_due(T0 + 3 * MINUTE).unwrap();
     assert_eq!(store.item(c.id, T0).unwrap().unwrap().push.status, S::Queued);
     assert!(store.inbox(&InboxQuery::default(), T0).unwrap().held.is_empty());
+}
+
+#[test]
+fn an_open_web_tab_never_holds_or_sees_away_an_urgent_alert() {
+    // Only a web tab is active: the urgent alert goes straight out.
+    let store = store();
+    active(&store, NIGHT, None);
+    let it = item(&store.apply_event(&failed(), None, NIGHT).unwrap());
+    assert_eq!(it.push.level, PushLevel::Urgent);
+    assert_eq!(it.push.status, S::Queued);
+    // A normal push is still held by the tab.
+    let pr = item(&store.apply_event(&ready(1), None, T0).unwrap());
+    assert_eq!((pr.push.status, pr.push.reason), (S::Held, Some(R::Active)));
+
+    // The phone in hand holds it; the tab's banner marking it seen doesn't suppress it.
+    let store = self::store();
+    active(&store, T0, None);
+    phone_active(&store, T0);
+    let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+    assert_eq!((it.push.status, it.push.reason), (S::Held, Some(R::Active)));
+    store
+        .mark_seen(&SeenTarget::Ids(vec![it.id]), "web", T0 + SECOND)
+        .unwrap();
+    let held = store.item(it.id, T0).unwrap().unwrap();
+    assert!(held.seen);
+    assert_eq!(held.push.status, S::Held);
+    store.run_due(T0 + 3 * MINUTE).unwrap();
+    let after = store.item(it.id, T0).unwrap().unwrap();
+    assert_eq!(after.push.status, S::Queued);
+
+    // Seen on the phone, it is suppressed at once, as before.
+    let store = self::store();
+    phone_active(&store, T0);
+    let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+    store
+        .mark_seen(&SeenTarget::Ids(vec![it.id]), "ios", T0 + SECOND)
+        .unwrap();
+    let after = store.item(it.id, T0).unwrap().unwrap();
+    assert_eq!(
+        (after.push.status, after.push.reason),
+        (S::Suppressed, Some(R::Seen))
+    );
+
+    // A web seen, then the phone's: suppressed when the phone's comes.
+    let store = self::store();
+    phone_active(&store, T0);
+    let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+    store
+        .mark_seen(&SeenTarget::Through(it.id), "web", T0 + SECOND)
+        .unwrap();
+    assert_eq!(store.item(it.id, T0).unwrap().unwrap().push.status, S::Held);
+    // Not newly seen, but the phone's mark still counts.
+    assert_eq!(
+        store
+            .mark_seen(&SeenTarget::Through(it.id), "ios", T0 + 2 * SECOND)
+            .unwrap(),
+        0
+    );
+    let after = store.item(it.id, T0).unwrap().unwrap();
+    assert_eq!(
+        (after.push.status, after.push.reason),
+        (S::Suppressed, Some(R::Seen))
+    );
 }
 
 #[test]
@@ -777,7 +1168,7 @@ fn actions_snooze_wake_and_close() {
             .needs_you
             .is_empty()
     );
-    // An event for it updates the snoozed item.
+    // An event for it updates the snoozed item (the same one changes nothing, so writes nothing).
     let update = store.apply_event(&reminder("r1"), None, T0 + HOUR).unwrap();
     assert_eq!(update.outcome, EventOutcome::Updated);
     store.run_due(T0 + 2 * HOUR).unwrap();
@@ -821,11 +1212,17 @@ fn actions_snooze_wake_and_close() {
             "push_sent",
             "seen",
             "snoozed",
-            "updated",
             "woke",
-            "done"
+            "done",
+            "push_suppressed"
         ]
     );
+    // The push the wake queued was never taken: closing it cancelled it.
+    assert_eq!(
+        (done.push.status, done.push.reason),
+        (S::Suppressed, Some(R::Closed))
+    );
+    assert!(store.pushes_due(T0 + 3 * HOUR).unwrap().is_empty());
 }
 
 #[test]
@@ -1139,8 +1536,30 @@ fn an_unobserved_source_mutes_its_alerts_until_it_reports_again() {
             .status,
         S::Queued
     );
-    // Unobserved twice records one notice.
+    // Unobserved twice opens one alert, which pushes: it belongs to `beacon`, never muted by
+    // the rule it reports on.
     store.apply_snapshot(&s, T0 + MINUTE).unwrap();
+    let open = store
+        .inbox(&InboxQuery::default(), T0 + MINUTE)
+        .unwrap()
+        .alerts
+        .open;
+    let stopped: Vec<_> = open
+        .iter()
+        .filter(|i| i.kind == "beacon.source_stopped")
+        .collect();
+    assert_eq!(stopped.len(), 1);
+    let stopped = stopped[0].clone();
+    assert_eq!(stopped.source, "beacon");
+    assert_eq!(stopped.key, "backup");
+    assert_eq!(stopped.title, "Can't check Backups");
+    assert_eq!(
+        stopped.body,
+        "The bucket didn't answer. Its alerts are on hold until it reports again."
+    );
+    assert_eq!(stopped.push.level, PushLevel::Normal);
+    assert_eq!(stopped.push.status, S::Queued);
+    sent(&store, T0 + MINUTE);
     store
         .apply_snapshot(
             &snapshot(vec![SnapshotEntry {
@@ -1156,6 +1575,12 @@ fn an_unobserved_source_mutes_its_alerts_until_it_reports_again() {
     let after = store.item(it.id, T0).unwrap().unwrap();
     assert_eq!(after.state, Some(ItemState::Open));
     assert_eq!(after.push.status, S::Queued, "decided again (unmuted)");
+    // Observed again: the alert resolves with its recovery, in place of the record.
+    let back = store.item(stopped.id, T0).unwrap().unwrap();
+    assert_eq!(back.state, Some(ItemState::Resolved));
+    assert_eq!(back.title, "Checking Backups again");
+    assert_eq!(back.body, "Its alerts are back on. Lasted 2 min.");
+    assert_eq!(back.push.status, S::Queued, "the recovery");
     let all = InboxQuery {
         classes: vec![Class::Update, Class::Record],
         ..InboxQuery::default()
@@ -1169,7 +1594,71 @@ fn an_unobserved_source_mutes_its_alerts_until_it_reports_again() {
         .map(|i| i.kind)
         .filter(|k| k.starts_with("beacon."))
         .collect();
+    assert!(kinds.is_empty(), "{kinds:?}");
+}
+
+#[test]
+fn a_source_with_no_alert_kinds_records_an_update_and_a_record() {
+    let store = store();
+    let notes = r#"
+source = "notes"
+name = "Notes"
+icon = "book"
+
+[kinds."notes.saved"]
+class = "update"
+push = "silent"
+title = "Note saved"
+"#;
+    store
+        .publish(&parse(notes, &Check::default()).unwrap(), T0 - DAY)
+        .unwrap();
+    let snap = |observed: bool| Snapshot {
+        source: "notes".into(),
+        observed,
+        reason: (!observed).then(|| "The folder didn't load.".into()),
+        stale_after: None,
+        sent_at: None,
+        kinds: Some(vec![]),
+        firing: vec![],
+    };
+    store.apply_snapshot(&snap(false), T0).unwrap();
+    store.apply_snapshot(&snap(true), T0 + MINUTE).unwrap();
+    let all = InboxQuery {
+        classes: vec![Class::Update, Class::Record],
+        ..InboxQuery::default()
+    };
+    let inbox = store.inbox(&all, T0 + MINUTE).unwrap();
+    let kinds: Vec<&str> = inbox.activity.items.iter().map(|i| i.kind.as_str()).collect();
     assert_eq!(kinds, ["beacon.source_observed", "beacon.source_unobserved"]);
+    assert_eq!(inbox.activity.items[1].push.status, S::None);
+    assert!(inbox.alerts.open.is_empty());
+}
+
+#[test]
+fn a_silence_still_mutes_source_stopped() {
+    let store = store();
+    store
+        .open_silence(
+            &NewSilence {
+                matcher: SilenceMatch {
+                    kind: Some("beacon.source_stopped".into()),
+                    ..SilenceMatch::default()
+                },
+                reason: "Moving the backups".into(),
+                until: T0 + HOUR,
+                client: "api".into(),
+            },
+            T0,
+        )
+        .unwrap();
+    let mut s = snapshot(vec![]);
+    s.observed = false;
+    s.reason = Some("The bucket didn't answer.".into());
+    store.apply_snapshot(&s, T0).unwrap();
+    let open = store.inbox(&InboxQuery::default(), T0).unwrap().alerts.open;
+    let stopped = open.iter().find(|i| i.kind == "beacon.source_stopped").unwrap();
+    assert_eq!(stopped.push.reason, Some(R::Silenced));
 }
 
 #[test]
@@ -1189,16 +1678,42 @@ fn a_source_goes_stale_without_snapshots() {
         .unwrap();
     assert!(!source.observed);
     assert_eq!(source.reason.as_deref(), Some("It stopped reporting."));
-    let unobserved = store
+    let stopped = store
         .inbox(&InboxQuery::default(), T0 + 5 * MINUTE)
         .unwrap()
-        .activity
-        .items
+        .alerts
+        .open
         .into_iter()
-        .find(|i| i.kind == "beacon.source_unobserved")
+        .find(|i| i.kind == "beacon.source_stopped")
         .unwrap();
-    assert_eq!(unobserved.title, "Can't check Backups");
-    assert_eq!(unobserved.push.status, S::None);
+    assert_eq!(stopped.title, "Can't check Backups");
+    assert_eq!(
+        stopped.body,
+        "It stopped reporting. Its alerts are on hold until it reports again."
+    );
+    assert_eq!(stopped.push.status, S::Queued);
+}
+
+#[test]
+fn trail_going_quiet_opens_source_stopped() {
+    let store = store();
+    store.apply_trail_snapshot(T0, vec![], T0).unwrap();
+    store.run_due(T0 + 11 * MINUTE).unwrap();
+    let stopped = store
+        .inbox(&InboxQuery::default(), T0 + 11 * MINUTE)
+        .unwrap()
+        .alerts
+        .open
+        .into_iter()
+        .find(|i| i.kind == "beacon.source_stopped")
+        .unwrap();
+    assert_eq!(stopped.key, "trail");
+    assert_eq!(stopped.push.status, S::Queued);
+    store
+        .apply_trail_snapshot(T0 + 12 * MINUTE, vec![], T0 + 12 * MINUTE)
+        .unwrap();
+    let after = store.item(stopped.id, T0).unwrap().unwrap();
+    assert_eq!(after.state, Some(ItemState::Resolved));
 }
 
 // ---------- Trail ----------

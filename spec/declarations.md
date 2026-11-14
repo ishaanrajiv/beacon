@@ -264,8 +264,9 @@ posted.
 
 | Kind | Class | Push | Title | When |
 |---|---|---|---|---|
-| `beacon.source_unobserved` | update | none | "Can't check {source_name}" | A source posted `observed: false`, or its snapshots went stale. Its alerts are muted until it reports again. Shown on the client's system page. |
-| `beacon.source_observed` | record | none | "Checking {source_name} again" | An unobserved source reported again. |
+| `beacon.source_stopped` | alert | normal | "Can't check {source_name}" | A source that declares an alert kind (or `trail`) posted `observed: false`, or its snapshots went stale: its alerts are on hold. Key: the source. Body: "{reason} Its alerts are on hold until it reports again." Recovers as "Checking {source_name} again", "Its alerts are back on. Lasted {lasted}." when the source is observed again. Actions `acknowledge`, `silence_1h`. Its source is `beacon`, which is always observed, so the rule it reports on never mutes it; a silence can. |
+| `beacon.source_unobserved` | update | none | "Can't check {source_name}" | A source with no alert kind posted `observed: false`, or its snapshots went stale. Shown on the client's system page. |
+| `beacon.source_observed` | record | none | "Checking {source_name} again" | An unobserved source with no open `beacon.source_stopped` reported again. |
 | `beacon.flapping` | update | normal | "An alert keeps flapping" | An alert opened more than 3 times in 30 minutes. Body: "{alert} opened {openings} times in {window}. It stays quiet until it settles for {stable}." |
 | `beacon.catch_up` | update | normal | "{count} things came in overnight" | At the end of quiet hours, standing in for two or more held items. Body: their titles. |
 | `beacon.budget` | update | none | "More pushes than usual today" | The 6th non-alert push of a day. Body: "{count} so far. Most were {kind_title} from {source_name}." |

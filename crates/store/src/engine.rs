@@ -287,13 +287,33 @@ impl<'a, 'r> Tx<'a, 'r> {
         if step.close_held && row.push.status == PushStatus::Held {
             self.suppress(row, PushReason::Closed)?;
         }
+        // A push still queued for an item that left open makes no more attempts. If a device
+        // may already have it, the recovery below replaces its banner.
+        let mut may_have = false;
+        if step.close_held && row.push.status == PushStatus::Queued {
+            may_have = self.cancel_queued(row)?;
+            if !(may_have && step.recovery) {
+                self.suppress(row, PushReason::Closed)?;
+            }
+        }
         match step.text {
             Text::Keep => {}
             Text::Firing => self.render_firing(row),
             Text::Recovery => self.render_recovery(row),
         }
-        if step.recovery && row.push.status == PushStatus::Sent {
+        // Its own push was sent, or a device may have a firing push of an earlier moment (one
+        // cancelled when the alert was dismissed, or sent before a reopening that didn't push).
+        if step.recovery
+            && (row.push.status == PushStatus::Sent
+                || may_have
+                || self.shown(row.id)?.as_deref() == Some("item"))
+        {
             self.recovery(row)?;
+        }
+        // A recovery still waiting when the alert fires again would say it is back while it is
+        // open: the reopening's own decision stands instead.
+        if step.outcome == Outcome::Reopened {
+            self.supersede_queued(row.id)?;
         }
         if step.flapping {
             self.history(row.id, "flapping", None)?;
@@ -343,10 +363,11 @@ impl<'a, 'r> Tx<'a, 'r> {
     pub fn presence(&self) -> Result<Vec<Presence>> {
         let mut stmt = self
             .conn
-            .prepare_cached("SELECT device, active, last_heartbeat, viewing FROM presence")?;
+            .prepare_cached("SELECT device, active, last_heartbeat, viewing, client FROM presence")?;
         let rows = stmt.query_map([], |r| {
             Ok(Presence {
                 device: r.get(0)?,
+                ios: r.get::<_, String>(4)? == "ios",
                 active: r.get(1)?,
                 last_heartbeat: r.get(2)?,
                 viewing: r.get(3)?,
@@ -371,6 +392,43 @@ impl<'a, 'r> Tx<'a, 'r> {
         Ok(observed == Some(false))
     }
 
+    /// The item is seen, and every `seen` since its state last changed (it opened, reopened,
+    /// resolved, woke or was recorded) came from a web client.
+    pub fn seen_only_on_web(&self, row: &Row) -> Result<bool> {
+        if !row.life.seen {
+            return Ok(false);
+        }
+        let elsewhere: i64 = self
+            .conn
+            .prepare_cached(
+                "SELECT count(*) FROM history WHERE item = ?1 AND what = 'seen' AND coalesce(client, '') != 'web' \
+                 AND id > (SELECT coalesce(max(id), 0) FROM history WHERE item = ?1 \
+                 AND what IN ('opened', 'reopened', 'resolved', 'woke', 'recorded'))",
+            )?
+            .query_row([row.id], |r| r.get(0))?;
+        Ok(elsewhere == 0)
+    }
+
+    /// What the phone shows for the item: the purpose (`item` or `recovery`) of its latest push
+    /// that a device has or may have (sent, or an attempt accepted or without a clear answer).
+    /// None when no device has had one.
+    pub(crate) fn shown(&self, item: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT purpose FROM pushes p WHERE item = ?1 AND (status = 'sent' OR EXISTS \
+                 (SELECT 1 FROM attempts a WHERE a.push = p.id AND a.status IN ('accepted', 'uncertain'))) \
+                 ORDER BY id DESC LIMIT 1",
+            )?
+            .query_row([item], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// The phone shows the item's recovery.
+    fn recovery_shown(&self, item: i64) -> Result<bool> {
+        Ok(self.shown(item)?.as_deref() == Some("recovery"))
+    }
+
     fn last_push(&self, kind: &str, key: &str) -> Result<Option<i64>> {
         Ok(self
             .conn
@@ -388,8 +446,11 @@ impl<'a, 'r> Tx<'a, 'r> {
             silences: &silences,
             source_unobserved: self.unobserved(&row.source)?,
             last_push: self.last_push(&row.kind, &row.key)?,
+            recovery_shown: self.recovery_shown(row.id)?,
         };
-        let mut decision = delivery::decide(&row.subject(), trigger, &state, &presence, self.now);
+        let mut subject = row.subject();
+        subject.seen_only_on_web = self.seen_only_on_web(row)?;
+        let mut decision = delivery::decide(&subject, trigger, &state, &presence, self.now);
         if self.late && decision != Decision::None {
             decision = Decision::Suppress(PushReason::Late);
         }
@@ -469,6 +530,33 @@ impl<'a, 'r> Tx<'a, 'r> {
         Ok(())
     }
 
+    /// Cancels the item's queued push (`spec/delivery.md`, "Sending"): no more attempts. True
+    /// when a device may already have it: an attempt was accepted, or got no clear answer.
+    fn cancel_queued(&self, row: &Row) -> Result<bool> {
+        let Some(job) = row.push_job else {
+            return Ok(false);
+        };
+        let may_have = may_have_delivered(self.conn, job)?;
+        self.conn
+            .prepare_cached(
+                "UPDATE pushes SET status = 'cancelled', reason = 'closed', finished = ?2 \
+                 WHERE id = ?1 AND status = 'queued'",
+            )?
+            .execute(params![job, self.now])?;
+        Ok(may_have)
+    }
+
+    /// Cancels every push of the item still waiting to be sent: something newer stands.
+    fn supersede_queued(&self, item: i64) -> Result<()> {
+        self.conn
+            .prepare_cached(
+                "UPDATE pushes SET status = 'cancelled', reason = 'superseded', finished = ?2 \
+                 WHERE item = ?1 AND status = 'queued'",
+            )?
+            .execute(params![item, self.now])?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)] // reason: one row of the push queue, field by field
     fn queue(
         &self,
@@ -480,6 +568,9 @@ impl<'a, 'r> Tx<'a, 'r> {
         category: Option<&str>,
         data: &Value,
     ) -> Result<i64> {
+        // The newest push about an item replaces the last one's banner (the collapse id), so an
+        // older one still waiting to retry would only put stale text back over it.
+        self.supersede_queued(row.id)?;
         self.conn
             .prepare_cached(
                 "INSERT INTO pushes (item, purpose, queued_at, title, body, level, collapse_id, category, thread, url, \
@@ -501,9 +592,9 @@ impl<'a, 'r> Tx<'a, 'r> {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// A resolved alert whose push was sent: the recovery text, passive, same collapse id. Only
-    /// `push = false` stops it.
-    fn recovery(&mut self, row: &mut Row) -> Result<()> {
+    /// A resolved alert whose push was sent, or may have reached a device: the recovery text,
+    /// passive, same collapse id. Only `push = false` stops it.
+    pub(crate) fn recovery(&mut self, row: &mut Row) -> Result<()> {
         if !self.s.push {
             return self.suppress(row, PushReason::PushOff);
         }
@@ -629,7 +720,16 @@ impl<'a, 'r> Tx<'a, 'r> {
     }
 }
 
-/// The input an alert or action event's open state means.
+/// Whether a device may have push `job`: an attempt Apple accepted, or one with no clear answer.
+pub(crate) fn may_have_delivered(conn: &Connection, job: i64) -> Result<bool> {
+    let n: i64 = conn
+        .prepare_cached(
+            "SELECT count(*) FROM attempts WHERE push = ?1 AND status IN ('accepted', 'uncertain')",
+        )?
+        .query_row([job], |r| r.get(0))?;
+    Ok(n > 0)
+}
+
 /// A push's `data` (`spec/apns.md`): the item's id, kind, key and collapse id, and its context
 /// when it has one. Never a token.
 fn push_data(row: &Row) -> Value {
@@ -640,6 +740,7 @@ fn push_data(row: &Row) -> Value {
     data
 }
 
+/// The input an alert or action event's open state means.
 pub(crate) fn open_input(class: Class) -> Input {
     if class == Class::Alert {
         Input::Fire

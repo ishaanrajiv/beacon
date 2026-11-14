@@ -50,7 +50,8 @@ Every one but `throttle` is set in `beacon.toml` (`spec/config.md`); `throttle` 
 | `repeat` | An unacknowledged alert's next repeat came due |
 
 `state` is what the decision reads: the active silences, which sources are unobserved, the time of
-the last push sent per `(kind, key)`, the alert's flapping flag, and the server's `push` setting.
+the last push sent per `(kind, key)`, whether the item's last push on the phone is its recovery,
+the alert's flapping flag, and the server's `push` setting.
 `presence` is every device with its last heartbeat and `viewing`. The decision is one of: **send**
 (`push.status` becomes `queued`), **hold** until a time (`held`, with a reason), **none**, or
 **suppress** (with a reason).
@@ -65,9 +66,12 @@ those triggers.
 3. **Flapping?** The item is an alert that is flapping ("Alerts") → suppress, `flapping`.
 4. **Being viewed?** *Skipped for `repeat`.* The item has a `context`, and an active device's
    `viewing` equals it → suppress, `viewing`. The client shows it in place.
-5. **You're active?** *Skipped for `released` and `repeat`.* Any device is active →
-   hold, `active`, until now + `delivery.alert_hold` (120 s) for an alert, now + `delivery.hold`
-   (90 s) for an action or update. The item shows in the inbox's `held` list for the in-app banner.
+5. **You're active?** *Skipped for `released` and `repeat`.* A device is active → hold,
+   `active`, until now + `delivery.alert_hold` (120 s) for an alert, now + `delivery.hold` (90 s)
+   for an action or update. The item shows in the inbox's `held` list for the in-app banner.
+   - push `urgent` → only an `ios` device counts (the phone in hand shows it in the app). Web
+     presence never holds an urgent push: a tab can be open on the app with nobody in front of it.
+   - any other push → any device counts.
 6. **Quiet hours?** Now is within `[quiet_hours.start, quiet_hours.end)` in `timezone`:
    - push `urgent` → go on;
    - the kind is `time_bound` → go on;
@@ -76,17 +80,22 @@ those triggers.
 7. **Throttled?** *Skipped for `repeat`, `woke` and `caught_up`.* A push for the same `(kind, key)`
    was sent (decided `send`, whether or not Apple has taken it yet) within the kind's `throttle` →
    suppress, `throttled`. A kind with `throttle = "none"`
-   is never throttled.
+   is never throttled. A reopened alert whose last push a device has (sent) or may have (an
+   attempt `accepted` or `uncertain`) is its recovery is not throttled either, whether it is
+   decided as it reopens or later (a hold `released`, a silence ended): the phone says it is
+   back, and the firing text must replace that.
 8. **Send.** With `push = false` in beacon.toml → suppress, `push_off` (everything above is still
    decided and recorded, so the decisions can be compared before push is turned on). Otherwise →
    send ("Sending").
 
-**When a hold ends** (`released`): if the item has been seen → suppress, `seen`. If it has left
+**When a hold ends** (`released`): if the item has been seen → suppress, `seen`; for an urgent
+push, only a seen from a client other than `web` counts. If it has left
 `open` (an alert resolved or dismissed, an action done, dismissed, snoozed or resolved) →
 suppress, `closed`. Otherwise decide again with trigger `released`, which skips step 5: an item
 you didn't see in the hold pushes even though you are still active.
 
-At any time, a held item that is seen is suppressed (`seen`) at once, and one that leaves `open`
+At any time, a held item that is seen is suppressed (`seen`) at once (an urgent one only when
+seen on something other than a web client), and one that leaves `open`
 is suppressed (`closed`) at once; it doesn't wait for `release_at`.
 
 ## Sending
@@ -114,6 +123,34 @@ A send goes to every registered device (`spec/apns.md`), with:
 The item's `push.status` is `queued` until a device takes it (`sent`) or every device has failed
 for good (`failed`, with `rejected`, `expired`, `no_devices` or `unconfigured`).
 
+**A queued push never outlives what it says.** The phone must not end up showing the firing text
+of an alert or action that has closed:
+
+- When an item leaves `open` (an alert resolved or dismissed, an action done, dismissed, snoozed
+  or resolved) while its push is `queued` (waiting for its first attempt or a retry), the push
+  makes no more attempts. If no attempt was `accepted` or `uncertain`, no device has it: the
+  item's push is suppressed (`closed`) and it needs no recovery. If one was, a device may have
+  it: a resolved alert that isn't flapping or one-off gets its **recovery** push, which replaces
+  that banner through the shared collapse id; anything else is suppressed (`closed`), and the
+  iPhone app removes the notification when it next opens (`spec/clients.md`).
+- A push the sender has in flight at that moment has no attempt recorded yet, so it is cancelled
+  as above. When Apple's answer comes back it is recorded; if the push was the item's own,
+  Apple took it or gave no clear answer, and the item is an alert that has stayed resolved with
+  nothing newer queued, the recovery goes out then. One sender sends one push at a time, so the
+  recovery always follows the push it replaces.
+- A newer push about the same item (a repeat, a recovery, a reopening's push) cancels an older
+  one still queued: they share a collapse id, and the older would only put stale text back. A
+  reopening cancels a recovery still queued even when the reopening itself doesn't push.
+- A recovery in flight when its alert reopens is cancelled the same way. If Apple took it or
+  gave no clear answer and the reopening was suppressed `throttled` (nothing said then that a
+  device had the recovery), the open alert is decided again (`reopened`), now unthrottled.
+- The sender lists every push due and sends them one at a time, so it checks that each is still
+  `queued` just before sending it: one cancelled while an earlier push was sending is skipped.
+- A resolving alert also gets its recovery when its own push was never `sent` but a device has,
+  or may have, an earlier firing push of the same item: one cancelled when the alert was
+  dismissed, or one sent before a reopening that didn't push. What the phone shows is the
+  item's latest push that a device has or may have.
+
 ## Alerts
 
 An alert item is one incident of one `(kind, key)`. Its state is `open`, `dismissed` or
@@ -124,8 +161,8 @@ stop).
 |---|---|---|---|
 | — (no item, or the last resolved `flap_window` or more ago) | fire | `open` | A new item. `openings = 1`. `seen = false`. Repeats scheduled from now. Decide (`opened`). |
 | `resolved`, within `flap_window` of resolving | fire | `open` | The same item reopens: `times.opened` now, `times.resolved`, `acknowledged` and `dismissed` cleared, `seen = false`, text back to the firing text, repeats rescheduled. Count the openings within the window; more than `flap_openings` (3) → flapping (below). Decide (`reopened`). |
-| `open`, `dismissed` | fire | unchanged | Facts, slots, text and labels updated. No push. |
-| `open`, `dismissed` | resolve (an event, or absent from its source's snapshot) | `resolved` | `times.resolved` now. Text becomes the recovery text, with `{lasted}` from `times.opened` to now. `seen = false`. A held push is suppressed (`closed`). Repeats cancelled. If the item's push was `sent` and it isn't flapping, a **recovery** push: the recovery text, same collapse id, `passive`, no category; the item's `push.status` follows it (`queued`, then `sent`). It is not subject to silences, quiet hours, presence or throttle; only to `push = false` (suppressed, `push_off`). |
+| `open`, `dismissed` | fire | unchanged | Facts, slots, text and labels updated. No push. When nothing it shows or stores would change (facts, slots, labels, rendered text and buttons, link, category, context), nothing is written: no history row, no new `version`, no copy to Trail; the answer is still `updated` with the item as it is. |
+| `open`, `dismissed` | resolve (an event, or absent from its source's snapshot) | `resolved` | `times.resolved` now. Text becomes the recovery text, with `{lasted}` from `times.opened` to now. `seen = false`. A held push is suppressed (`closed`); a queued one stops ("Sending"). Repeats cancelled. If the item's push was `sent`, or a device may have a firing push of it ("Sending"), and it isn't flapping, a **recovery** push: the recovery text, same collapse id, `passive`, no category; the item's `push.status` follows it (`queued`, then `sent`). It is not subject to silences, quiet hours, presence or throttle; only to `push = false` (suppressed, `push_off`). |
 | `resolved` | resolve | unchanged | Nothing (`outcome: "ignored"`). |
 | `open`, `dismissed` | acknowledge | unchanged | `acknowledged` now. Repeats cancelled. A one-off alert resolves instead (no recovery text: it keeps its own). |
 | `open` | dismiss | `dismissed` | Leaves Needs you; stays in Alerts. Repeats cancelled. A held push is suppressed (`closed`). A one-off alert resolves instead. |
@@ -154,8 +191,8 @@ stop).
 | From | Input | To | Effects |
 |---|---|---|---|
 | — (no item in `open` or `snoozed` for the `(kind, key)`) | open | `open` | A new item. `seen = false`. Decide (`opened`). |
-| `open`, `snoozed` | open | unchanged | Facts, slots, text and labels updated. No push. |
-| `open`, `snoozed` | done | `done` | `times.done`. A held push is suppressed (`closed`). |
+| `open`, `snoozed` | open | unchanged | Facts, slots, text and labels updated. No push. Unchanged, nothing is written, as for alerts. |
+| `open`, `snoozed` | done | `done` | `times.done`. A held push is suppressed (`closed`); a queued one stops ("Sending"). |
 | `open`, `snoozed` | dismiss | `dismissed` | `times.dismissed`. The same. |
 | `open` | snooze until T | `snoozed` | `times.snoozed_until = T`. The same. |
 | `snoozed` | T passes | `open` | `seen = false`. Decide (`woke`). |
@@ -183,6 +220,8 @@ Recorded once, never change state. Updates are decided (`opened`); records never
 - Seen goes back to false when the producer changes the item's state: an alert opens, reopens or
   resolves; a snoozed action wakes. Text updates don't change it.
 - A held push of an item that is seen is suppressed. Seen never resolves anything.
+- A seen posted with `"client": "web"` never suppresses an urgent push: the item reads as seen,
+  but its held push still goes out unless the phone (or the API) marks it seen too.
 - **Done** is an action you handled: `POST /v1/items/{id}/actions` with `done`. It differs from
   `dismissed` (you won't do it) and `resolved` (its source closed it). All three leave Needs you.
 - When the iPhone app opens, it removes the delivered notifications of alerts and actions that are
@@ -211,14 +250,19 @@ A source is **observed** until it says otherwise or goes quiet:
 - A snapshot with `observed: false` and a `reason`, or no snapshot for `stale_after` after the last
   one (checked at least every 30 seconds), makes it **unobserved**. A source that has never posted
   a snapshot is never stale.
-- Becoming unobserved records one `beacon.source_unobserved` update (key = the source, fact
-  `source_name`, slot `reason`; "It stopped reporting." when stale). Its push is `none`; clients
-  show it on their system page.
+- Becoming unobserved, for a source that declares at least one alert kind (and for `trail`),
+  opens one `beacon.source_stopped` alert (key = the source, fact `source_name`, slot `reason`;
+  "It stopped reporting." when stale), push `normal`, decided like any alert (`opened`, or
+  `reopened` within the flap window). Its source is `beacon`, which is always observed, so the rule
+  it reports on never mutes it; a silence can.
+- A source with no alert kind records one `beacon.source_unobserved` update instead (the same key,
+  fact and slot). Its push is `none`; clients show it on their system page.
 - While unobserved, the source's alerts don't push (`unobserved`), and nothing about them changes:
   not hearing from a source is not a recovery. Its actions and updates push as usual.
-- A snapshot with `observed: true` makes it observed again and records `beacon.source_observed`.
-  Each of its alerts still open whose push was suppressed `unobserved` is decided again
-  (`unmuted`).
+- A snapshot with `observed: true` makes it observed again. Its open `beacon.source_stopped`
+  resolves ("Checking {source_name} again", with how long it lasted, and a recovery push if its
+  push was sent); with none open, Beacon records `beacon.source_observed`. Each of its alerts
+  still open whose push was suppressed `unobserved` is decided again (`unmuted`).
 - Source `trail` follows the same rules through `POST /v1/trail`. Source `beacon` is always observed.
 
 ## The budget
@@ -236,6 +280,8 @@ push is `none`. Nothing is suppressed by the budget: it is a signal to fix a noi
   Keys are scoped to the kind's source.
 - Trail notices are recorded once per notice `id`, for as long as their item is kept.
 - Snapshots are idempotent by nature: posting the same one twice changes nothing the second time.
+  An entry (or event) that would change nothing about an open item writes nothing: no history
+  row, no `version`, so clients' `If-None-Match` still gets `304`.
 - Item actions whose effect already holds answer `200` and change nothing; `POST /v1/seen` and
   presence are idempotent.
 - A push retried after a lost answer from Apple may show twice; the collapse id makes the phone

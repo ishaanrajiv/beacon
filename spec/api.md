@@ -48,7 +48,7 @@ when there are several (a declarations file, an event with three bad facts).
 | `405` | The route exists, with another method. The `Allow` header lists the methods. |
 | `409` | A conflict: an Idempotency-Key reused with another body, a snapshot older than one already taken, an action that doesn't apply to the item's state, a reserved source. |
 | `410` | `POST /v1/live-activity` only: Apple says the activity's token is dead. |
-| `413` | The body is over `limits.body_bytes`. |
+| `413` | The body is over `limits.body_bytes`: by its Content-Length, or for a chunked body as soon as the chunks so far and the next chunk's size pass it. |
 | `422` | Readable, but not declared: an undeclared kind, or facts and slots that don't fit their kind. |
 | `502` | `POST /v1/live-activity` only: Apple didn't take the update. |
 | `503` | Storage failed (retry), or for `POST /v1/live-activity`, no APNs key is configured. |
@@ -261,6 +261,8 @@ different body is `409`. Generated emitters send one with every call (`spec/clie
 
 `outcome` is `opened`, `reopened`, `updated`, `resolved`, `recorded` or `ignored` (`item` is null
 then). The item shows what was decided about its push at once (`push.status` may be `held`).
+`updated` is also the answer when the event changes nothing about an open item; then nothing is
+written (`spec/delivery.md`, "Alerts").
 
 `422` for an undeclared kind:
 
@@ -299,7 +301,7 @@ limit) posts one after each check, so a restart or a missed post is put right at
 |---|---|---|---|
 | `source` | string | required | A published source (`422` otherwise). Not `beacon` or `trail`. |
 | `observed` | bool | `true` | false: the source couldn't see what it watches (see below). |
-| `reason` | string | required when `observed` is false | 1 to 100 characters, a sentence for a person: "The usage page didn't load." Becomes the `reason` slot of `beacon.source_unobserved`. |
+| `reason` | string | required when `observed` is false | 1 to 100 characters, a sentence for a person: "The usage page didn't load." Becomes the `reason` slot of `beacon.source_stopped` (or, for a source with no alert kind, `beacon.source_unobserved`). |
 | `stale_after` | duration | `[delivery] snapshot_stale_after` (`15m`) | `1m` to `7d`. With no snapshot for this long, the source becomes unobserved. |
 | `sent_at` | integer ms | none | When the source made it. If sent: `409` when older than the newest snapshot already taken from this source, more than 5 minutes old, or more than 1 minute in the future. |
 | `kinds` | list of kind names | every `alert` and `action` kind of the source | The kinds this snapshot is complete for. Each must be an alert or action kind of the source (`422`). |
@@ -314,12 +316,14 @@ With `observed: true`, in one transaction:
    a snapshot opened it.
 3. An action you closed (done or dismissed) whose `(kind, key)` is still listed stays closed. It
    opens again as a new item only after a snapshot without it, followed by one with it.
-4. The source is observed again (if it wasn't, Beacon records `beacon.source_observed`), its
+4. The source is observed again (if it wasn't, its open `beacon.source_stopped` resolves, or with
+   none open Beacon records `beacon.source_observed`), its
    `last_snapshot` is now and its `stale_after` is the one given.
 
 With `observed: false`, nothing opens or resolves (`firing` is ignored): the source is unobserved
 with `reason`, and its alerts are muted until a snapshot with `observed: true`
-(`spec/delivery.md`, "Sources").
+(`spec/delivery.md`, "Sources"). A source that declares an alert kind opens a
+`beacon.source_stopped` alert saying so.
 
 The snapshot is all or nothing: if any entry fails a check, `422` with every problem
 (`at` like `snapshot firing[2] facts.used_percent`), and nothing changes.
@@ -353,8 +357,8 @@ else in Trail changes. Local access only. Every item it makes belongs to source 
   are kept. A notice's labels are the same. Its link is `[trail] open`.
 - Trail listing one key twice in a snapshot counts once.
 - A snapshot also observes source `trail`, with `stale_after` = `[trail] stale_after` (`11m`:
-  Trail re-posts every 5 minutes). If Trail stops posting, `trail` becomes unobserved and its
-  alerts are muted.
+  Trail re-posts every 5 minutes). If Trail stops posting, `trail` becomes unobserved, its
+  alerts are muted, and `beacon.source_stopped` (key `trail`) opens and pushes.
 
 **`notice`** (`{"type": "notice", "id", "source", "alert", "severity", "title", "body", "ts", "event"}`):
 
@@ -412,12 +416,19 @@ A client's heartbeat. Beacon holds pushes while you are active somewhere (`spec/
 What each client must do:
 
 - **Web:** active while the tab is visible and focused (`document.visibilityState === "visible"`
-  and `document.hasFocus()`). Post at once on becoming active, every `heartbeat` (30 s) while
-  active, and `active: false` on becoming hidden or blurred.
+  and `document.hasFocus()`) **and** the person has moved the pointer, pressed a key or touched
+  the page within the last 5 minutes (`pointermove`, `pointerdown`, `keydown`, `wheel`,
+  `touchstart` on the page). Post at once on becoming active, every `heartbeat` (30 s) while
+  active, and `active: false` on becoming hidden or blurred, or when 5 minutes pass without input.
+  A tab left open on the app with nobody in front of it is not active.
 - **iOS:** active while the app is in the foreground (scene phase active). Post at once on
   entering the foreground, every 30 s while there, and `active: false` on leaving it.
 - Post again at once whenever `viewing` changes.
-- No idle detection from the operating system, on either.
+- No idle detection from the operating system, on either: the web's 5 minutes are input on the
+  page itself.
+
+`client` matters: an urgent push is held only while an `ios` device is active, because a web tab
+can be open with nobody looking at it (`spec/delivery.md`, step 5).
 
 A device counts as active for `presence.active_window` (75 s) after its last heartbeat with
 `active: true`, or until a heartbeat with `active: false`. A **visit** is a run of time with at
@@ -560,7 +571,7 @@ Every route that returns notifications returns this shape.
 |---|---|
 | `none` | `declared` (a record, or a kind with push `none`) |
 | `held` | `active` (you're active somewhere), `quiet_hours` |
-| `suppressed` | `silenced`, `unobserved`, `flapping`, `viewing` (a client showed its context), `seen` (seen while held), `closed` (done, dismissed, snoozed or resolved while held), `throttled`, `catch_up`, `late`, `push_off` |
+| `suppressed` | `silenced`, `unobserved`, `flapping`, `viewing` (a client showed its context), `seen` (seen while held), `closed` (done, dismissed, snoozed or resolved while held, or while queued: see `spec/delivery.md`, "Sending"), `throttled`, `catch_up`, `late`, `push_off` |
 | `failed` | `no_devices`, `rejected` (Apple refused it for every device), `expired` (not taken within an hour), `unconfigured` (no signing key) |
 
 The buttons that apply now (`actions`), from the kind's declared list:
@@ -640,7 +651,9 @@ in the fix. `404` for an unknown item.
 or `{"ids": [4182, 4177]}`: exactly one of the two. `through` marks every item with an id up to
 it; `ids` at most 500 items. Optional `"client"`: `"web"`, `"ios"` or `"api"` (default), recorded in
 each item's history. `200` `{"ok": true, "seen": 3}`: how many were newly marked. A held
-push of a newly seen item is suppressed (`seen`). When a client marks seen is in
+push of a newly seen item is suppressed (`seen`), except that `"client": "web"` never suppresses
+an urgent push. An `ios` or `api` mark on an item that only a web client has seen, whose urgent
+push is held, is recorded and suppresses it, though it doesn't count as newly marked. When a client marks seen is in
 `spec/delivery.md`, "Seen and done".
 
 ### Silences

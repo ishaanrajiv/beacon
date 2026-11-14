@@ -133,7 +133,7 @@ CREATE TABLE pushes (
     thread TEXT NOT NULL,
     url TEXT,
     data TEXT NOT NULL,          -- JSON object
-    status TEXT NOT NULL,        -- queued | sent | failed
+    status TEXT NOT NULL,        -- queued | sent | failed | cancelled (its item closed, or a newer push replaced it)
     reason TEXT,
     attempts INTEGER NOT NULL DEFAULT 0,
     next_attempt INTEGER NOT NULL,
