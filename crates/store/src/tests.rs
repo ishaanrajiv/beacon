@@ -476,6 +476,120 @@ fn a_reopening_after_its_recovery_was_sent_is_not_throttled() {
 }
 
 #[test]
+fn a_recovery_in_flight_when_its_alert_reopens_is_put_right_if_taken() {
+    for (answer, next, taken) in [
+        ("accepted", PushNext::Sent, true),
+        ("uncertain", PushNext::RetryAt(T0 + 3 * MINUTE), true),
+        ("rejected", PushNext::Failed(R::Rejected), false),
+    ] {
+        let store = store();
+        let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+        sent(&store, T0);
+        store.apply_event(&resolved(failed()), None, T0 + MINUTE).unwrap();
+        // The sender has taken the recovery and is talking to Apple...
+        let recovery = store.pushes_due(T0 + MINUTE).unwrap()[0].id;
+        // ...when the alert fires again, within its throttle: nothing says a device has the
+        // recovery yet, so the reopening is throttled and the recovery cancelled.
+        let back = item(&store.apply_event(&failed(), None, T0 + 2 * MINUTE).unwrap());
+        assert_eq!(
+            (back.push.status, back.push.reason),
+            (S::Suppressed, Some(R::Throttled))
+        );
+        // Then Apple answers.
+        store
+            .push_attempted(recovery, &[attempt(answer)], next, T0 + 2 * MINUTE + SECOND)
+            .unwrap();
+        let row = store.item(it.id, T0).unwrap().unwrap();
+        let due = store.pushes_due(T0 + 2 * MINUTE + SECOND).unwrap();
+        if taken {
+            // The phone says it is back while it is open: the firing text goes out after all.
+            assert_eq!(row.push.status, S::Queued, "{answer}");
+            assert_eq!(due.len(), 1, "{answer}");
+            assert_eq!(due[0].purpose, "item");
+            assert_eq!(due[0].title, back.title);
+        } else {
+            assert_eq!(
+                (row.push.status, row.push.reason),
+                (S::Suppressed, Some(R::Throttled)),
+                "{answer}"
+            );
+            assert!(due.is_empty(), "{answer}");
+        }
+    }
+}
+
+#[test]
+fn a_reopening_held_after_its_recovery_was_sent_pushes_when_released() {
+    let store = store();
+    let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+    sent(&store, T0);
+    store.apply_event(&resolved(failed()), None, T0 + MINUTE).unwrap();
+    sent(&store, T0 + MINUTE);
+    // The phone is in hand when it fires again: held, then released unseen within the throttle.
+    phone_active(&store, T0 + 2 * MINUTE);
+    let back = item(&store.apply_event(&failed(), None, T0 + 2 * MINUTE).unwrap());
+    assert_eq!(back.push.status, S::Held);
+    store.run_due(T0 + 4 * MINUTE).unwrap();
+    let after = store.item(it.id, T0).unwrap().unwrap();
+    assert_eq!(after.push.status, S::Queued);
+    assert_eq!(store.pushes_due(T0 + 4 * MINUTE).unwrap()[0].purpose, "item");
+}
+
+#[test]
+fn a_dismissed_alert_whose_push_a_device_may_have_still_gets_its_recovery() {
+    let store = store();
+    let it = item(&store.apply_event(&down(), None, T0).unwrap());
+    let job = store.pushes_due(T0).unwrap()[0].id;
+    // No clear answer from Apple: it may be on the phone, and is waiting to retry.
+    store
+        .push_attempted(
+            job,
+            &[attempt("uncertain")],
+            PushNext::RetryAt(T0 + 10 * SECOND),
+            T0,
+        )
+        .unwrap();
+    // Dismissed: the queued push stops, and nothing replaces its banner yet.
+    store.press(it.id, "dismiss", None, "web", T0 + SECOND).unwrap();
+    let dismissed = store.item(it.id, T0).unwrap().unwrap();
+    assert_eq!(
+        (dismissed.push.status, dismissed.push.reason),
+        (S::Suppressed, Some(R::Closed))
+    );
+    assert!(store.pushes_due(T0 + MINUTE).unwrap().is_empty());
+    // Its source resolves it: the banner a device may have is replaced by the recovery.
+    let after = item(&store.apply_event(&resolved(down()), None, T0 + MINUTE).unwrap());
+    assert_eq!(after.push.status, S::Queued);
+    let due = store.pushes_due(T0 + MINUTE).unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].purpose, "recovery");
+
+    // A dismissed alert no device has resolves without one.
+    let store = self::store();
+    let it = item(&store.apply_event(&down(), None, T0).unwrap());
+    store.press(it.id, "dismiss", None, "web", T0 + SECOND).unwrap();
+    let after = item(&store.apply_event(&resolved(down()), None, T0 + MINUTE).unwrap());
+    assert_eq!(after.push.status, S::Suppressed);
+    assert!(store.pushes_due(T0 + MINUTE).unwrap().is_empty());
+}
+
+#[test]
+fn a_push_cancelled_after_the_sender_listed_it_is_no_longer_queued() {
+    let store = store();
+    let first = item(&store.apply_event(&failed(), None, T0).unwrap());
+    let second = item(&store.apply_event(&down(), None, T0).unwrap());
+    // The sender lists both, and is still sending the first...
+    let batch = store.pushes_due(T0).unwrap();
+    assert_eq!(batch.len(), 2);
+    let (a, b) = (&batch[0], &batch[1]);
+    assert_eq!((a.item, b.item), (first.id, second.id));
+    // ...when the second's alert resolves.
+    store.apply_event(&resolved(down()), None, T0 + SECOND).unwrap();
+    assert!(store.push_queued(a.id).unwrap());
+    assert!(!store.push_queued(b.id).unwrap(), "the sender must skip it");
+}
+
+#[test]
 fn a_reopening_cancels_a_recovery_still_waiting() {
     let store = store();
     let it = item(&store.apply_event(&failed(), None, T0).unwrap());

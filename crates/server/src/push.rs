@@ -25,6 +25,11 @@ fn relevance(job: &PushJob) -> f64 {
 /// Sends every push due now and records each round of attempts.
 pub(crate) fn drain(app: &App, now: i64) -> Result<(), beacon_store::Error> {
     for job in app.store.pushes_due(now)? {
+        // Every push due was listed at once, and each send can take seconds: one whose item
+        // closed, or that a newer push replaced, while an earlier one was sending is skipped.
+        if !app.store.push_queued(job.id)? {
+            continue;
+        }
         let Some(client) = &app.apns else {
             app.store
                 .push_attempted(job.id, &[], PushNext::Failed(PushReason::Unconfigured), now)?;

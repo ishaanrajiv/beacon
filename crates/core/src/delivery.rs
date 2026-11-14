@@ -202,8 +202,8 @@ pub struct State<'a> {
     pub source_unobserved: bool,
     /// When a push for the item's `(kind, key)` last went out.
     pub last_push: Option<i64>,
-    /// The last push a device has, or may have, for this alert is its recovery: the phone says
-    /// it is back.
+    /// The last push a device has, or may have, for this item is its recovery: the phone says
+    /// it is back, so the item has reopened since.
     pub recovery_shown: bool,
 }
 
@@ -315,8 +315,9 @@ pub fn decide(
             };
         }
     }
-    // 7. Throttled? Not a reopening whose recovery is what the phone shows.
-    let recovered = trigger == Trigger::Reopened && state.recovery_shown;
+    // 7. Throttled? Not a reopened alert whose recovery is what the phone shows, whether it is
+    // decided as it reopens or later (a hold released, a silence ended).
+    let recovered = trigger != Trigger::Opened && state.recovery_shown;
     if !matches!(trigger, Trigger::Repeat | Trigger::Woke | Trigger::CaughtUp)
         && !recovered
         && let (Some(throttle), Some(last)) = (item.throttle, state.last_push)

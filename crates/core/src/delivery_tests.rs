@@ -557,7 +557,10 @@ fn step_7_a_reopening_after_its_recovery_is_not_throttled() {
     c.recovery_shown = true;
     // The phone says it is back: the reopening must replace that.
     assert_eq!(c.decide(Trigger::Reopened, NOON), Decision::Send);
-    // Only a reopening skips it.
+    // So must a reopening that was held and is released, or was muted and is decided again.
+    assert_eq!(c.decide(Trigger::Released, NOON), Decision::Send);
+    assert_eq!(c.decide(Trigger::Unmuted, NOON), Decision::Send);
+    // A new item is throttled as ever.
     assert_eq!(c.decide(Trigger::Opened, NOON), Decision::Suppress(R::Throttled));
     // With the firing push last, the throttle applies as before.
     c.recovery_shown = false;

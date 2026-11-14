@@ -301,7 +301,13 @@ impl<'a, 'r> Tx<'a, 'r> {
             Text::Firing => self.render_firing(row),
             Text::Recovery => self.render_recovery(row),
         }
-        if step.recovery && (row.push.status == PushStatus::Sent || may_have) {
+        // Its own push was sent, or a device may have a firing push of an earlier moment (one
+        // cancelled when the alert was dismissed, or sent before a reopening that didn't push).
+        if step.recovery
+            && (row.push.status == PushStatus::Sent
+                || may_have
+                || self.shown(row.id)?.as_deref() == Some("item"))
+        {
             self.recovery(row)?;
         }
         // A recovery still waiting when the alert fires again would say it is back while it is
@@ -403,10 +409,11 @@ impl<'a, 'r> Tx<'a, 'r> {
         Ok(elsewhere == 0)
     }
 
-    /// The latest push of the item that a device has or may have (sent, or an attempt accepted
-    /// or without a clear answer) is its recovery.
-    fn recovery_shown(&self, item: i64) -> Result<bool> {
-        let purpose: Option<String> = self
+    /// What the phone shows for the item: the purpose (`item` or `recovery`) of its latest push
+    /// that a device has or may have (sent, or an attempt accepted or without a clear answer).
+    /// None when no device has had one.
+    pub(crate) fn shown(&self, item: i64) -> Result<Option<String>> {
+        Ok(self
             .conn
             .prepare_cached(
                 "SELECT purpose FROM pushes p WHERE item = ?1 AND (status = 'sent' OR EXISTS \
@@ -414,8 +421,12 @@ impl<'a, 'r> Tx<'a, 'r> {
                  ORDER BY id DESC LIMIT 1",
             )?
             .query_row([item], |r| r.get(0))
-            .optional()?;
-        Ok(purpose.as_deref() == Some("recovery"))
+            .optional()?)
+    }
+
+    /// The phone shows the item's recovery.
+    fn recovery_shown(&self, item: i64) -> Result<bool> {
+        Ok(self.shown(item)?.as_deref() == Some("recovery"))
     }
 
     fn last_push(&self, kind: &str, key: &str) -> Result<Option<i64>> {

@@ -80,9 +80,10 @@ those triggers.
 7. **Throttled?** *Skipped for `repeat`, `woke` and `caught_up`.* A push for the same `(kind, key)`
    was sent (decided `send`, whether or not Apple has taken it yet) within the kind's `throttle` →
    suppress, `throttled`. A kind with `throttle = "none"`
-   is never throttled. A `reopened` alert whose last push a device has (sent) or may have (an
-   attempt `accepted` or `uncertain`) is its recovery is not throttled either: the phone says it
-   is back, and the reopening must replace that.
+   is never throttled. A reopened alert whose last push a device has (sent) or may have (an
+   attempt `accepted` or `uncertain`) is its recovery is not throttled either, whether it is
+   decided as it reopens or later (a hold `released`, a silence ended): the phone says it is
+   back, and the firing text must replace that.
 8. **Send.** With `push = false` in beacon.toml → suppress, `push_off` (everything above is still
    decided and recorded, so the decisions can be compared before push is turned on). Otherwise →
    send ("Sending").
@@ -140,6 +141,15 @@ of an alert or action that has closed:
 - A newer push about the same item (a repeat, a recovery, a reopening's push) cancels an older
   one still queued: they share a collapse id, and the older would only put stale text back. A
   reopening cancels a recovery still queued even when the reopening itself doesn't push.
+- A recovery in flight when its alert reopens is cancelled the same way. If Apple took it or
+  gave no clear answer and the reopening was suppressed `throttled` (nothing said then that a
+  device had the recovery), the open alert is decided again (`reopened`), now unthrottled.
+- The sender lists every push due and sends them one at a time, so it checks that each is still
+  `queued` just before sending it: one cancelled while an earlier push was sending is skipped.
+- A resolving alert also gets its recovery when its own push was never `sent` but a device has,
+  or may have, an earlier firing push of the same item: one cancelled when the alert was
+  dismissed, or one sent before a reopening that didn't push. What the phone shows is the
+  item's latest push that a device has or may have.
 
 ## Alerts
 
@@ -152,7 +162,7 @@ stop).
 | — (no item, or the last resolved `flap_window` or more ago) | fire | `open` | A new item. `openings = 1`. `seen = false`. Repeats scheduled from now. Decide (`opened`). |
 | `resolved`, within `flap_window` of resolving | fire | `open` | The same item reopens: `times.opened` now, `times.resolved`, `acknowledged` and `dismissed` cleared, `seen = false`, text back to the firing text, repeats rescheduled. Count the openings within the window; more than `flap_openings` (3) → flapping (below). Decide (`reopened`). |
 | `open`, `dismissed` | fire | unchanged | Facts, slots, text and labels updated. No push. When nothing it shows or stores would change (facts, slots, labels, rendered text and buttons, link, category, context), nothing is written: no history row, no new `version`, no copy to Trail; the answer is still `updated` with the item as it is. |
-| `open`, `dismissed` | resolve (an event, or absent from its source's snapshot) | `resolved` | `times.resolved` now. Text becomes the recovery text, with `{lasted}` from `times.opened` to now. `seen = false`. A held push is suppressed (`closed`); a queued one stops ("Sending"). Repeats cancelled. If the item's push was `sent`, or was queued and a device may have it ("Sending"), and it isn't flapping, a **recovery** push: the recovery text, same collapse id, `passive`, no category; the item's `push.status` follows it (`queued`, then `sent`). It is not subject to silences, quiet hours, presence or throttle; only to `push = false` (suppressed, `push_off`). |
+| `open`, `dismissed` | resolve (an event, or absent from its source's snapshot) | `resolved` | `times.resolved` now. Text becomes the recovery text, with `{lasted}` from `times.opened` to now. `seen = false`. A held push is suppressed (`closed`); a queued one stops ("Sending"). Repeats cancelled. If the item's push was `sent`, or a device may have a firing push of it ("Sending"), and it isn't flapping, a **recovery** push: the recovery text, same collapse id, `passive`, no category; the item's `push.status` follows it (`queued`, then `sent`). It is not subject to silences, quiet hours, presence or throttle; only to `push = false` (suppressed, `push_off`). |
 | `resolved` | resolve | unchanged | Nothing (`outcome: "ignored"`). |
 | `open`, `dismissed` | acknowledge | unchanged | `acknowledged` now. Repeats cancelled. A one-off alert resolves instead (no recovery text: it keeps its own). |
 | `open` | dismiss | `dismissed` | Leaves Needs you; stays in Alerts. Repeats cancelled. A held push is suppressed (`closed`). A one-off alert resolves instead. |
