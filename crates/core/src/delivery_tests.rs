@@ -29,6 +29,7 @@ struct Case {
     silences: Vec<Silence>,
     unobserved: bool,
     last_push: Option<i64>,
+    recovery_shown: bool,
     presence: Vec<Presence>,
 }
 
@@ -54,6 +55,7 @@ fn case(class: Class) -> Case {
         silences: Vec::new(),
         unobserved: false,
         last_push: None,
+        recovery_shown: false,
         presence: Vec::new(),
     }
 }
@@ -80,6 +82,7 @@ impl Case {
             silences: &self.silences,
             source_unobserved: self.unobserved,
             last_push: self.last_push,
+            recovery_shown: self.recovery_shown,
         };
         decide(&subject, trigger, &state, &self.presence, now)
     }
@@ -545,6 +548,23 @@ fn step_7_throttles_within_the_kind_s_throttle() {
     c.last_push = Some(NOON - SECOND);
     c.throttle = None;
     assert_eq!(c.decide(Trigger::Opened, NOON), Decision::Send);
+}
+
+#[test]
+fn step_7_a_reopening_after_its_recovery_is_not_throttled() {
+    let mut c = case(Class::Alert);
+    c.last_push = Some(NOON - MINUTE);
+    c.recovery_shown = true;
+    // The phone says it is back: the reopening must replace that.
+    assert_eq!(c.decide(Trigger::Reopened, NOON), Decision::Send);
+    // Only a reopening skips it.
+    assert_eq!(c.decide(Trigger::Opened, NOON), Decision::Suppress(R::Throttled));
+    // With the firing push last, the throttle applies as before.
+    c.recovery_shown = false;
+    assert_eq!(
+        c.decide(Trigger::Reopened, NOON),
+        Decision::Suppress(R::Throttled)
+    );
 }
 
 #[test]

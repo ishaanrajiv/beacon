@@ -403,6 +403,21 @@ impl<'a, 'r> Tx<'a, 'r> {
         Ok(elsewhere == 0)
     }
 
+    /// The latest push of the item that a device has or may have (sent, or an attempt accepted
+    /// or without a clear answer) is its recovery.
+    fn recovery_shown(&self, item: i64) -> Result<bool> {
+        let purpose: Option<String> = self
+            .conn
+            .prepare_cached(
+                "SELECT purpose FROM pushes p WHERE item = ?1 AND (status = 'sent' OR EXISTS \
+                 (SELECT 1 FROM attempts a WHERE a.push = p.id AND a.status IN ('accepted', 'uncertain'))) \
+                 ORDER BY id DESC LIMIT 1",
+            )?
+            .query_row([item], |r| r.get(0))
+            .optional()?;
+        Ok(purpose.as_deref() == Some("recovery"))
+    }
+
     fn last_push(&self, kind: &str, key: &str) -> Result<Option<i64>> {
         Ok(self
             .conn
@@ -420,6 +435,7 @@ impl<'a, 'r> Tx<'a, 'r> {
             silences: &silences,
             source_unobserved: self.unobserved(&row.source)?,
             last_push: self.last_push(&row.kind, &row.key)?,
+            recovery_shown: self.recovery_shown(row.id)?,
         };
         let mut subject = row.subject();
         subject.seen_only_on_web = self.seen_only_on_web(row)?;

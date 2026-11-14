@@ -398,6 +398,35 @@ fn a_push_in_flight_when_its_alert_resolves_is_followed_by_the_recovery_if_taken
 }
 
 #[test]
+fn a_reopening_after_its_recovery_was_sent_is_not_throttled() {
+    let store = store();
+    let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+    sent(&store, T0);
+    store.apply_event(&resolved(failed()), None, T0 + MINUTE).unwrap();
+    sent(&store, T0 + MINUTE);
+    // Within the kind's 10-minute throttle: the phone says it recovered, so it pushes.
+    let back = item(&store.apply_event(&failed(), None, T0 + 2 * MINUTE).unwrap());
+    assert_eq!(back.id, it.id);
+    assert_eq!(back.state, Some(ItemState::Open));
+    assert_eq!(back.push.status, S::Queued);
+    let due = store.pushes_due(T0 + 2 * MINUTE).unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].purpose, "item");
+    assert_eq!(due[0].title, back.title);
+
+    // A recovery that never went out leaves the firing banner up: the throttle applies.
+    let store = self::store();
+    store.apply_event(&failed(), None, T0).unwrap();
+    sent(&store, T0);
+    store.apply_event(&resolved(failed()), None, T0 + MINUTE).unwrap();
+    let back = item(&store.apply_event(&failed(), None, T0 + 2 * MINUTE).unwrap());
+    assert_eq!(
+        (back.push.status, back.push.reason),
+        (S::Suppressed, Some(R::Throttled))
+    );
+}
+
+#[test]
 fn a_reopening_cancels_a_recovery_still_waiting() {
     let store = store();
     let it = item(&store.apply_event(&failed(), None, T0).unwrap());

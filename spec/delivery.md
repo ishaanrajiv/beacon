@@ -50,7 +50,8 @@ Every one but `throttle` is set in `beacon.toml` (`spec/config.md`); `throttle` 
 | `repeat` | An unacknowledged alert's next repeat came due |
 
 `state` is what the decision reads: the active silences, which sources are unobserved, the time of
-the last push sent per `(kind, key)`, the alert's flapping flag, and the server's `push` setting.
+the last push sent per `(kind, key)`, whether the item's last push on the phone is its recovery,
+the alert's flapping flag, and the server's `push` setting.
 `presence` is every device with its last heartbeat and `viewing`. The decision is one of: **send**
 (`push.status` becomes `queued`), **hold** until a time (`held`, with a reason), **none**, or
 **suppress** (with a reason).
@@ -79,7 +80,9 @@ those triggers.
 7. **Throttled?** *Skipped for `repeat`, `woke` and `caught_up`.* A push for the same `(kind, key)`
    was sent (decided `send`, whether or not Apple has taken it yet) within the kind's `throttle` →
    suppress, `throttled`. A kind with `throttle = "none"`
-   is never throttled.
+   is never throttled. A `reopened` alert whose last push a device has (sent) or may have (an
+   attempt `accepted` or `uncertain`) is its recovery is not throttled either: the phone says it
+   is back, and the reopening must replace that.
 8. **Send.** With `push = false` in beacon.toml → suppress, `push_off` (everything above is still
    decided and recorded, so the decisions can be compared before push is turned on). Otherwise →
    send ("Sending").
