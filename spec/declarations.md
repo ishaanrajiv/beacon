@@ -305,6 +305,11 @@ folder with `source = "trail"` and name it in the rule's `kind` (`spec/api.md`, 
 - A metric rule (a snapshot entry) names an alert, action, update or record that isn't a one-off
   alert; an event rule (a notice) names a one-off alert, an update or a record. Anything else
   falls back to the severity's built-in kind.
+- A firing entry keeps the kind its alert opened as until it clears. A rule that gains, loses or
+  changes its `kind` while it is firing (a deploy) is the same incident under Trail's key: the
+  open alert is updated, nothing recovers and nothing new is pushed, and the rule's new kind
+  applies from its next firing. Only when the entry can no longer be the old kind (a publish
+  removed it, or a fact it needs is gone) does the old alert close and a new one open.
 
 ## Reaching the server
 

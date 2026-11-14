@@ -1967,6 +1967,73 @@ fn a_trail_entry_naming_a_kind_becomes_that_kind() {
 }
 
 #[test]
+fn a_firing_trail_alert_keeps_its_kind_until_it_clears() {
+    let store = trail_store();
+    let key = "shop.disk{disk=data}";
+    // Firing as the severity's built-in kind, before the rule named one.
+    let (first, _) = store
+        .apply_trail_snapshot(T0, vec![disk(key, None, 96.0)], T0)
+        .unwrap();
+    let severe = store.item(first.opened[0], T0).unwrap().unwrap();
+    assert_eq!(severe.kind, "trail.severe");
+    // The rule gains a kind while it fires. It is the same incident: nothing opens, nothing
+    // resolves, and so nothing is pushed for a rule that only changed its words.
+    let (during, fallbacks) = store
+        .apply_trail_snapshot(
+            T0 + MINUTE,
+            vec![disk(key, Some("trail.disk_full"), 97.0)],
+            T0 + MINUTE,
+        )
+        .unwrap();
+    assert!(fallbacks.is_empty(), "{fallbacks:?}");
+    assert!(
+        during.opened.is_empty() && during.resolved.is_empty(),
+        "{during:?}"
+    );
+    assert_eq!(during.updated, [severe.id]);
+    // Once it clears, the next firing is the kind the rule names.
+    let (gone, _) = store
+        .apply_trail_snapshot(T0 + 2 * MINUTE, vec![], T0 + 2 * MINUTE)
+        .unwrap();
+    assert_eq!(gone.resolved, [severe.id]);
+    let (back, _) = store
+        .apply_trail_snapshot(
+            T0 + 3 * MINUTE,
+            vec![disk(key, Some("trail.disk_full"), 98.0)],
+            T0 + 3 * MINUTE,
+        )
+        .unwrap();
+    let named = store.item(back.opened[0], T0 + 3 * MINUTE).unwrap().unwrap();
+    assert_eq!(named.kind, "trail.disk_full");
+    // And the other way: a rule that drops its kind while firing stays the kind it opened as.
+    let (dropped, _) = store
+        .apply_trail_snapshot(T0 + 4 * MINUTE, vec![disk(key, None, 98.5)], T0 + 4 * MINUTE)
+        .unwrap();
+    assert!(
+        dropped.opened.is_empty() && dropped.resolved.is_empty(),
+        "{dropped:?}"
+    );
+    assert_eq!(dropped.updated, [named.id]);
+    // Another series of the same rule is its own incident, and opens as the rule's kind now.
+    let (other, _) = store
+        .apply_trail_snapshot(
+            T0 + 5 * MINUTE,
+            vec![disk(key, None, 98.5), disk("shop.disk{disk=logs}", None, 91.0)],
+            T0 + 5 * MINUTE,
+        )
+        .unwrap();
+    assert_eq!(other.opened.len(), 1);
+    assert_eq!(
+        store
+            .item(other.opened[0], T0 + 5 * MINUTE)
+            .unwrap()
+            .unwrap()
+            .kind,
+        "trail.severe"
+    );
+}
+
+#[test]
 fn a_trail_entry_whose_kind_doesnt_fit_falls_back_to_its_severity() {
     let store = trail_store();
     let mut no_label = disk("b", Some("trail.disk_full"), 96.0);

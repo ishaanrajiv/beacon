@@ -74,11 +74,22 @@ impl Store {
         let stale_after = Duration::from_ms(self.settings().trail_stale_after);
         self.write(now, |w| {
             let covered = w.trail_covered();
+            let open = w.open_trail_kinds()?;
             let mut entries = Vec::new();
             let mut fallbacks = Vec::new();
             for (i, alert) in firing.iter().enumerate() {
                 let at = format!("trail firing[{i}]");
-                let (entry, fallback) = w.trail_entry(&at, alert, &covered, false);
+                let (mut entry, fallback) = w.trail_entry(&at, alert, &covered, false);
+                // Already open as another kind (its rule gained, lost or changed `kind` while
+                // firing): it is the same incident, so it stays the kind it opened as until it
+                // clears. Otherwise the old item would recover and a new one open and push, for
+                // a rule that only changed its words.
+                if let Some(kind) = open.get(&alert.key)
+                    && *kind != entry.kind
+                    && let Some(same) = w.trail_entry_as(&at, alert, kind, &covered)
+                {
+                    entry = same;
+                }
                 entries.push(entry);
                 fallbacks.extend(fallback);
             }
@@ -165,6 +176,41 @@ impl Tx<'_, '_> {
         covered
     }
 
+    /// The kind of each alert or action of `trail` that is open now, by Trail's key.
+    fn open_trail_kinds(&self) -> Result<BTreeMap<String, String>> {
+        let open = rows::query(
+            self.conn,
+            "WHERE source = ?1 AND state IN ('open', 'dismissed', 'snoozed') ORDER BY id",
+            [TRAIL_SOURCE],
+        )?;
+        let mut kinds = BTreeMap::new();
+        for row in open {
+            if row.life.is_open() {
+                kinds.entry(row.key).or_insert(row.kind);
+            }
+        }
+        Ok(kinds)
+    }
+
+    /// Trail's firing entry as `kind`, the kind its open item has: None when the snapshot no
+    /// longer covers that kind (a publish removed it) or the entry can't be it.
+    fn trail_entry_as(
+        &self,
+        at: &str,
+        alert: &TrailAlert,
+        kind: &str,
+        covered: &BTreeSet<String>,
+    ) -> Option<SnapshotEntry> {
+        if !covered.contains(kind) {
+            return None;
+        }
+        if TRAIL_BUILTIN.contains(&kind) {
+            return Some(builtin_entry(alert, kind));
+        }
+        self.named_trail_entry(at, alert, &Value::String(kind.to_string()), covered, false)
+            .ok()
+    }
+
     /// The entry Trail's alert becomes: the kind it names when that fits, else its severity's
     /// built-in kind and the problem.
     fn trail_entry(
@@ -174,18 +220,7 @@ impl Tx<'_, '_> {
         covered: &BTreeSet<String>,
         notice: bool,
     ) -> (SnapshotEntry, Option<Fallback>) {
-        let builtin_entry = || {
-            let mut slots = Map::new();
-            slots.insert("title".into(), Value::String(alert.title.clone()));
-            slots.insert("body".into(), Value::String(alert.body.clone()));
-            SnapshotEntry {
-                kind: alert.builtin.clone(),
-                key: alert.key.clone(),
-                slots,
-                labels: alert.labels.clone(),
-                ..SnapshotEntry::default()
-            }
-        };
+        let builtin_entry = || builtin_entry(alert, &alert.builtin);
         let Some(named) = &alert.kind else {
             return (builtin_entry(), None);
         };
@@ -295,6 +330,20 @@ impl Tx<'_, '_> {
             Some(problem) => Err(problem),
             None => Ok(entry),
         }
+    }
+}
+
+/// Trail's alert as one of Beacon's built-in Trail kinds, which carry its title and body in slots.
+fn builtin_entry(alert: &TrailAlert, kind: &str) -> SnapshotEntry {
+    let mut slots = Map::new();
+    slots.insert("title".into(), Value::String(alert.title.clone()));
+    slots.insert("body".into(), Value::String(alert.body.clone()));
+    SnapshotEntry {
+        kind: kind.to_string(),
+        key: alert.key.clone(),
+        slots,
+        labels: alert.labels.clone(),
+        ..SnapshotEntry::default()
     }
 }
 
