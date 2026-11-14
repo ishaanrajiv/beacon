@@ -384,7 +384,8 @@ fn body<T: DeserializeOwned>(
 
 fn health(app: &App) -> Reply {
     let devices = app.store.devices();
-    let ok = app.store.version().is_ok() && devices.is_ok();
+    let unreadable = app.store.unreadable();
+    let ok = app.store.version().is_ok() && devices.is_ok() && unreadable.is_ok();
     Reply::json(
         if ok { 200 } else { 503 },
         json!({
@@ -394,6 +395,7 @@ fn health(app: &App) -> Reply {
             "push": app.config.settings.push,
             "apns": if app.apns.is_some() { "ok" } else { "unconfigured" },
             "devices": devices.map_or(0, |d| d.len()),
+            "unreadable_sources": unreadable.map_or(0, |u| u.len()),
         }),
     )
 }

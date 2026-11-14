@@ -8,7 +8,7 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::rows::{self, Row};
 use beacon_core::Problem;
 use beacon_core::builtin;
-use beacon_core::decl::{Check, Declarations, Kind};
+use beacon_core::decl::{Declarations, Kind};
 use beacon_core::duration::{Duration, MINUTE};
 use beacon_core::item::Item;
 use beacon_core::lifecycle::{FireTarget, Input, Life, Outcome, fire_target};
@@ -141,18 +141,87 @@ const REASON_MAX: usize = 100;
 /// The reason a source that stopped posting snapshots is unobserved.
 pub const STALE_REASON: &str = "It stopped reporting.";
 
-/// Every published source's declarations; one that no longer reads is left out.
-pub(crate) fn load_registry(conn: &Connection) -> Result<Vec<Declarations>> {
-    let mut stmt = conn.prepare("SELECT decl FROM registry ORDER BY source")?;
-    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-    let mut out = Vec::new();
-    for row in rows {
-        let value: Value = serde_json::from_str(&row?)?;
-        if let Ok(decl) = Declarations::from_json(value, &Check::default()) {
-            out.push(decl);
+/// A published source whose stored declarations, or some of whose kinds, Beacon can't read back
+/// (written by a version that stored them differently). It is kept and reported, never dropped:
+/// `GET /v1/registry` shows its `problem`, `GET /v1/health` counts it, and events for what can't
+/// be read are refused with a fix that says to publish it again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Unreadable {
+    pub source: String,
+    /// The kinds that can't be read; empty when the source itself can't be.
+    pub kinds: Vec<String>,
+    pub problem: Problem,
+    /// Why, in a few words.
+    #[serde(skip)]
+    pub why: String,
+    pub published: i64,
+}
+
+impl Unreadable {
+    fn new(source: &str, kinds: Vec<String>, why: &str, published: i64) -> Unreadable {
+        let what = if kinds.is_empty() {
+            format!("its declarations as stored can't be read: {why}")
+        } else {
+            let names: Vec<String> = kinds.iter().map(|k| format!("`{k}`")).collect();
+            format!("{} as stored can't be read: {why}", names.join(", "))
+        };
+        Unreadable {
+            source: source.to_string(),
+            kinds,
+            problem: Problem::new(
+                format!("registry source {source}"),
+                what,
+                format!(
+                    "publish `{source}` again (`beacon publish <its folder>`); until then its events are refused"
+                ),
+            ),
+            why: why.to_string(),
+            published,
         }
     }
-    Ok(out)
+
+    /// Whether events of `kind` are refused because of it.
+    pub fn covers(&self, kind: &str) -> bool {
+        self.kinds.is_empty() || self.kinds.iter().any(|k| k == kind)
+    }
+}
+
+/// Every published source's declarations, read tolerantly, and the sources that can't all be
+/// read. Nothing stored can fail the start.
+pub(crate) fn load_registry(conn: &Connection) -> Result<(Vec<Declarations>, Vec<Unreadable>)> {
+    let mut stmt = conn.prepare("SELECT source, decl, published FROM registry ORDER BY source")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    let mut unreadable = Vec::new();
+    for row in rows {
+        let (source, text, published) = row?;
+        let read = serde_json::from_str::<Value>(&text)
+            .map_err(|e| format!("it is not JSON: {e}"))
+            .and_then(|value| Declarations::from_stored(&value));
+        match read {
+            Err(why) => unreadable.push(Unreadable::new(&source, Vec::new(), &why, published)),
+            Ok(stored) if stored.decl.source != source => unreadable.push(Unreadable::new(
+                &source,
+                Vec::new(),
+                &format!("they name source `{}`", stored.decl.source),
+                published,
+            )),
+            Ok(stored) => {
+                if let Some((_, why)) = stored.unreadable.iter().next() {
+                    let kinds = stored.unreadable.keys().cloned().collect();
+                    unreadable.push(Unreadable::new(&source, kinds, why, published));
+                }
+                out.push(stored.decl);
+            }
+        }
+    }
+    Ok((out, unreadable))
 }
 
 impl Store {
@@ -170,7 +239,7 @@ impl Store {
             ));
         }
         let mut inner = self.lock()?;
-        let text = decl.to_json().to_string();
+        let text = decl.to_stored().to_string();
         inner
             .conn
             .prepare_cached(
@@ -204,6 +273,11 @@ impl Store {
     /// Every source's declarations, Beacon's own first, then by source.
     pub fn all_declarations(&self) -> Result<Vec<Declarations>> {
         Ok(self.lock()?.registry.values().cloned().collect())
+    }
+
+    /// The published sources Beacon can't (all) read back, by source.
+    pub fn unreadable(&self) -> Result<Vec<Unreadable>> {
+        Ok(self.lock()?.unreadable.values().cloned().collect())
     }
 
     // ---------- events ----------
@@ -436,6 +510,7 @@ fn check_category(at: &str, kind_name: &str, kind: &Kind, category: Option<&str>
     )]
 }
 
+/// `at` names the field, like `event kind`.
 fn undeclared(at: &str, name: &str, registry: &BTreeMap<String, Declarations>) -> Error {
     let all: Vec<&str> = registry
         .values()
@@ -449,17 +524,40 @@ fn undeclared(at: &str, name: &str, registry: &BTreeMap<String, Declarations>) -
     };
     Error::new(
         ErrorKind::Undeclared,
-        format!("{at} kind"),
+        at,
         format!("`{name}` is not a declared kind"),
         fix,
     )
 }
 
 impl Tx<'_, '_> {
+    /// The problem of a stored source that can't be read, when it covers `kind`.
+    fn unreadable_kind(&self, at: &str, kind: &str) -> Option<Problem> {
+        let unreadable = self.unreadable.get(source_of(kind))?;
+        unreadable.covers(kind).then(|| {
+            Problem::new(
+                at,
+                format!(
+                    "`{kind}` was published, but Beacon can't read it as stored: {}",
+                    unreadable.why
+                ),
+                unreadable.problem.fix.clone(),
+            )
+        })
+    }
+
+    /// The error for a kind the registry doesn't have: unreadable as stored, or undeclared.
+    fn refuse_kind(&self, at: &str, kind: &str) -> Error {
+        match self.unreadable_kind(at, kind) {
+            Some(problem) => Error::many(ErrorKind::Undeclared, vec![problem]),
+            None => undeclared(at, kind, self.registry),
+        }
+    }
+
     /// Checks and applies one event.
     pub(crate) fn event(&mut self, event: &Event, at: &str, check_key: bool) -> Result<EventAnswer> {
         let Some((decl, kind)) = self.kind(&event.kind) else {
-            return Err(undeclared(at, &event.kind, self.registry));
+            return Err(self.refuse_kind(&format!("{at} kind"), &event.kind));
         };
         if let Some(source) = &event.source
             && source != &decl.source
@@ -627,6 +725,11 @@ impl Tx<'_, '_> {
     /// kinds and has already been mapped.
     fn snapshot(&mut self, snap: &Snapshot, builtin: bool) -> Result<SnapshotAnswer> {
         let Some(decl) = self.registry.get(&snap.source) else {
+            if let Some(unreadable) = self.unreadable.get(&snap.source) {
+                let mut problem = unreadable.problem.clone();
+                problem.at = "snapshot source".into();
+                return Err(Error::many(ErrorKind::Undeclared, vec![problem]));
+            }
             return Err(Error::new(
                 ErrorKind::Undeclared,
                 "snapshot source",
@@ -692,10 +795,14 @@ impl Tx<'_, '_> {
         };
         let mut unfit = Vec::new();
         for (i, name) in covered.iter().enumerate() {
+            let at = format!("snapshot kinds[{i}]");
             match decl.kinds.get(name) {
                 Some(kind) if builtin || kind.class.has_lifecycle() => {}
+                None if self.unreadable_kind(&at, name).is_some() => {
+                    unfit.extend(self.unreadable_kind(&at, name));
+                }
                 _ => unfit.push(invalid(
-                    format!("snapshot kinds[{i}]"),
+                    at,
                     format!(
                         "`{name}` is not an alert or action kind of source `{}`",
                         snap.source

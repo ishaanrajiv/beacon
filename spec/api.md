@@ -115,7 +115,7 @@ the bare prefix (`/beacon/`) gets a `200` rather than a `404`.
 ### `GET /v1/health`
 
 ```json
-{"ok": true, "version": "0.1.0", "started": 1794571200000, "push": true, "apns": "ok", "devices": 1}
+{"ok": true, "version": "0.1.0", "started": 1794571200000, "push": true, "apns": "ok", "devices": 1, "unreadable_sources": 0}
 ```
 
 | Field | |
@@ -124,6 +124,7 @@ the bare prefix (`/beacon/`) gets a `200` rather than a `404`.
 | `push` | `push` in beacon.toml: false means decisions are made and recorded but nothing is sent |
 | `apns` | `ok`, or `unconfigured` when there is no signing key |
 | `devices` | registered devices |
+| `unreadable_sources` | published sources whose stored declarations, or some of whose kinds, Beacon can't read back (`spec/declarations.md`, "Reading back what was stored"); `GET /v1/registry` says which |
 
 ## The registry
 
@@ -144,7 +145,8 @@ the bare prefix (`/beacon/`) gets a `200` rather than a `404`.
       "observed": true,
       "reason": null,
       "last_snapshot": 1794571100000,
-      "stale_after": "30m"
+      "stale_after": "30m",
+      "problem": null
     }
   ]
 }
@@ -153,6 +155,10 @@ the bare prefix (`/beacon/`) gets a `200` rather than a `404`.
 Sorted by `source`. `beacon` and `trail` are listed with `builtin: true` and `published: null`.
 `observed` is false while the source is unobserved (`spec/delivery.md`, "Sources"), and `reason`
 says why. `last_snapshot` and `stale_after` are null for a source that has never posted a snapshot.
+`problem` is null, or `{at, message, fix}` when Beacon can't read back what was published for the
+source, or some of its kinds (`spec/declarations.md`, "Reading back what was stored"): `kinds`
+counts only those it can read (0 when it can read none, and then `name` is the source and `icon`
+`bell`), and the fix says to publish it again.
 
 ### `GET /v1/registry/{source}`
 

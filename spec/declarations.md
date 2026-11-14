@@ -288,6 +288,8 @@ keeps them:
    fields as the TOML with every default filled in (below).
 2. The server checks them again (with its `banned_words`), stores them in SQLite in one
    transaction, and answers `200`. A source's new declarations replace its old ones entirely.
+   What it stores is the JSON form below stamped with `"format": 1`, so a later version can tell
+   what wrote it; each item keeps the kind it was made with the same way.
 3. An event or snapshot entry of a kind the registry doesn't have is refused with `422`, and the
    fix names the closest declared kind and says to declare and publish it.
 4. Items already stored keep the text, class and push they were given. Republishing never
@@ -296,6 +298,25 @@ keeps them:
 
 A deploy pipeline runs `beacon publish` for a service after deploying it, so the server always
 knows the kinds the running code sends.
+
+### Reading back what was stored
+
+The checks run when declarations are published, and stay as strict as above. Reading back what
+Beacon itself stored (at start, after each publish, and each item's kind) is tolerant, so a
+rollback, or an upgrade that changed a field, never takes a source down:
+
+- A field this version doesn't know is ignored, at every level (the source, a kind, a custom
+  action), and so is `format`.
+- A missing field takes its default (the table above; `name` defaults to the source, `icon` to
+  `bell`, `push` to `none` on a record). Stored declarations aren't checked again.
+- A kind that still can't be read (no `class` or `title`, a value this version can't read) is kept
+  out of the registry, and so is a source that can't be read at all (not an object, no `source`).
+  Neither is dropped silently: the source is listed by `GET /v1/registry` with a `problem`
+  (`spec/api.md`), `GET /v1/health` counts it in `unreadable_sources`, the server says so once on
+  stderr at start, and an event, snapshot or snapshot `kinds` entry naming what can't be read is
+  refused (`422`) with a fix that says to publish the source again. Its other kinds work as usual.
+- An item whose stored kind can't be read still loads: it keeps its text, push level and buttons,
+  and is said once on stderr.
 
 ### The JSON form
 

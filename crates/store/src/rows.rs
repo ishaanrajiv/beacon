@@ -1,7 +1,7 @@
 //! An item's row: read whole, changed in memory by a core transition, written whole.
 
 use crate::error::{Error, ErrorKind, Result};
-use beacon_core::decl::Kind;
+use beacon_core::decl::{Action, CustomAction, Kind};
 use beacon_core::delivery::{Settings, Subject};
 use beacon_core::item::{AlertInfo, Item, Push};
 use beacon_core::lifecycle::{Button, Life, Times};
@@ -153,6 +153,91 @@ fn get_opt_word<T: DeserializeOwned>(r: &SqlRow<'_>, column: &str) -> rusqlite::
         .transpose()
 }
 
+/// The kind an item was made with, read tolerantly (`Kind::from_stored`). One that still can't
+/// be read is reported once and stood in for by a kind made from what the row shows, so the item
+/// still loads: it keeps its text, push level and buttons.
+fn stored_kind(r: &SqlRow<'_>, class: Class) -> rusqlite::Result<Kind> {
+    let text: String = r.get("kind_decl")?;
+    let read = serde_json::from_str::<Value>(&text)
+        .map_err(|e| format!("it is not JSON: {e}"))
+        .and_then(|value| Kind::from_stored(&value));
+    match read {
+        Ok(kind) => Ok(kind),
+        Err(why) => {
+            let id: i64 = r.get("id")?;
+            report_unreadable_kind(id, &why);
+            Ok(stand_in_kind(
+                class,
+                get_word(r, "push_level")?,
+                &r.get::<_, String>("title")?,
+                &r.get::<_, String>("body")?,
+                r.get("preview")?,
+                r.get("one_off")?,
+                &get_json::<Vec<Button>>(r, "buttons")?,
+            ))
+        }
+    }
+}
+
+/// Says once per item, on stderr, that its stored kind can't be read.
+fn report_unreadable_kind(id: i64, why: &str) {
+    static REPORTED: std::sync::Mutex<std::collections::BTreeSet<i64>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let first = REPORTED
+        .lock()
+        .map(|mut reported| reported.insert(id))
+        .unwrap_or(false);
+    if first {
+        eprintln!(
+            "beacon: item {id}'s stored kind can't be read ({why}); it keeps its text and buttons, and a new event re-renders it as stored"
+        );
+    }
+}
+
+/// A kind standing in for one that can't be read: the row's own text as fixed templates.
+fn stand_in_kind(
+    class: Class,
+    push: PushLevel,
+    title: &str,
+    body: &str,
+    preview: Option<String>,
+    one_off: bool,
+    buttons: &[Button],
+) -> Kind {
+    let fixed = |text: &str| text.replace('{', "{{").replace('}', "}}");
+    let actions = buttons
+        .iter()
+        .map(|button| match button.builtin() {
+            Some(action) => Action::Builtin(action),
+            None => Action::Custom(CustomAction {
+                id: button.id.clone(),
+                label: button.label.clone(),
+                url: button.url.as_deref().map(fixed),
+            }),
+        })
+        .collect();
+    Kind {
+        class,
+        push,
+        description: String::new(),
+        title: fixed(title),
+        body: fixed(body),
+        facts: BTreeMap::new(),
+        slots: BTreeMap::new(),
+        open: None,
+        actions,
+        time_bound: false,
+        repeat: Vec::new(),
+        throttle: beacon_core::duration::Duration::from_ms(beacon_core::decl::THROTTLE_DEFAULT),
+        preview,
+        recovered: None,
+        recovered_body: None,
+        context: false,
+        one_off,
+        categories: Vec::new(),
+    }
+}
+
 pub(crate) fn from_sql(r: &SqlRow<'_>) -> rusqlite::Result<Row> {
     let class: Class = get_word(r, "class")?;
     let state: Option<ItemState> = get_opt_word(r, "state")?;
@@ -174,7 +259,7 @@ pub(crate) fn from_sql(r: &SqlRow<'_>) -> rusqlite::Result<Row> {
         labels: get_json(r, "labels")?,
         facts: get_json(r, "facts")?,
         slots: get_json(r, "slots")?,
-        decl: get_json(r, "kind_decl")?,
+        decl: stored_kind(r, class)?,
         buttons: get_json(r, "buttons")?,
         created: r.get("created")?,
         updated: r.get("updated")?,
@@ -290,7 +375,7 @@ pub(crate) fn save(conn: &Connection, row: &Row) -> Result<()> {
             json(&row.labels)?,
             json(&row.facts)?,
             json(&row.slots)?,
-            json(&row.decl)?,
+            row.decl.to_stored().to_string(),
             json(&row.buttons)?,
             row.updated,
             row.life.state.map(word),

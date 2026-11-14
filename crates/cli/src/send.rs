@@ -7,7 +7,7 @@ use crate::{Done, Fail, out};
 use beacon_core::Problem;
 use beacon_core::decl::{self, Check, Declarations, FactBase, Kind};
 use beacon_core::duration::Duration;
-use beacon_core::names::{RESERVED_SOURCES, source_of};
+use beacon_core::names::source_of;
 use beacon_core::problem::closest;
 use serde_json::{Map, Value, json};
 use std::path::Path;
@@ -62,11 +62,17 @@ impl<'a> Kinds<'a> {
             )]));
         }
         let answer = answer.into_result()?;
-        let check = Check {
-            builtin: RESERVED_SOURCES.contains(&source),
-            ..Check::default()
-        };
-        Declarations::from_json(answer.json(), &check).map_err(Fail::refused)
+        // The server checked them when they were published; read them as tolerantly as it reads
+        // its own, so a newer server's fields don't stop the command.
+        Declarations::from_stored(&answer.json())
+            .map(|stored| stored.decl)
+            .map_err(|why| {
+                Fail::refused(vec![Problem::new(
+                    format!("source {source}"),
+                    format!("Beacon's declarations for `{source}` can't be read: {why}"),
+                    "check --server points at Beacon, or pass --decls <folder> to check against a local kinds.toml",
+                )])
+            })
     }
 }
 

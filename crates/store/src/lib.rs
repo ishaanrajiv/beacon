@@ -30,7 +30,9 @@ mod tests;
 pub use clients::{Heartbeat, NewSilence, PressAnswer, SeenTarget, SilenceView};
 pub use error::{Error, ErrorKind, Result};
 pub use jobs::{Attempt, Due, PushJob, PushNext, Ran, SinkRecord};
-pub use producers::{Event, EventAnswer, EventOutcome, EventState, Snapshot, SnapshotAnswer, SnapshotEntry};
+pub use producers::{
+    Event, EventAnswer, EventOutcome, EventState, Snapshot, SnapshotAnswer, SnapshotEntry, Unreadable,
+};
 pub use reads::{
     Acted, AttemptView, DeviceView, HistoryEntry, Inbox, InboxQuery, ItemDetail, SourceView, VisitSummary,
 };
@@ -59,6 +61,9 @@ pub(crate) struct Inner {
     /// Every source's declarations: Beacon's own, then the published ones. Read from the
     /// database at open and after each publish.
     pub registry: BTreeMap<String, Declarations>,
+    /// Published sources whose stored declarations (or some of whose kinds) can't be read, by
+    /// source: kept and reported, never dropped silently.
+    pub unreadable: BTreeMap<String, Unreadable>,
     /// Beacon's own declarations, with `[trail] open` applied.
     pub builtin: Vec<Declarations>,
 }
@@ -117,6 +122,7 @@ impl Store {
         let mut inner = Inner {
             conn,
             registry: BTreeMap::new(),
+            unreadable: BTreeMap::new(),
             builtin,
         };
         inner.reload_registry()?;
@@ -165,6 +171,7 @@ impl Store {
         let Inner {
             conn,
             registry,
+            unreadable,
             builtin: _,
         } = &mut *inner;
         let tx = conn
@@ -172,6 +179,7 @@ impl Store {
             .map_err(|e| Error::sql("can't start a write", &e))?;
         let value = {
             let mut w = engine::Tx::new(&tx, &self.settings, registry, now);
+            w.unreadable = unreadable;
             f(&mut w)?
         };
         tx.commit().map_err(|e| Error::sql("can't commit", &e))?;
@@ -203,10 +211,12 @@ impl Inner {
         for decl in &self.builtin {
             registry.insert(decl.source.clone(), decl.clone());
         }
-        for decl in producers::load_registry(&self.conn)? {
+        let (published, unreadable) = producers::load_registry(&self.conn)?;
+        for decl in published {
             registry.insert(decl.source.clone(), decl);
         }
         self.registry = registry;
+        self.unreadable = unreadable.into_iter().map(|u| (u.source.clone(), u)).collect();
         Ok(())
     }
 }

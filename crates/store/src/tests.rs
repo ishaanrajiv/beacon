@@ -2236,3 +2236,184 @@ fn a_silence_with_an_idempotency_key_opens_once() {
     let err = store.open_silence_once(&new, "a key", "{}", T0).unwrap_err();
     assert_eq!(err.kind, ErrorKind::Invalid);
 }
+
+// ---------- stored declarations ----------
+
+/// Rewrites a stored declarations row (or an item's kind) with `edit`, as another version might
+/// have written it, with the store closed.
+fn rewrite_stored(path: &std::path::Path, sql: &str, edit: impl Fn(&mut Value)) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let rows: Vec<(String, String)> = conn
+        .prepare(sql)
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    for (id, text) in rows {
+        let mut value: Value = serde_json::from_str(&text).unwrap();
+        edit(&mut value);
+        let table = if sql.contains("registry") {
+            "registry SET decl"
+        } else {
+            "items SET kind_decl"
+        };
+        let column = if sql.contains("registry") { "source" } else { "id" };
+        conn.execute(
+            &format!("UPDATE {table} = ?1 WHERE {column} = ?2"),
+            [value.to_string(), id],
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn stored_declarations_carry_a_format_and_read_back_tolerantly() {
+    let dir = temp_dir("stored");
+    let path = dir.join("beacon.db");
+    {
+        let store = Store::open(&path, Settings::default()).unwrap();
+        store
+            .publish(&parse(BACKUP, &Check::default()).unwrap(), T0)
+            .unwrap();
+        store.apply_event(&failed(), None, T0).unwrap();
+    }
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let stored: String = conn
+        .query_row("SELECT decl FROM registry WHERE source = 'backup'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&stored).unwrap()["format"], 1);
+    let kind: String = conn
+        .query_row("SELECT kind_decl FROM items", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&kind).unwrap()["format"], 1);
+    drop(conn);
+
+    // A newer version wrote fields this one doesn't know: before, the whole source was dropped.
+    rewrite_stored(&path, "SELECT source, decl FROM registry", |v| {
+        v["colour"] = "teal".into();
+        v["kinds"]["backup.failed"]["escalate_after"] = "1h".into();
+    });
+    rewrite_stored(&path, "SELECT CAST(id AS TEXT), kind_decl FROM items", |v| {
+        v["escalate_after"] = "1h".into();
+    });
+    let store = Store::open(&path, Settings::default()).unwrap();
+    assert!(store.unreadable().unwrap().is_empty());
+    let answer = store.apply_event(&failed(), None, T0 + MINUTE).unwrap();
+    assert_eq!(answer.outcome, EventOutcome::Updated);
+    let backup = store.declarations("backup").unwrap().unwrap();
+    assert_eq!(backup, parse(BACKUP, &Check::default()).unwrap());
+}
+
+#[test]
+fn a_stored_source_that_cant_be_read_is_kept_and_reported() {
+    let dir = temp_dir("unreadable");
+    let path = dir.join("beacon.db");
+    let id;
+    {
+        let store = Store::open(&path, Settings::default()).unwrap();
+        for text in [BACKUP, SHIP] {
+            store
+                .publish(&parse(text, &Check::default()).unwrap(), T0)
+                .unwrap();
+        }
+        id = item(&store.apply_event(&failed(), None, T0).unwrap()).id;
+    }
+    // One kind of backup can't be read; ship can't be read at all; an item's kind is garbage.
+    rewrite_stored(&path, "SELECT source, decl FROM registry", |v| {
+        if v["source"] == "backup" {
+            v["kinds"]["backup.failed"]["class"] = "page".into();
+        } else {
+            *v = json!(["not", "declarations"]);
+        }
+    });
+    rewrite_stored(&path, "SELECT CAST(id AS TEXT), kind_decl FROM items", |v| {
+        *v = json!({"class": 3});
+    });
+    let store = Store::open(&path, Settings::default()).unwrap();
+    let unreadable = store.unreadable().unwrap();
+    assert_eq!(unreadable.len(), 2);
+    assert_eq!(unreadable[0].kinds, ["backup.failed"]);
+    assert!(unreadable[1].kinds.is_empty());
+
+    // Both still show in the registry, with their problem.
+    let sources = store.sources().unwrap();
+    let backup = sources.iter().find(|s| s.source == "backup").unwrap();
+    assert!(backup.problem.as_ref().unwrap().message.contains("backup.failed"));
+    assert_eq!(
+        backup.kinds,
+        parse(BACKUP, &Check::default()).unwrap().kinds.len() - 1
+    );
+    let ship = sources.iter().find(|s| s.source == "ship").unwrap();
+    assert!(
+        ship.problem
+            .as_ref()
+            .unwrap()
+            .fix
+            .contains("publish `ship` again")
+    );
+    assert_eq!((ship.kinds, ship.published), (0, Some(T0)));
+
+    // Events for what can't be read are refused with the fix; the rest of the source works.
+    let e = store.apply_event(&failed(), None, T0).unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Undeclared);
+    assert!(
+        e.problems[0].message.contains("can't read it as stored"),
+        "{:?}",
+        e.problems
+    );
+    assert!(e.problems[0].fix.contains("publish `backup` again"));
+    let e = store.apply_event(&ready(1), None, T0).unwrap_err();
+    assert!(
+        e.problems[0].fix.contains("publish `ship` again"),
+        "{:?}",
+        e.problems
+    );
+    let finished = event(
+        "backup.finished",
+        "",
+        json!({"size": "2 GB", "took": 60_000}),
+        json!({}),
+    );
+    store.apply_event(&finished, None, T0).unwrap();
+    let mut snap = Snapshot {
+        source: "ship".into(),
+        observed: true,
+        reason: None,
+        stale_after: None,
+        sent_at: None,
+        kinds: None,
+        firing: vec![],
+    };
+    let e = store.apply_snapshot(&snap, T0).unwrap_err();
+    assert!(e.problems[0].fix.contains("publish `ship` again"));
+    snap.source = "backup".into();
+    snap.kinds = Some(vec!["backup.failed".into()]);
+    let e = store.apply_snapshot(&snap, T0).unwrap_err();
+    assert!(
+        e.problems[0].fix.contains("publish `backup` again"),
+        "{:?}",
+        e.problems
+    );
+
+    // The item whose kind can't be read still loads, with its text and buttons.
+    let detail = store.item_detail(id, T0).unwrap().unwrap();
+    assert_eq!(detail.item.title, "Backup failed");
+    assert!(!detail.item.actions.is_empty());
+    assert!(
+        !store
+            .inbox(&InboxQuery::default(), T0)
+            .unwrap()
+            .needs_you
+            .is_empty()
+    );
+
+    // Publishing again puts it right.
+    store
+        .publish(&parse(BACKUP, &Check::default()).unwrap(), T0 + MINUTE)
+        .unwrap();
+    assert_eq!(store.unreadable().unwrap().len(), 1);
+    store.apply_event(&failed(), None, T0 + MINUTE).unwrap();
+}

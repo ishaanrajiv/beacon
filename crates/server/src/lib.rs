@@ -126,6 +126,10 @@ impl App {
         let store = Store::open_with_devices(&db, &config.devices_db, config.settings.clone())
             .map_err(|e| e.problems)?;
         store.set_trail_open(&config.trail_open).map_err(|e| e.problems)?;
+        // Said once, at start: a source whose stored declarations can't be read back.
+        for unreadable in store.unreadable().map_err(|e| e.problems)? {
+            eprintln!("beacon: {}", unreadable.problem);
+        }
         let apns = match &config.apns {
             None => None,
             Some(apns) => {

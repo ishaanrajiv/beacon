@@ -26,6 +26,8 @@ pub(crate) struct Tx<'a, 'r> {
     pub conn: &'a Connection,
     pub s: &'r Settings,
     pub registry: &'r BTreeMap<String, Declarations>,
+    /// Sources whose stored declarations can't all be read: their events are refused with a fix.
+    pub unreadable: &'r BTreeMap<String, crate::Unreadable>,
     pub now: i64,
     /// A late Trail notice: its decision becomes `late` (`spec/api.md`, `POST /v1/trail`).
     pub late: bool,
@@ -89,10 +91,12 @@ impl<'a, 'r> Tx<'a, 'r> {
         registry: &'r BTreeMap<String, Declarations>,
         now: i64,
     ) -> Self {
+        static NONE: BTreeMap<String, crate::Unreadable> = BTreeMap::new();
         Tx {
             conn,
             s,
             registry,
+            unreadable: &NONE,
             now,
             late: false,
             version: None,

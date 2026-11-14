@@ -20,7 +20,8 @@ store.set_trail_open(&config.trail.open)?;
 | Route | Method |
 |---|---|
 | `GET /v1` (`version`) | `version() -> i64` |
-| `GET /v1/registry` | `sources() -> Vec<SourceView>` |
+| `GET /v1/registry` | `sources() -> Vec<SourceView>` (with each source's `problem`) |
+| `GET /v1/health` | `unreadable() -> Vec<Unreadable>`: published sources it can't (all) read back |
 | `GET /v1/registry/{source}`, `GET /v1/kinds` | `declarations(source) -> Option<Declarations>`, `all_declarations()` |
 | `PUT /v1/registry/{source}` | `publish(&Declarations, now)` (run the checks with `banned_words` first) |
 | `DELETE /v1/registry/{source}` | `unpublish(source) -> bool` |

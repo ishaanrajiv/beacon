@@ -616,6 +616,7 @@ fn snapshots_resolve_what_is_absent_and_an_unobserved_source_mutes_its_alerts() 
         .unwrap()
         .clone();
     assert_eq!(lab_source["observed"], false);
+    assert_eq!(lab_source["problem"], Value::Null);
     lab.later(31 * MINUTE);
     let muted = lab.down().json["item"].clone();
     assert_eq!(muted["push"]["reason"], "unobserved");
@@ -829,6 +830,7 @@ fn dead_tokens_are_pruned_and_retries_are_scheduled() {
     );
     let health = lab.get("/v1/health").json;
     assert_eq!(health["devices"], 0);
+    assert_eq!(health["unreadable_sources"], 0);
     lab.later(MINUTE);
     let note = lab
         .post("/v1/events", &json!({"kind": "lab.note", "slots": {"text": "x"}}))

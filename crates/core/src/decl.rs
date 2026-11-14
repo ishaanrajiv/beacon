@@ -269,6 +269,142 @@ impl Declarations {
     }
 }
 
+// ---------- reading what Beacon stored ----------
+
+/// The format number Beacon stamps on the declarations it stores (`"format"` in the stored JSON),
+/// so a later version can tell what wrote them. Version 1: the JSON form of this crate.
+pub const STORED_FORMAT: u64 = 1;
+
+/// Declarations read back from storage: every kind that could be read, and why the others couldn't.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stored {
+    pub decl: Declarations,
+    /// The `format` it was stamped with; None for declarations stored before the stamp.
+    pub format: Option<u64>,
+    /// Kinds that couldn't be read even tolerantly, with why.
+    pub unreadable: BTreeMap<String, String>,
+}
+
+impl Declarations {
+    /// The JSON Beacon stores: the JSON form, stamped with [`STORED_FORMAT`].
+    pub fn to_stored(&self) -> Value {
+        let mut value = self.to_json();
+        if let Some(map) = value.as_object_mut() {
+            map.insert("format".into(), Value::from(STORED_FORMAT));
+        }
+        value
+    }
+
+    /// Reads declarations Beacon stored, tolerantly: unknown fields are ignored and a missing
+    /// field takes its default, so declarations written by a newer or older version still load.
+    /// A kind that still can't be read is listed in `unreadable` rather than failing the source.
+    /// Nothing is checked: the checks ran when they were published. Err only when the source
+    /// itself can't be read (not an object, no `source`).
+    pub fn from_stored(value: &Value) -> Result<Stored, String> {
+        let Some(map) = value.as_object() else {
+            return Err("the stored declarations are not a JSON object".into());
+        };
+        let Some(source) = map.get("source").and_then(Value::as_str) else {
+            return Err("the stored declarations have no `source`".into());
+        };
+        let name = map
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(source)
+            .to_string();
+        let icon = map
+            .get("icon")
+            .and_then(Value::as_str)
+            .and_then(Icon::parse)
+            .unwrap_or(Icon::Bell);
+        let mut kinds = BTreeMap::new();
+        let mut unreadable = BTreeMap::new();
+        match map.get("kinds") {
+            None | Some(Value::Null) => {}
+            Some(Value::Object(raw)) => {
+                for (kind_name, kind) in raw {
+                    match Kind::from_stored(kind) {
+                        Ok(kind) => {
+                            kinds.insert(kind_name.clone(), kind);
+                        }
+                        Err(why) => {
+                            unreadable.insert(kind_name.clone(), why);
+                        }
+                    }
+                }
+            }
+            Some(_) => return Err("the stored `kinds` is not an object".into()),
+        }
+        Ok(Stored {
+            decl: Declarations {
+                source: source.to_string(),
+                name,
+                icon,
+                kinds,
+            },
+            format: map.get("format").and_then(Value::as_u64),
+            unreadable,
+        })
+    }
+}
+
+impl Kind {
+    /// The JSON an item keeps of the kind it was made with, stamped with [`STORED_FORMAT`].
+    pub fn to_stored(&self) -> Value {
+        let mut value = serde_json::to_value(self).unwrap_or(Value::Null);
+        if let Some(map) = value.as_object_mut() {
+            map.insert("format".into(), Value::from(STORED_FORMAT));
+        }
+        value
+    }
+
+    /// Reads a kind Beacon stored, tolerantly: fields this version doesn't know are ignored, and a
+    /// missing field takes its default (`push` is `none` on a record). Err with why when a field
+    /// it needs (`class`, `title`, `push`) is missing, or a value can't be read.
+    pub fn from_stored(value: &Value) -> Result<Kind, String> {
+        let Some(map) = value.as_object() else {
+            return Err("a stored kind is not a JSON object".into());
+        };
+        let mut known = serde_json::Map::new();
+        for (field, value) in map {
+            if !KIND_FIELDS.contains(&field.as_str()) {
+                continue;
+            }
+            let value = if field == "actions" {
+                stored_actions(value)
+            } else {
+                value.clone()
+            };
+            known.insert(field.clone(), value);
+        }
+        if !known.contains_key("push") && known.get("class").and_then(Value::as_str) == Some("record") {
+            known.insert("push".into(), Value::from("none"));
+        }
+        serde_json::from_value(Value::Object(known)).map_err(|e| format!("a stored kind can't be read: {e}"))
+    }
+}
+
+/// A stored `actions` list with the fields a custom action doesn't know left out.
+fn stored_actions(value: &Value) -> Value {
+    let Some(list) = value.as_array() else {
+        return value.clone();
+    };
+    Value::Array(
+        list.iter()
+            .map(|action| match action.as_object() {
+                Some(custom) => Value::Object(
+                    custom
+                        .iter()
+                        .filter(|(field, _)| CUSTOM_ACTION_FIELDS.contains(&field.as_str()))
+                        .map(|(field, value)| (field.clone(), value.clone()))
+                        .collect(),
+                ),
+                None => action.clone(),
+            })
+            .collect(),
+    )
+}
+
 // ---------- reading the TOML ----------
 
 const FILE_FIELDS: [&str; 4] = ["source", "name", "icon", "kinds"];
