@@ -5,6 +5,10 @@
 export const DEFAULT_URL = "http://127.0.0.1:8210";
 /** The spool's limits (spec/clients.md, "The spool"). */
 export const SPOOL_LIMITS = { files: 1000, bytes: 8 * 1024 * 1024, ageMs: 24 * 60 * 60 * 1000, snapshotAgeMs: 5 * 60 * 1000 };
+const SPOOL_LAST_SEQUENCE = 999_999;
+const SPOOL_NAME_TRIES = 20;
+/** `<ms>-<sequence>.json`, or the older `<ms>-<sequence>-<hex>.json`. */
+const SPOOL_NAME = /^(\d{15})-(\d{6})(?:-[0-9a-f]+)?\.json$/;
 
 /**
  * What Beacon answered. `ok` is true for a 2xx; otherwise `problem` says what went wrong.
@@ -34,8 +38,8 @@ interface SpoolFs {
   mkdir(path: string, options: { recursive: true }): Promise<unknown>;
   readdir(path: string): Promise<string[]>;
   readFile(path: string, encoding: "utf8"): Promise<string>;
-  writeFile(path: string, data: string): Promise<void>;
-  rename(from: string, to: string): Promise<void>;
+  writeFile(path: string, data: string, options: { flag: "wx" }): Promise<void>;
+  link(from: string, to: string): Promise<void>;
   unlink(path: string): Promise<void>;
   stat(path: string): Promise<{ size: number }>;
 }
@@ -103,7 +107,6 @@ class BeaconRuntime {
   droppedTotal = 0;
   /** The spool's clock, for tests. */
   now: () => number = () => Date.now();
-  sequence = 0;
   /** The flush running now: a second waits for it rather than sending the same files again. */
   flushing: Promise<Flushed> | undefined;
 
@@ -228,12 +231,58 @@ class BeaconRuntime {
     return (await import(name)) as SpoolFs;
   }
 
-  /** The spool's request files, oldest first (their names start with the time they were queued). */
+  /** When a request file was queued, and its place among those queued in that millisecond. */
+  position(name: string): [number, number] | undefined {
+    const match = SPOOL_NAME.exec(name);
+    return match ? [Number(match[1]), Number(match[2])] : undefined;
+  }
+
+  /** The spool's request files, oldest first: by the time and sequence their names start with, as numbers. */
   async spooled(fs: SpoolFs, spool: string): Promise<string[]> {
+    let names: string[];
     try {
-      return (await fs.readdir(spool)).filter((n) => n.endsWith(".json") && !n.startsWith(".")).sort();
+      names = (await fs.readdir(spool)).filter((n) => n.endsWith(".json") && !n.startsWith("."));
     } catch {
       return [];
+    }
+    return names.sort((x, y) => {
+      const [a, b] = [this.position(x), this.position(y)];
+      if (a === undefined || b === undefined) return a !== undefined ? -1 : b !== undefined ? 1 : x < y ? -1 : x > y ? 1 : 0;
+      return a[0] - b[0] || a[1] - b[1] || (x < y ? -1 : x > y ? 1 : 0);
+    });
+  }
+
+  /** After every file already there, whatever process wrote it, and never before the clock. */
+  async nextName(fs: SpoolFs, spool: string, now: number): Promise<string> {
+    let [ms, sequence] = [now, 0];
+    for (const name of await this.spooled(fs, spool)) {
+      const at = this.position(name);
+      if (at !== undefined && (at[0] > ms || (at[0] === ms && at[1] >= sequence))) [ms, sequence] = [at[0], at[1] + 1];
+    }
+    if (sequence > SPOOL_LAST_SEQUENCE) [ms, sequence] = [ms + 1, 0];
+    return `${String(ms).padStart(15, "0")}-${String(sequence).padStart(6, "0")}.json`;
+  }
+
+  /**
+   * Writes `data` under a temporary name, then hard-links it to the next name, which fails if another
+   * process took that name first; then it looks again. So no two processes take one name, and no reader
+   * sees half a file.
+   */
+  async publish(fs: SpoolFs, spool: string, data: string, now: number): Promise<void> {
+    const temporary = `.${this.idempotencyKey().slice(0, 16)}.tmp`;
+    await fs.writeFile(`${spool}/${temporary}`, data, { flag: "wx" });
+    try {
+      for (let tries = 0; tries < SPOOL_NAME_TRIES; tries++) {
+        try {
+          await fs.link(`${spool}/${temporary}`, `${spool}/${await this.nextName(fs, spool, now)}`);
+          return;
+        } catch (error) {
+          if ((error as { code?: unknown }).code !== "EEXIST") throw error;
+        }
+      }
+      throw new Error(`another process took each of ${SPOOL_NAME_TRIES} names in a row`);
+    } finally {
+      await this.drop(fs, spool, temporary);
     }
   }
 
@@ -307,10 +356,7 @@ class BeaconRuntime {
         evicted.push(names.shift() ?? "");
         total -= sizes.shift() ?? 0;
       }
-      const sequence = String(this.sequence++ % 1_000_000).padStart(6, "0");
-      const name = `${String(now).padStart(15, "0")}-${sequence}-${this.idempotencyKey().slice(0, 8)}.json`;
-      await fs.writeFile(`${spool}/.${name}.tmp`, data);
-      await fs.rename(`${spool}/.${name}.tmp`, `${spool}/${name}`);
+      await this.publish(fs, spool, data, now);
       for (const old of [...replaced, ...evicted]) await this.drop(fs, spool, old);
       dropped = evicted.length;
       this.droppedTotal += dropped;

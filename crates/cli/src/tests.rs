@@ -933,3 +933,90 @@ fn a_snapshot_whose_replacement_cant_be_written_is_kept() {
     let [kept] = spooled(&dir).try_into().unwrap();
     assert_eq!(kept["body"]["firing"].as_array().map(Vec::len), Some(1));
 }
+
+/// The request files' names, in order.
+fn spool_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".json") && !n.starts_with('.'))
+        .collect();
+    names.sort();
+    names
+}
+
+fn spooled_keys(dir: &Path) -> Vec<String> {
+    spooled(dir)
+        .iter()
+        .map(|f| f["body"]["key"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+fn request_text(key: &str) -> String {
+    json!({"path": "/v1/events", "key": "0".repeat(32), "queued_at": NOW, "body": {"kind": "backup.space", "key": key}})
+        .to_string()
+}
+
+/// A request file as another process would have left it.
+fn another_process_queued(dir: &Path, name: &str, key: &str) {
+    std::fs::write(dir.join(name), request_text(key)).unwrap();
+}
+
+/// `beacon send backup.space --key <key>` while Beacon is away, through the spool in `dir`.
+fn send_while_away(dir: &Path, key: &str) {
+    beacon(&[
+        "send",
+        "backup.space",
+        "used_percent=96",
+        "--key",
+        key,
+        "--decls",
+        &example("backup"),
+        "--spool",
+        dir.to_str().unwrap(),
+        "--server",
+        NOBODY,
+    ])
+    .unwrap();
+}
+
+#[test]
+fn a_new_spool_file_sorts_after_any_already_there_whatever_wrote_it() {
+    let dir = scratch("spool-ahead");
+    // Another process's clock is ahead of this one, and it named its file the old way.
+    another_process_queued(&dir, &format!("{:015}-000003-0a1b2c3d.json", NOW + 5000), "ahead");
+    send_while_away(&dir, "mine");
+    assert_eq!(spooled_keys(&dir), ["ahead", "mine"]);
+    assert_eq!(
+        spool_names(&dir).last().unwrap(),
+        &format!("{:015}-000004.json", NOW + 5000)
+    );
+}
+
+#[test]
+fn within_a_millisecond_the_spool_sequence_goes_on_from_the_highest_there() {
+    let dir = scratch("spool-sequence");
+    another_process_queued(&dir, &format!("{NOW:015}-000500.json"), "theirs");
+    send_while_away(&dir, "mine");
+    assert_eq!(
+        spool_names(&dir),
+        [format!("{NOW:015}-000500.json"), format!("{NOW:015}-000501.json")]
+    );
+    // Past the last sequence, the next millisecond.
+    another_process_queued(&dir, &format!("{NOW:015}-999999.json"), "full");
+    send_while_away(&dir, "next");
+    assert_eq!(
+        spool_names(&dir).last().unwrap(),
+        &format!("{:015}-000000.json", NOW + 1)
+    );
+    assert_eq!(spooled_keys(&dir), ["theirs", "mine", "full", "next"]);
+}
+
+#[test]
+fn a_spool_name_another_process_takes_first_is_not_overwritten() {
+    let dir = scratch("spool-collision");
+    crate::spool::fault::take_next_name(request_text("theirs"));
+    send_while_away(&dir, "mine");
+    assert_eq!(spooled_keys(&dir), ["theirs", "mine"]);
+}

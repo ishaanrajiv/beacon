@@ -239,9 +239,24 @@ folder, the emitters and the `beacon` command keep it instead:
 
 The files are the same for every client, so the Python and TypeScript emitters and the command can
 share one folder, and any of them flushes the others'. One file per request, named
-`<ms since 1970, 15 digits>-<6-digit sequence>-<8 hex>.json`, so the names sort oldest first, and
-written to a temporary name starting with `.` and then renamed, so a reader never sees half of one.
-It holds:
+`<ms since 1970, 15 digits>-<sequence, 6 digits>.json`. Files are listed, and sent, in the order of
+those two numbers, compared as numbers. No lock file is needed to keep that order across processes:
+
+- **Naming.** A writer first lists the folder and finds the greatest `(ms, sequence)` there. The new
+  name's `ms` is the later of its clock and that one's; its sequence is one more than that one's
+  when the `ms` is the same, else 0; past 999999 it is the next `ms` with sequence 0. So a new file
+  never sorts before one already there, whatever process wrote it, and a clock that steps back
+  doesn't reorder. `queued_at` in the file is the writer's clock, which ages it; the name only
+  orders it.
+- **Publishing.** The request is written to a temporary name starting with `.`, then hard-linked
+  to its name, which fails if that name exists, and the temporary name removed. So two processes
+  can't take one name, and a reader never sees half a file. A writer whose name was taken first
+  lists again and tries the next, up to 20 times, then answers that the spool can't be written.
+  The folder must be on a file system with hard links.
+- **Older names.** Files named `<ms>-<sequence>-<hex>.json` by earlier versions are still read,
+  ordered by their `(ms, sequence)` among the rest, and sent.
+
+A file holds:
 
 ```json
 {"path": "/v1/events", "key": "<32 hex>", "queued_at": 1794571200000, "body": {"kind": "backup.failed", "key": "nightly", "facts": {}}}

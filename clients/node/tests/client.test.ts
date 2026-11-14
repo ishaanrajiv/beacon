@@ -2,11 +2,11 @@
 // Run from clients/node: `node --test tests/` (Node 22.18+ runs TypeScript as it is).
 
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { after, afterEach, before, beforeEach, test } from "node:test";
 import * as client from "../beacon_client.ts";
 import * as assistant from "./gen/assistant_kinds.ts";
@@ -380,6 +380,79 @@ test("a newer snapshot replaces a queued one, and an old one is dropped", async 
   const flushed = await client.flush();
   assert.deepEqual([flushed.sent, flushed.dropped], [0, 2]);
   assert.equal(seen.length, 0);
+});
+
+const pad = (ms: number, sequence: number): string => `${String(ms).padStart(15, "0")}-${String(sequence).padStart(6, "0")}`;
+const names = (): string[] =>
+  readdirSync(spool)
+    .filter((n) => n.endsWith(".json") && !n.startsWith("."))
+    .sort();
+const requestText = (key: string): string =>
+  JSON.stringify({ path: "/v1/events", key: "0".repeat(32), queued_at: clock, body: { kind: "backup.space", key } });
+function anotherProcessQueued(name: string, key: string): void {
+  mkdirSync(spool, { recursive: true });
+  writeFileSync(join(spool, name), requestText(key));
+}
+
+test("a new file sorts after any already there, whatever wrote it", async () => {
+  useSpool();
+  // Another process's clock is ahead of this one, and it named its file the old way.
+  anotherProcessQueued(`${pad(clock + 5000, 3)}-0a1b2c3d.json`, "ahead");
+  refuse(1);
+  await client.send("backup.space", { key: "mine" });
+  assert.deepEqual(
+    bodies().map((b) => b["key"]),
+    ["ahead", "mine"],
+  );
+  assert.equal(names().at(-1), `${pad(clock + 5000, 4)}.json`);
+});
+
+test("within a millisecond the sequence goes on from the highest there", async () => {
+  useSpool();
+  anotherProcessQueued(`${pad(clock, 500)}.json`, "theirs");
+  refuse(1);
+  await client.send("backup.space", { key: "mine" });
+  assert.deepEqual(names(), [`${pad(clock, 500)}.json`, `${pad(clock, 501)}.json`]);
+  // Past the last sequence, the next millisecond.
+  anotherProcessQueued(`${pad(clock, 999999)}.json`, "full");
+  refuse(1);
+  await client.send("backup.space", { key: "next" });
+  assert.equal(names().at(-1), `${pad(clock + 1, 0)}.json`);
+  assert.deepEqual(
+    bodies().map((b) => b["key"]),
+    ["theirs", "mine", "full", "next"],
+  );
+});
+
+test("a name another process takes first is not overwritten", async () => {
+  useSpool();
+  const realFs = client.runtime.fs;
+  let taken = false;
+  const firstTaken =
+    (real: (from: string, to: string) => Promise<void>) =>
+    async (from: string, to: string): Promise<void> => {
+      if (!taken && !basename(to).startsWith(".")) {
+        taken = true;
+        writeFileSync(to, requestText("theirs"));
+      }
+      await real(from, to);
+    };
+  client.runtime.fs = async () => {
+    const fs = await realFs.call(client.runtime);
+    return { ...fs, link: firstTaken(fs.link), rename: firstTaken(fs.rename) };
+  };
+  let sent: client.Sent | undefined;
+  try {
+    refuse();
+    sent = await client.send("backup.space", { key: "mine" });
+  } finally {
+    client.runtime.fs = realFs;
+  }
+  assert.equal(sent.queued, true, sent.problem ?? "");
+  assert.deepEqual(
+    bodies().map((b) => b["key"]),
+    ["theirs", "mine"],
+  );
 });
 
 test("a snapshot whose replacement can't be written is kept", async () => {

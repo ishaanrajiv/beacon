@@ -15,7 +15,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Callable, cast
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
@@ -397,6 +397,58 @@ class SpoolTest(unittest.TestCase):
         flushed = beacon_client.flush()
         self.assertEqual((flushed.sent, flushed.dropped), (0, 2))
         self.assertEqual(self.beacon.requests, [])
+
+    def names(self) -> list[str]:
+        return sorted(n for n in os.listdir(self.spool) if n.endswith(".json") and not n.startswith("."))
+
+    def keys(self) -> list[object]:
+        return [cast("dict[str, object]", f["body"])["key"] for f in self.files()]
+
+    def request_text(self, key: str) -> str:
+        body = {"kind": "backup.space", "key": key}
+        return json.dumps({"path": "/v1/events", "key": "0" * 32, "queued_at": self.clock, "body": body})
+
+    def another_process_queued(self, name: str, key: str) -> None:
+        os.makedirs(self.spool, exist_ok=True)
+        Path(self.spool, name).write_text(self.request_text(key))
+
+    def test_a_new_file_sorts_after_any_already_there_whatever_wrote_it(self) -> None:
+        # Another process's clock is ahead of this one, and it named its file the old way.
+        self.another_process_queued(f"{self.clock + 5000:015d}-000003-0a1b2c3d.json", "ahead")
+        self.refuse(1)
+        beacon_client.send("backup.space", key="mine")
+        self.assertEqual(self.keys(), ["ahead", "mine"])
+        self.assertEqual(self.names()[-1], f"{self.clock + 5000:015d}-000004.json")
+
+    def test_within_a_millisecond_the_sequence_goes_on_from_the_highest_there(self) -> None:
+        self.another_process_queued(f"{self.clock:015d}-000500.json", "theirs")
+        self.refuse(1)
+        beacon_client.send("backup.space", key="mine")
+        self.assertEqual(self.names(), [f"{self.clock:015d}-000500.json", f"{self.clock:015d}-000501.json"])
+        # Past the last sequence, the next millisecond.
+        self.another_process_queued(f"{self.clock:015d}-999999.json", "full")
+        self.refuse(1)
+        beacon_client.send("backup.space", key="next")
+        self.assertEqual(self.names()[-1], f"{self.clock + 1:015d}-000000.json")
+        self.assertEqual(self.keys(), ["theirs", "mine", "full", "next"])
+
+    def test_a_name_another_process_takes_first_is_not_overwritten(self) -> None:
+        taken: list[str] = []
+
+        def first_taken(real: Callable[[str, str], None]) -> Callable[[str, str], None]:
+            def publish(src: str, dst: str) -> None:
+                if not taken and not os.path.basename(dst).startswith("."):
+                    taken.append(dst)
+                    Path(dst).write_text(self.request_text("theirs"))
+                real(src, dst)
+
+            return publish
+
+        with mock.patch("os.link", first_taken(os.link)), mock.patch("os.replace", first_taken(os.replace)):
+            self.refuse()
+            sent = beacon_client.send("backup.space", key="mine")
+        self.assertTrue(sent.queued, sent.problem)
+        self.assertEqual(self.keys(), ["theirs", "mine"])
 
     def test_a_snapshot_whose_replacement_cant_be_written_is_kept(self) -> None:
         real_open = open

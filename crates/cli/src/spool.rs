@@ -6,7 +6,8 @@ use crate::args::Args;
 use crate::http::Http;
 use beacon_core::Problem;
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 /// At most this many requests wait; the oldest go first to make room.
 const MAX_FILES: usize = 1000;
@@ -18,6 +19,10 @@ const MAX_AGE_MS: i64 = 24 * 60 * 60 * 1000;
 const SNAPSHOT_MAX_AGE_MS: i64 = 5 * 60 * 1000;
 
 const SNAPSHOTS: &str = "/v1/snapshots";
+/// The highest sequence within one millisecond; the next request takes the next millisecond.
+const LAST_SEQUENCE: u32 = 999_999;
+/// Names a request tries, each taken by another process just first, before the spool gives up.
+const NAME_TRIES: usize = 20;
 
 pub struct Spool {
     pub dir: PathBuf,
@@ -46,6 +51,35 @@ fn random_hex(bytes: usize) -> String {
         buf = nanos.to_be_bytes().iter().copied().cycle().take(bytes).collect();
     }
     buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// When a request file was queued and its place among those queued in that millisecond, from its
+/// name: `<ms>-<sequence>.json`, or the older `<ms>-<sequence>-<hex>.json`.
+fn position(name: &str) -> Option<(i64, u32)> {
+    let stem = name.strip_suffix(".json")?;
+    let (ms, rest) = (stem.get(..15)?, stem.get(15..)?);
+    let rest = rest.strip_prefix('-')?;
+    let (sequence, tail) = (rest.get(..6)?, rest.get(6..)?);
+    let digits = |text: &str| text.bytes().all(|b| b.is_ascii_digit());
+    let random = tail.is_empty()
+        || tail
+            .strip_prefix('-')
+            .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()));
+    if !(digits(ms) && digits(sequence) && random) {
+        return None;
+    }
+    Some((ms.parse().ok()?, sequence.parse().ok()?))
+}
+
+/// Creates `path`, which must not exist yet, holding `data`.
+fn create_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    #[cfg(test)]
+    fault::check()?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(data)
 }
 
 /// Two snapshots of one source covering the same kinds: the newer says all the older did.
@@ -84,7 +118,8 @@ impl Spool {
         )
     }
 
-    /// The request files, oldest first: their names start with the time they were queued.
+    /// The request files, oldest first: by the time and sequence their names start with, as
+    /// numbers. A name that has neither comes last.
     fn names(&self) -> Vec<String> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return Vec::new();
@@ -94,8 +129,50 @@ impl Spool {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.ends_with(".json") && !n.starts_with('.'))
             .collect();
-        names.sort();
+        names.sort_by_cached_key(|name| (position(name).is_none(), position(name), name.clone()));
         names
+    }
+
+    /// The name the next request takes: after every file already there, whatever process wrote
+    /// it, and never before the clock, so a clock that steps back doesn't reorder.
+    fn next_name(&self, now_ms: i64) -> String {
+        let last = self.names().iter().filter_map(|name| position(name)).max();
+        let (mut ms, mut sequence) = match last {
+            Some((ms, sequence)) if ms >= now_ms => (ms, sequence.saturating_add(1)),
+            _ => (now_ms, 0),
+        };
+        if sequence > LAST_SEQUENCE {
+            ms += 1;
+            sequence = 0;
+        }
+        format!("{ms:015}-{sequence:06}.json")
+    }
+
+    /// Writes `data` under a temporary name, then hard-links it to the next name, which fails if
+    /// another process took that name first; then it looks again. So no two processes take one
+    /// name, and no reader sees half a file.
+    fn publish(&self, data: &[u8], now_ms: i64) -> Result<(), Problem> {
+        let temporary = self.path(&format!(".{}.tmp", random_hex(8)));
+        create_file(&temporary, data).map_err(|e| self.problem(format!("can't be written: {e}")))?;
+        let published = self.link(&temporary, now_ms);
+        let _ = std::fs::remove_file(&temporary);
+        published
+    }
+
+    fn link(&self, temporary: &Path, now_ms: i64) -> Result<(), Problem> {
+        for _ in 0..NAME_TRIES {
+            let name = self.path(&self.next_name(now_ms));
+            #[cfg(test)]
+            fault::before_publish(&name);
+            match std::fs::hard_link(temporary, &name) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(self.problem(format!("can't be written: {e}"))),
+            }
+        }
+        Err(self.problem(format!(
+            "can't be written: another process took each of {NAME_TRIES} names in a row"
+        )))
     }
 
     fn path(&self, name: &str) -> PathBuf {
@@ -117,13 +194,14 @@ impl Spool {
         let _ = std::fs::remove_file(self.path(name));
     }
 
-    /// Writes a file under a temporary name, then renames it, so no reader sees half of it.
+    /// Writes a file under a temporary name, then renames it over `name`, so no reader sees half
+    /// of it.
     fn write(&self, name: &str, data: &[u8]) -> std::io::Result<()> {
-        #[cfg(test)]
-        fault::check()?;
-        let temporary = self.path(&format!(".{name}.tmp"));
-        std::fs::write(&temporary, data)?;
-        std::fs::rename(&temporary, self.path(name))
+        let temporary = self.path(&format!(".{}.tmp", random_hex(8)));
+        create_file(&temporary, data)?;
+        std::fs::rename(&temporary, self.path(name)).inspect_err(|_| {
+            let _ = std::fs::remove_file(&temporary);
+        })
     }
 
     /// Keeps the request to send later. Answers how many of the oldest were dropped to make room.
@@ -152,17 +230,7 @@ impl Spool {
             total -= size;
             evicted.push(name);
         }
-        // Within one millisecond, the next number after what is already there keeps the order.
-        let prefix = format!("{now_ms:015}-");
-        let sequence = self
-            .names()
-            .iter()
-            .filter_map(|n| n.strip_prefix(&prefix)?.get(..6)?.parse::<u32>().ok())
-            .max()
-            .map_or(0, |last| last + 1);
-        let name = format!("{prefix}{sequence:06}-{}.json", random_hex(4));
-        self.write(&name, data.as_bytes())
-            .map_err(|e| self.problem(format!("can't be written: {e}")))?;
+        self.publish(data.as_bytes(), now_ms)?;
         for old in replaced.iter().chain(&evicted) {
             self.drop_file(old);
         }
@@ -245,10 +313,27 @@ impl Spool {
 /// Faults the tests inject, one thread at a time, so tests running beside each other don't see them.
 #[cfg(test)]
 pub mod fault {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
+    use std::path::Path;
 
     thread_local! {
         static FAIL_WRITE: Cell<bool> = const { Cell::new(false) };
+        static TAKE_NAME: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    /// Another process writes `contents` under the name the next request file is about to get,
+    /// between this one choosing the name and publishing it.
+    pub fn take_next_name(contents: String) {
+        TAKE_NAME.with(|take| *take.borrow_mut() = Some(contents));
+    }
+
+    pub(super) fn before_publish(path: &Path) {
+        let request = path
+            .file_name()
+            .is_some_and(|name| !name.to_string_lossy().starts_with('.'));
+        if let Some(contents) = TAKE_NAME.with(|take| request.then(|| take.borrow_mut().take()).flatten()) {
+            let _ = std::fs::write(path, contents);
+        }
     }
 
     /// The next file the spool writes on this thread fails, as on a full disk.

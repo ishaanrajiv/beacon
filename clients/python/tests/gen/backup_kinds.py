@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import os
-import itertools
+import re
 import secrets
 import time
 import urllib.error
@@ -20,6 +20,10 @@ SPOOL_MAX_FILES = 1000
 SPOOL_MAX_BYTES = 8 * 1024 * 1024
 SPOOL_MAX_AGE_MS = 24 * 60 * 60 * 1000
 SNAPSHOT_MAX_AGE_MS = 5 * 60 * 1000
+SPOOL_LAST_SEQUENCE = 999_999
+SPOOL_NAME_TRIES = 20
+# `<ms>-<sequence>.json`, or the older `<ms>-<sequence>-<hex>.json`.
+_SPOOL_NAME = re.compile(r"(\d{15})-(\d{6})(?:-[0-9a-f]+)?\.json")
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _MS = timedelta(milliseconds=1)
 
@@ -109,7 +113,6 @@ class _Runtime:
     retry_delays = (1.0, 3.0)
     timeout = 5.0
     dropped_total = 0
-    _sequence = itertools.count()
 
     def url(self) -> str:
         url = _settings.url or os.environ.get("BEACON_URL") or DEFAULT_URL
@@ -265,13 +268,47 @@ class _Runtime:
     def now_ms(self) -> int:
         return time.time_ns() // 1_000_000
 
+    def position(self, name: str) -> tuple[int, int] | None:
+        """When a request file was queued, and its place among those queued in that millisecond."""
+        match = _SPOOL_NAME.fullmatch(name)
+        return (int(match[1]), int(match[2])) if match else None
+
     def spooled(self, spool: str) -> list[str]:
-        """The spool's request files, oldest first (their names start with the time they were queued)."""
+        """The spool's request files, oldest first: by the time and sequence their names start with, as numbers."""
         try:
             names = os.listdir(spool)
         except OSError:
             return []
-        return sorted(name for name in names if name.endswith(".json") and not name.startswith("."))
+        requests = (name for name in names if name.endswith(".json") and not name.startswith("."))
+        return sorted(requests, key=lambda name: (self.position(name) is None, self.position(name) or (0, 0), name))
+
+    def next_name(self, spool: str, now: int) -> str:
+        """After every file already there, whatever process wrote it, and never before the clock."""
+        ms, sequence = now, 0
+        last = max(filter(None, map(self.position, self.spooled(spool))), default=None)
+        if last is not None and last[0] >= now:
+            ms, sequence = last[0], last[1] + 1
+        if sequence > SPOOL_LAST_SEQUENCE:
+            ms, sequence = ms + 1, 0
+        return f"{ms:015d}-{sequence:06d}.json"
+
+    def publish(self, spool: str, data: bytes, now: int) -> None:
+        """Writes `data` under a temporary name, then hard-links it to the next name, which fails if another
+        process took that name first; then it looks again. So no two processes take one name, and no reader
+        sees half a file."""
+        temporary = os.path.join(spool, f".{secrets.token_hex(8)}.tmp")
+        with open(temporary, "xb") as file:
+            file.write(data)
+        try:
+            for _ in range(SPOOL_NAME_TRIES):
+                try:
+                    os.link(temporary, os.path.join(spool, self.next_name(spool, now)))
+                    return
+                except FileExistsError:
+                    continue
+            raise OSError(f"another process took each of {SPOOL_NAME_TRIES} names in a row")
+        finally:
+            self.drop(spool, os.path.basename(temporary))
 
     def read_spooled(self, spool: str, name: str) -> Mapping[str, object] | None:
         try:
@@ -336,11 +373,7 @@ class _Runtime:
             while names and (len(names) >= SPOOL_MAX_FILES or sum(sizes) + len(data) > SPOOL_MAX_BYTES):
                 evicted.append(names.pop(0))
                 sizes.pop(0)
-            name = f"{now:015d}-{next(self._sequence) % 1_000_000:06d}-{secrets.token_hex(4)}.json"
-            temporary = os.path.join(spool, f".{name}.tmp")
-            with open(temporary, "wb") as file:
-                file.write(data)
-            os.replace(temporary, os.path.join(spool, name))
+            self.publish(spool, data, now)
         except OSError as error:
             problem = f"{sent.problem or f'Beacon answered {sent.status}'}\n  and the spool {spool} can't be written: {error}"
             return Sent(ok=False, status=sent.status, outcome=None, item=None, problem=problem)
