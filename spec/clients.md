@@ -262,10 +262,15 @@ The web and iPhone clients are not generated: they read `spec/api.md`. In short:
 
 - Poll `GET /v1/inbox` with `If-None-Match` while active (15 s), and on a push or after an action.
 - Post presence (`POST /v1/presence`) every 30 s while active, and `active: false` on leaving.
+  Web is active while the tab is visible and focused and the person has moved the pointer, pressed
+  a key or touched the page within the last 5 minutes; when that lapses it posts `active: false`
+  (`spec/api.md`, `POST /v1/presence`).
 - Mark seen (`POST /v1/seen`) as `spec/delivery.md`, "Seen and done", says.
 - Show one unread dot per row (`seen` false), and the dot while `dot` is true; no numbers, no app
   icon badge.
-- Show `held` items as an in-app banner, once each, and mark them seen when shown.
+- Show `held` items as an in-app banner, once each, and mark them seen when shown, with their
+  own `client`. A web client's seen doesn't stop an urgent push (`spec/delivery.md`, "Seen and
+  done"), so the phone still rings for one shown only in a browser.
 - Draw each source with its `icon` and `source_name`, and every text as plain text.
 - Web: Needs you, Alerts (open, then resolved), Activity (by day, then by source; records behind a
   filter); Today's "Since you were last here" from `since_last_visit`.

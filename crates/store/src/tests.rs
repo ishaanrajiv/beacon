@@ -126,6 +126,21 @@ fn active(store: &Store, now: i64, viewing: Option<&str>) {
         .unwrap();
 }
 
+/// The iPhone app is in the foreground.
+fn phone_active(store: &Store, now: i64) {
+    store
+        .heartbeat(
+            &Heartbeat {
+                client: "ios".into(),
+                device: "ios-1".into(),
+                active: true,
+                viewing: None,
+            },
+            now,
+        )
+        .unwrap();
+}
+
 fn inactive(store: &Store, now: i64) {
     store
         .heartbeat(
@@ -282,7 +297,7 @@ fn resolving_a_sent_alert_queues_a_passive_recovery() {
 #[test]
 fn an_alert_that_never_pushed_recovers_quietly() {
     let store = store();
-    active(&store, T0, None);
+    phone_active(&store, T0);
     store.apply_event(&failed(), None, T0).unwrap();
     let after = item(&store.apply_event(&resolved(failed()), None, T0 + MINUTE).unwrap());
     // The hold was suppressed `closed`; nothing was sent, so no recovery.
@@ -583,6 +598,7 @@ fn a_hold_while_active_releases_and_pushes_if_unseen() {
 fn a_held_item_seen_or_closed_is_suppressed_at_once() {
     let store = store();
     active(&store, T0, None);
+    phone_active(&store, T0);
     let a = item(&store.apply_event(&ready(1), None, T0).unwrap());
     let b = item(&store.apply_event(&reminder("r1"), None, T0).unwrap());
     let c = item(&store.apply_event(&failed(), None, T0).unwrap());
@@ -613,6 +629,69 @@ fn a_held_item_seen_or_closed_is_suppressed_at_once() {
     store.run_due(T0 + 3 * MINUTE).unwrap();
     assert_eq!(store.item(c.id, T0).unwrap().unwrap().push.status, S::Queued);
     assert!(store.inbox(&InboxQuery::default(), T0).unwrap().held.is_empty());
+}
+
+#[test]
+fn an_open_web_tab_never_holds_or_sees_away_an_urgent_alert() {
+    // Only a web tab is active: the urgent alert goes straight out.
+    let store = store();
+    active(&store, NIGHT, None);
+    let it = item(&store.apply_event(&failed(), None, NIGHT).unwrap());
+    assert_eq!(it.push.level, PushLevel::Urgent);
+    assert_eq!(it.push.status, S::Queued);
+    // A normal push is still held by the tab.
+    let pr = item(&store.apply_event(&ready(1), None, T0).unwrap());
+    assert_eq!((pr.push.status, pr.push.reason), (S::Held, Some(R::Active)));
+
+    // The phone in hand holds it; the tab's banner marking it seen doesn't suppress it.
+    let store = self::store();
+    active(&store, T0, None);
+    phone_active(&store, T0);
+    let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+    assert_eq!((it.push.status, it.push.reason), (S::Held, Some(R::Active)));
+    store
+        .mark_seen(&SeenTarget::Ids(vec![it.id]), "web", T0 + SECOND)
+        .unwrap();
+    let held = store.item(it.id, T0).unwrap().unwrap();
+    assert!(held.seen);
+    assert_eq!(held.push.status, S::Held);
+    store.run_due(T0 + 3 * MINUTE).unwrap();
+    let after = store.item(it.id, T0).unwrap().unwrap();
+    assert_eq!(after.push.status, S::Queued);
+
+    // Seen on the phone, it is suppressed at once, as before.
+    let store = self::store();
+    phone_active(&store, T0);
+    let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+    store
+        .mark_seen(&SeenTarget::Ids(vec![it.id]), "ios", T0 + SECOND)
+        .unwrap();
+    let after = store.item(it.id, T0).unwrap().unwrap();
+    assert_eq!(
+        (after.push.status, after.push.reason),
+        (S::Suppressed, Some(R::Seen))
+    );
+
+    // A web seen, then the phone's: suppressed when the phone's comes.
+    let store = self::store();
+    phone_active(&store, T0);
+    let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+    store
+        .mark_seen(&SeenTarget::Through(it.id), "web", T0 + SECOND)
+        .unwrap();
+    assert_eq!(store.item(it.id, T0).unwrap().unwrap().push.status, S::Held);
+    // Not newly seen, but the phone's mark still counts.
+    assert_eq!(
+        store
+            .mark_seen(&SeenTarget::Through(it.id), "ios", T0 + 2 * SECOND)
+            .unwrap(),
+        0
+    );
+    let after = store.item(it.id, T0).unwrap().unwrap();
+    assert_eq!(
+        (after.push.status, after.push.reason),
+        (S::Suppressed, Some(R::Seen))
+    );
 }
 
 #[test]

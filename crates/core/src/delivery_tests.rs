@@ -23,6 +23,7 @@ struct Case {
     throttle: Option<i64>,
     flapping: bool,
     seen: bool,
+    seen_only_on_web: bool,
     open: bool,
     settings: Settings,
     silences: Vec<Silence>,
@@ -47,6 +48,7 @@ fn case(class: Class) -> Case {
         throttle: Some(10 * MINUTE),
         flapping: false,
         seen: false,
+        seen_only_on_web: false,
         open: true,
         settings: Settings::default(),
         silences: Vec::new(),
@@ -70,6 +72,7 @@ impl Case {
             throttle: self.throttle,
             flapping: self.flapping,
             seen: self.seen,
+            seen_only_on_web: self.seen_only_on_web,
             open: self.open,
         };
         let state = State {
@@ -81,12 +84,26 @@ impl Case {
         decide(&subject, trigger, &state, &self.presence, now)
     }
 
+    /// The iPhone app is in the foreground.
     fn active(mut self, now: i64, viewing: Option<&str>) -> Case {
         self.presence.push(Presence {
-            device: "web-1".into(),
+            device: "ios-1".into(),
+            ios: true,
             active: true,
             last_heartbeat: now - 10 * SECOND,
             viewing: viewing.map(str::to_string),
+        });
+        self
+    }
+
+    /// A web tab is visible, focused and in use.
+    fn active_web(mut self, now: i64) -> Case {
+        self.presence.push(Presence {
+            device: "web-1".into(),
+            ios: false,
+            active: true,
+            last_heartbeat: now - 10 * SECOND,
+            viewing: None,
         });
         self
     }
@@ -296,6 +313,7 @@ fn step_4_an_inactive_device_viewing_is_ignored() {
     c.context = Some("assistant:thread:42");
     c.presence.push(Presence {
         device: "ios-1".into(),
+        ios: true,
         active: false,
         last_heartbeat: NOON,
         viewing: Some("assistant:thread:42".into()),
@@ -334,6 +352,67 @@ fn step_5_holds_while_you_are_active() {
         Decision::Hold { .. }
     ));
     assert_eq!(c.decide(Trigger::Opened, NOON + 65 * SECOND), Decision::Send);
+}
+
+#[test]
+fn step_5_web_presence_never_holds_an_urgent_push() {
+    // A laptop left open on the app at 3am: the urgent alert goes out.
+    let c = case(Class::Alert).active_web(NIGHT);
+    assert_eq!(c.push, PushLevel::Urgent);
+    assert_eq!(c.decide(Trigger::Opened, NIGHT), Decision::Send);
+    assert_eq!(c.decide(Trigger::Reopened, NOON), Decision::Send);
+    // The phone in hand holds it: the app shows it in its own banner.
+    let c = case(Class::Alert).active_web(NOON).active(NOON, None);
+    assert_eq!(
+        c.decide(Trigger::Opened, NOON),
+        Decision::Hold {
+            reason: R::Active,
+            until: NOON + 120 * SECOND
+        }
+    );
+    // Other levels are held by any active client, as before.
+    for (class, push, wait) in [
+        (Class::Alert, PushLevel::Normal, 120 * SECOND),
+        (Class::Alert, PushLevel::Silent, 120 * SECOND),
+        (Class::Action, PushLevel::Normal, 90 * SECOND),
+        (Class::Update, PushLevel::Silent, 90 * SECOND),
+    ] {
+        let mut c = case(class).active_web(NOON);
+        c.push = push;
+        assert_eq!(
+            c.decide(Trigger::Opened, NOON),
+            Decision::Hold {
+                reason: R::Active,
+                until: NOON + wait
+            },
+            "{class:?} {push:?}"
+        );
+    }
+    // An urgent action is held by the phone only, too.
+    let mut c = case(Class::Action).active_web(NOON);
+    c.push = PushLevel::Urgent;
+    assert_eq!(c.decide(Trigger::Opened, NOON), Decision::Send);
+}
+
+#[test]
+fn a_web_seen_never_suppresses_a_held_urgent_push() {
+    let mut c = case(Class::Alert);
+    c.seen = true;
+    c.seen_only_on_web = true;
+    assert_eq!(c.decide(Trigger::Released, NOON), Decision::Send);
+    // Seen on the phone (or by the API) suppresses it as before.
+    c.seen_only_on_web = false;
+    assert_eq!(c.decide(Trigger::Released, NOON), Decision::Suppress(R::Seen));
+    // Below urgent, a web client's seen still counts.
+    c.push = PushLevel::Normal;
+    c.seen_only_on_web = true;
+    assert_eq!(c.decide(Trigger::Released, NOON), Decision::Suppress(R::Seen));
+    // Closed still wins.
+    let mut c = case(Class::Alert);
+    c.seen = true;
+    c.seen_only_on_web = true;
+    c.open = false;
+    assert_eq!(c.decide(Trigger::Released, NOON), Decision::Suppress(R::Closed));
 }
 
 #[test]
@@ -632,6 +711,7 @@ fn the_budget_counts_the_sixth_push() {
 fn presence_counts_for_the_active_window() {
     let p = Presence {
         device: "d".into(),
+        ios: false,
         active: true,
         last_heartbeat: NOON,
         viewing: None,

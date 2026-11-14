@@ -107,6 +107,9 @@ pub struct Subject<'a> {
     pub flapping: bool,
     /// Seen in its current state.
     pub seen: bool,
+    /// Every `seen` since its state last changed came from a web client. An urgent push held
+    /// for an active iPhone is not suppressed by a web tab marking it seen.
+    pub seen_only_on_web: bool,
     /// Still `open`: an alert neither dismissed nor resolved, an action neither done, dismissed,
     /// snoozed nor resolved. Always true for updates and records.
     pub open: bool,
@@ -169,6 +172,8 @@ impl Silence {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Presence {
     pub device: String,
+    /// The heartbeat came from the iPhone app (`client: "ios"`), not a web client.
+    pub ios: bool,
     /// The last heartbeat said `active: true`.
     pub active: bool,
     pub last_heartbeat: i64,
@@ -237,7 +242,8 @@ pub fn silenced_by(item: &Subject<'_>, silences: &[Silence], now: i64) -> Option
 }
 
 /// Runs the steps of `spec/delivery.md`, "The decision", in order; the first that applies decides.
-/// For `released` it first suppresses an item that was seen (`seen`) or left `open` (`closed`).
+/// For `released` it first suppresses an item that was seen (`seen`; for an urgent push, seen on
+/// something other than a web client) or left `open` (`closed`).
 pub fn decide(
     item: &Subject<'_>,
     trigger: Trigger,
@@ -247,7 +253,7 @@ pub fn decide(
 ) -> Decision {
     let s = state.settings;
     if matches!(trigger, Trigger::Released | Trigger::CaughtUp) {
-        if item.seen {
+        if item.seen && !(item.push == PushLevel::Urgent && item.seen_only_on_web) {
             return Decision::Suppress(PushReason::Seen);
         }
         if !item.open {
@@ -280,8 +286,10 @@ pub fn decide(
     {
         return Decision::Suppress(PushReason::Viewing);
     }
-    // 5. You're active?
-    if !matches!(trigger, Trigger::Released | Trigger::Repeat) && !active.is_empty() {
+    // 5. You're active? An urgent push is held only for an active iPhone, which shows it in the
+    // app: a web tab may be open with nobody in front of it.
+    let holding = active.iter().any(|p| p.ios || item.push != PushLevel::Urgent);
+    if !matches!(trigger, Trigger::Released | Trigger::Repeat) && holding {
         let wait = if item.class == Class::Alert {
             s.alert_hold
         } else {

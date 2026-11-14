@@ -65,9 +65,12 @@ those triggers.
 3. **Flapping?** The item is an alert that is flapping ("Alerts") → suppress, `flapping`.
 4. **Being viewed?** *Skipped for `repeat`.* The item has a `context`, and an active device's
    `viewing` equals it → suppress, `viewing`. The client shows it in place.
-5. **You're active?** *Skipped for `released` and `repeat`.* Any device is active →
-   hold, `active`, until now + `delivery.alert_hold` (120 s) for an alert, now + `delivery.hold`
-   (90 s) for an action or update. The item shows in the inbox's `held` list for the in-app banner.
+5. **You're active?** *Skipped for `released` and `repeat`.* A device is active → hold,
+   `active`, until now + `delivery.alert_hold` (120 s) for an alert, now + `delivery.hold` (90 s)
+   for an action or update. The item shows in the inbox's `held` list for the in-app banner.
+   - push `urgent` → only an `ios` device counts (the phone in hand shows it in the app). Web
+     presence never holds an urgent push: a tab can be open on the app with nobody in front of it.
+   - any other push → any device counts.
 6. **Quiet hours?** Now is within `[quiet_hours.start, quiet_hours.end)` in `timezone`:
    - push `urgent` → go on;
    - the kind is `time_bound` → go on;
@@ -81,12 +84,14 @@ those triggers.
    decided and recorded, so the decisions can be compared before push is turned on). Otherwise →
    send ("Sending").
 
-**When a hold ends** (`released`): if the item has been seen → suppress, `seen`. If it has left
+**When a hold ends** (`released`): if the item has been seen → suppress, `seen`; for an urgent
+push, only a seen from a client other than `web` counts. If it has left
 `open` (an alert resolved or dismissed, an action done, dismissed, snoozed or resolved) →
 suppress, `closed`. Otherwise decide again with trigger `released`, which skips step 5: an item
 you didn't see in the hold pushes even though you are still active.
 
-At any time, a held item that is seen is suppressed (`seen`) at once, and one that leaves `open`
+At any time, a held item that is seen is suppressed (`seen`) at once (an urgent one only when
+seen on something other than a web client), and one that leaves `open`
 is suppressed (`closed`) at once; it doesn't wait for `release_at`.
 
 ## Sending
@@ -183,6 +188,8 @@ Recorded once, never change state. Updates are decided (`opened`); records never
 - Seen goes back to false when the producer changes the item's state: an alert opens, reopens or
   resolves; a snoozed action wakes. Text updates don't change it.
 - A held push of an item that is seen is suppressed. Seen never resolves anything.
+- A seen posted with `"client": "web"` never suppresses an urgent push: the item reads as seen,
+  but its held push still goes out unless the phone (or the API) marks it seen too.
 - **Done** is an action you handled: `POST /v1/items/{id}/actions` with `done`. It differs from
   `dismissed` (you won't do it) and `resolved` (its source closed it). All three leave Needs you.
 - When the iPhone app opens, it removes the delivered notifications of alerts and actions that are

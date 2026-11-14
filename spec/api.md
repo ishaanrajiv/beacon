@@ -412,12 +412,19 @@ A client's heartbeat. Beacon holds pushes while you are active somewhere (`spec/
 What each client must do:
 
 - **Web:** active while the tab is visible and focused (`document.visibilityState === "visible"`
-  and `document.hasFocus()`). Post at once on becoming active, every `heartbeat` (30 s) while
-  active, and `active: false` on becoming hidden or blurred.
+  and `document.hasFocus()`) **and** the person has moved the pointer, pressed a key or touched
+  the page within the last 5 minutes (`pointermove`, `pointerdown`, `keydown`, `wheel`,
+  `touchstart` on the page). Post at once on becoming active, every `heartbeat` (30 s) while
+  active, and `active: false` on becoming hidden or blurred, or when 5 minutes pass without input.
+  A tab left open on the app with nobody in front of it is not active.
 - **iOS:** active while the app is in the foreground (scene phase active). Post at once on
   entering the foreground, every 30 s while there, and `active: false` on leaving it.
 - Post again at once whenever `viewing` changes.
-- No idle detection from the operating system, on either.
+- No idle detection from the operating system, on either: the web's 5 minutes are input on the
+  page itself.
+
+`client` matters: an urgent push is held only while an `ios` device is active, because a web tab
+can be open with nobody looking at it (`spec/delivery.md`, step 5).
 
 A device counts as active for `presence.active_window` (75 s) after its last heartbeat with
 `active: true`, or until a heartbeat with `active: false`. A **visit** is a run of time with at
@@ -640,7 +647,9 @@ in the fix. `404` for an unknown item.
 or `{"ids": [4182, 4177]}`: exactly one of the two. `through` marks every item with an id up to
 it; `ids` at most 500 items. Optional `"client"`: `"web"`, `"ios"` or `"api"` (default), recorded in
 each item's history. `200` `{"ok": true, "seen": 3}`: how many were newly marked. A held
-push of a newly seen item is suppressed (`seen`). When a client marks seen is in
+push of a newly seen item is suppressed (`seen`), except that `"client": "web"` never suppresses
+an urgent push. An `ios` or `api` mark on an item that only a web client has seen, whose urgent
+push is held, is recorded and suppresses it, though it doesn't count as newly marked. When a client marks seen is in
 `spec/delivery.md`, "Seen and done".
 
 ### Silences

@@ -343,10 +343,11 @@ impl<'a, 'r> Tx<'a, 'r> {
     pub fn presence(&self) -> Result<Vec<Presence>> {
         let mut stmt = self
             .conn
-            .prepare_cached("SELECT device, active, last_heartbeat, viewing FROM presence")?;
+            .prepare_cached("SELECT device, active, last_heartbeat, viewing, client FROM presence")?;
         let rows = stmt.query_map([], |r| {
             Ok(Presence {
                 device: r.get(0)?,
+                ios: r.get::<_, String>(4)? == "ios",
                 active: r.get(1)?,
                 last_heartbeat: r.get(2)?,
                 viewing: r.get(3)?,
@@ -371,6 +372,23 @@ impl<'a, 'r> Tx<'a, 'r> {
         Ok(observed == Some(false))
     }
 
+    /// The item is seen, and every `seen` since its state last changed (it opened, reopened,
+    /// resolved, woke or was recorded) came from a web client.
+    pub fn seen_only_on_web(&self, row: &Row) -> Result<bool> {
+        if !row.life.seen {
+            return Ok(false);
+        }
+        let elsewhere: i64 = self
+            .conn
+            .prepare_cached(
+                "SELECT count(*) FROM history WHERE item = ?1 AND what = 'seen' AND coalesce(client, '') != 'web' \
+                 AND id > (SELECT coalesce(max(id), 0) FROM history WHERE item = ?1 \
+                 AND what IN ('opened', 'reopened', 'resolved', 'woke', 'recorded'))",
+            )?
+            .query_row([row.id], |r| r.get(0))?;
+        Ok(elsewhere == 0)
+    }
+
     fn last_push(&self, kind: &str, key: &str) -> Result<Option<i64>> {
         Ok(self
             .conn
@@ -389,7 +407,9 @@ impl<'a, 'r> Tx<'a, 'r> {
             source_unobserved: self.unobserved(&row.source)?,
             last_push: self.last_push(&row.kind, &row.key)?,
         };
-        let mut decision = delivery::decide(&row.subject(), trigger, &state, &presence, self.now);
+        let mut subject = row.subject();
+        subject.seen_only_on_web = self.seen_only_on_web(row)?;
+        let mut decision = delivery::decide(&subject, trigger, &state, &presence, self.now);
         if self.late && decision != Decision::None {
             decision = Decision::Suppress(PushReason::Late);
         }

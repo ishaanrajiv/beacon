@@ -9,7 +9,7 @@ use beacon_core::delivery::SilenceMatch;
 use beacon_core::duration::{DAY, MINUTE};
 use beacon_core::item::Item;
 use beacon_core::lifecycle::{Outcome, Refused};
-use beacon_core::model::{PushReason, Trigger};
+use beacon_core::model::{PushLevel, PushReason, PushStatus, Trigger};
 use rusqlite::{OptionalExtension, Row as SqlRow, params};
 use serde::{Deserialize, Serialize};
 
@@ -176,16 +176,18 @@ impl Store {
             ));
         }
         self.write(now, |w| {
+            // An urgent push held for the phone that only a web client has seen is still owed
+            // the phone's mark.
             let rows = match target {
-                SeenTarget::Through(through) => {
-                    rows::query(w.conn, "WHERE seen = 0 AND id <= ?1 ORDER BY id", [through])?
-                }
+                SeenTarget::Through(through) => rows::query(
+                    w.conn,
+                    "WHERE (seen = 0 OR (push_status = 'held' AND push_level = 'urgent')) AND id <= ?1 ORDER BY id",
+                    [through],
+                )?,
                 SeenTarget::Ids(ids) => {
                     let mut out = Vec::new();
                     for id in ids {
-                        if let Some(row) = rows::load(w.conn, *id)?
-                            && !row.life.seen
-                        {
+                        if let Some(row) = rows::load(w.conn, *id)? {
                             out.push(row);
                         }
                     }
@@ -194,9 +196,26 @@ impl Store {
             };
             let mut count = 0;
             for mut row in rows {
+                let urgent = row.push.level == PushLevel::Urgent;
+                if row.life.seen {
+                    let owed = client != "web"
+                        && urgent
+                        && row.push.status == PushStatus::Held
+                        && w.seen_only_on_web(&row)?;
+                    if owed {
+                        w.history(row.id, "seen", Some(client))?;
+                        w.suppress_held(&mut row, PushReason::Seen)?;
+                        w.touch(&mut row)?;
+                    }
+                    continue;
+                }
                 row.life.seen = true;
                 w.history(row.id, "seen", Some(client))?;
-                w.suppress_held(&mut row, PushReason::Seen)?;
+                // A web tab may be open with nobody in front of it: it never suppresses an
+                // urgent push (`spec/delivery.md`, "Seen and done").
+                if !(client == "web" && urgent) {
+                    w.suppress_held(&mut row, PushReason::Seen)?;
+                }
                 w.touch(&mut row)?;
                 count += 1;
             }
