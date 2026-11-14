@@ -60,5 +60,6 @@ recording inside a transaction), `producers.rs`, `trail.rs` (Trail's webhook), `
 six characters, items keep a chosen category), `migrate_3.sql` (version 3: history rows keep what
 their item was, filled by `engine::stamp_history` before every commit). Before a migration, `migrate`
 keeps a copy of the old database in `<data_dir>/previous/v<old>/` (`spec/config.md`, "Going back a
-version"). `cargo test -p beacon-store`
+version"). `views.sql` makes the `_v1` views other programs read at every start (`spec/config.md`,
+"Reading the database"); a test fails if one loses a column. `cargo test -p beacon-store`
 runs every case against an in-memory database, plus one file database across a restart.

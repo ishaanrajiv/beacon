@@ -111,6 +111,54 @@ then be opened read-only by another program (an assistant answering "what did Be
 today?") without exposing a token. Back up both files. A `beacon.db` from before devices moved
 (schema version 1) has its devices moved into `devices_db` at start, with the old rows overwritten.
 
+### Reading the database
+
+Another program may read `beacon.db` directly, read-only (with `readable_db = true` when it runs
+as another user; DuckDB's SQLite reader, or `sqlite3 -readonly`). It reads the views below, never
+the tables: the tables are internal and change between versions. A `_v1` view only gains columns,
+at the end; one that would lose, rename or retype a column becomes a `_v2` view beside it, and the
+`_v1` stays. The views are made again at every start. Every column is `INT` (an integer; times are
+milliseconds since 1970 UTC) or `TEXT`, as SQLite reports them, so DuckDB types them without
+`sqlite_all_varchar`. A null is a value the item doesn't have.
+
+`items_v1`, one row per item:
+
+| Column | Type | |
+|---|---|---|
+| `id` | INT | the item's id (`GET /v1/items/{id}`) |
+| `source`, `source_name` | TEXT | the source, and its display name |
+| `kind`, `key` | TEXT | the kind and the key |
+| `class` | TEXT | `alert`, `action`, `update` or `record` |
+| `state` | TEXT | the lifecycle state (`spec/delivery.md`); null for updates and records |
+| `push_level`, `push_status`, `push_reason` | TEXT | as `GET /v1/items/{id}` gives them |
+| `title`, `body` | TEXT | the words as shown now |
+| `url`, `context` | TEXT | the link it opens, and its context |
+| `labels` | TEXT | a JSON object of strings |
+| `service` | TEXT | its `service` label (`spec/declarations.md`) |
+| `seen` | INT | 1 once seen, else 0 |
+| `created`, `updated` | INT | made, and last changed |
+| `opened`, `acknowledged`, `dismissed`, `snoozed_until`, `done`, `resolved` | INT | when each happened (alerts and actions) |
+
+`history_v1`, one row per change of an item (`GET /v1/items/{id}`, `history`), with the item as
+that change left it:
+
+| Column | Type | |
+|---|---|---|
+| `id` | INT | the change's id, in order |
+| `item` | INT | the item's id |
+| `at` | INT | when |
+| `what` | TEXT | the step, like `opened`, `resolved`, `push_sent` |
+| `client` | TEXT | the client that did it, when one did |
+| `source`, `kind`, `class`, `service` | TEXT | the item's |
+| `state`, `title`, `push_level`, `push_status`, `push_reason` | TEXT | the item right after the change |
+
+```sql
+-- DuckDB: how many items each service raised, and the latest
+ATTACH 'beacon.db' AS beacon (TYPE sqlite, READ_ONLY);
+SELECT service, kind, count(*) AS items, to_timestamp(max(created) / 1000) AS latest
+FROM beacon.items_v1 GROUP BY ALL;
+```
+
 ### Going back a version
 
 `beacon.db` carries a schema version (`PRAGMA user_version`; now 3). A Beacon refuses to open a

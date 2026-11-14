@@ -3009,3 +3009,128 @@ fn a_database_from_a_newer_beacon_is_refused_with_the_way_back() {
     assert!(problem.message.contains("schema version 99"), "{problem}");
     assert!(problem.fix.contains("previous/v3/beacon.db"), "{problem}");
 }
+
+/// Each column of a view, with the type SQLite reports for it (what DuckDB's reader goes by).
+fn view_columns(store: &Store, view: &str) -> Vec<String> {
+    store
+        .read(|tx, _| {
+            let mut stmt = tx.prepare(&format!("SELECT name, type FROM pragma_table_info('{view}')"))?;
+            let rows = stmt.query_map([], |r| {
+                Ok(format!("{} {}", r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .unwrap()
+}
+
+/// The contract for programs that read beacon.db (spec/config.md, "Reading the database"). A `_v1`
+/// view only gains columns: if this test fails because one was removed, renamed or retyped, put
+/// it back and make a `_v2` view beside it instead.
+#[test]
+fn the_views_for_readers_keep_their_columns() {
+    let store = store();
+    let items = [
+        "id INT",
+        "source TEXT",
+        "source_name TEXT",
+        "kind TEXT",
+        "key TEXT",
+        "class TEXT",
+        "state TEXT",
+        "push_level TEXT",
+        "push_status TEXT",
+        "push_reason TEXT",
+        "title TEXT",
+        "body TEXT",
+        "url TEXT",
+        "context TEXT",
+        "labels TEXT",
+        "service TEXT",
+        "seen INT",
+        "created INT",
+        "updated INT",
+        "opened INT",
+        "acknowledged INT",
+        "dismissed INT",
+        "snoozed_until INT",
+        "done INT",
+        "resolved INT",
+    ];
+    let history = [
+        "id INT",
+        "item INT",
+        "at INT",
+        "what TEXT",
+        "client TEXT",
+        "source TEXT",
+        "kind TEXT",
+        "class TEXT",
+        "service TEXT",
+        "state TEXT",
+        "title TEXT",
+        "push_level TEXT",
+        "push_status TEXT",
+        "push_reason TEXT",
+    ];
+    let have_items = view_columns(&store, "items_v1");
+    let have_history = view_columns(&store, "history_v1");
+    // Only gains: what v1 promised is still there, in its place, with its type.
+    assert_eq!(
+        &have_items[..items.len()],
+        items,
+        "items_v1 lost or changed a column"
+    );
+    assert_eq!(
+        &have_history[..history.len()],
+        history,
+        "history_v1 lost or changed a column"
+    );
+    // And a column added since is listed above and in the spec, not slipped in.
+    assert_eq!(
+        have_items.len(),
+        items.len(),
+        "items_v1 has a column not listed here"
+    );
+    assert_eq!(
+        have_history.len(),
+        history.len(),
+        "history_v1 has a column not listed here"
+    );
+}
+
+#[test]
+fn the_views_read_what_the_tables_hold() {
+    let store = store();
+    let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+    store.apply_event(&resolved(failed()), None, T0 + HOUR).unwrap();
+    let (service, state, resolved_at, labels): (String, String, i64, String) = store
+        .read(|tx, _| {
+            Ok(tx.query_row(
+                "SELECT service, state, resolved, labels FROM items_v1 WHERE id = ?1",
+                [it.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(service, "backup");
+    assert_eq!(state, "resolved");
+    assert_eq!(resolved_at, T0 + HOUR);
+    assert_eq!(
+        serde_json::from_str::<Value>(&labels).unwrap()["service"],
+        "backup"
+    );
+    let steps: Vec<(String, String)> = store
+        .read(|tx, _| {
+            let mut stmt = tx.prepare("SELECT what, state FROM history_v1 WHERE item = ?1 ORDER BY id")?;
+            let rows = stmt.query_map([it.id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .unwrap();
+    assert_eq!(
+        steps[..2],
+        [
+            ("opened".to_string(), "open".to_string()),
+            ("resolved".to_string(), "resolved".to_string())
+        ]
+    );
+}

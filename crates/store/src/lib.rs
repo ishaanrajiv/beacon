@@ -312,6 +312,8 @@ fn migrate(conn: &mut Connection, previous: Option<&Path>) -> Result<()> {
         tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
             .map_err(|e| Error::sql("can't set the schema version", &e))?;
     }
+    tx.execute_batch(include_str!("views.sql"))
+        .map_err(|e| Error::sql("can't create the views for readers", &e))?;
     tx.commit()
         .map_err(|e| Error::sql("can't commit the schema", &e))?;
     if wal && version > 0 && version < 2 {
