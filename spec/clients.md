@@ -232,10 +232,13 @@ folder, the emitters and the `beacon` command keep it instead:
   One of other kinds stays, in order. A waiting snapshot is dropped, not sent, once its `sent_at`
   is more than 5 minutes old (Beacon would refuse it, `spec/api.md`).
 - **Bounded.** A file waits at most 24 hours (Beacon's idempotency window), then is dropped. The
-  folder holds at most 1,000 files and 8 MB: queuing one more drops the oldest first, once the new
-  one is written. Every drop is counted: `Flushed.dropped` (this flush) and `dropped_total` /
-  `droppedTotal` (this process), the `queued` answer's `problem` when it had to drop the oldest,
-  and `beacon flush`'s `dropped`.
+  folder holds at most 1,000 files and 8 MB (8,388,608 bytes of the files as written, UTF-8):
+  queuing one more drops the oldest first, once the new one is written. A request larger than the
+  whole 8 MB on its own is not kept and drops nothing: it is counted as dropped, and the answer is
+  the one for a spool that can't be written (`ok` false, `queued` false; the command exits `3`),
+  with a fix line saying the request is larger than the spool's limit. Every drop is counted:
+  `Flushed.dropped` (this flush) and `dropped_total` / `droppedTotal` (this process), the `queued`
+  answer's `problem` when it had to drop the oldest, and `beacon flush`'s `dropped`.
 
 The files are the same for every client, so the Python and TypeScript emitters and the command can
 share one folder, and any of them flushes the others'. One file per request, named

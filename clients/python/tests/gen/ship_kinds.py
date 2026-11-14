@@ -357,6 +357,15 @@ class _Runtime:
         """Writes the request to the spool and answers `queued`; a spool that can't be written leaves `sent` as it was."""
         now = self.now_ms()
         data = json.dumps({"path": path, "key": key, "queued_at": now, "body": dict(body)}).encode()
+        why = sent.problem or f"Beacon answered {sent.status}"
+        if len(data) > SPOOL_MAX_BYTES:
+            # It could never fit, and making room for it would drop everything waiting: drop it alone.
+            self.dropped_total += 1
+            problem = (
+                f"{why}\n  and the spool {spool} can't keep it: it is {len(data)} bytes"
+                f"\n  fix: the request is larger than the spool's limit of {SPOOL_MAX_BYTES} bytes on its own; send less in it"
+            )
+            return Sent(ok=False, status=sent.status, outcome=None, item=None, problem=problem)
         try:
             os.makedirs(spool, exist_ok=True)
             names = self.spooled(spool)
@@ -375,13 +384,12 @@ class _Runtime:
                 sizes.pop(0)
             self.publish(spool, data, now)
         except OSError as error:
-            problem = f"{sent.problem or f'Beacon answered {sent.status}'}\n  and the spool {spool} can't be written: {error}"
+            problem = f"{why}\n  and the spool {spool} can't be written: {error}"
             return Sent(ok=False, status=sent.status, outcome=None, item=None, problem=problem)
         for old in replaced + evicted:
             self.drop(spool, old)
         dropped = len(evicted)
         self.dropped_total += dropped
-        why = sent.problem or f"Beacon answered {sent.status}"
         if dropped:
             why += f"\n  the spool was full: dropped the {dropped} oldest"
         return Sent(ok=True, status=sent.status, outcome=None, item=None, problem=why, queued=True)

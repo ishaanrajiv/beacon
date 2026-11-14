@@ -333,7 +333,14 @@ class BeaconRuntime {
   async queue(spool: string, path: string, key: string, body: Record<string, unknown>, sent: Sent): Promise<Sent> {
     const now = this.now();
     const data = JSON.stringify({ path, key, queued_at: now, body });
+    const bytes = new TextEncoder().encode(data).byteLength;
     const why = sent.problem ?? `Beacon answered ${sent.status}`;
+    if (bytes > SPOOL_LIMITS.bytes) {
+      // It could never fit, and making room for it would drop everything waiting: drop it alone.
+      this.droppedTotal += 1;
+      const fix = `the request is larger than the spool's limit of ${SPOOL_LIMITS.bytes} bytes on its own; send less in it`;
+      return { ...sent, ok: false, queued: false, problem: `${why}\n  and the spool ${spool} can't keep it: it is ${bytes} bytes\n  fix: ${fix}` };
+    }
     let dropped = 0;
     try {
       const fs = await this.fs();
@@ -352,7 +359,7 @@ class BeaconRuntime {
       for (const name of names) sizes.push(await fs.stat(`${spool}/${name}`).then((s) => s.size, () => 0));
       let total = sizes.reduce((a, b) => a + b, 0);
       const evicted: string[] = [];
-      while (names.length > 0 && (names.length >= SPOOL_LIMITS.files || total + data.length > SPOOL_LIMITS.bytes)) {
+      while (names.length > 0 && (names.length >= SPOOL_LIMITS.files || total + bytes > SPOOL_LIMITS.bytes)) {
         evicted.push(names.shift() ?? "");
         total -= sizes.shift() ?? 0;
       }

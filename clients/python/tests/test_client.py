@@ -479,10 +479,28 @@ class SpoolTest(unittest.TestCase):
         self.assertIn("dropped the 1 oldest", (sent.problem if sent else None) or "")
         self.assertEqual([cast("dict[str, object]", f["body"])["key"] for f in self.files()], ["k1", "k2"])
         self.assertEqual(beacon_client.flush().dropped_total, 1)
+
+    def test_a_request_larger_than_the_whole_spool_is_not_queued_and_evicts_nothing(self) -> None:
+        for n in range(2):
+            self.refuse(1 if n else 3)
+            beacon_client.send("backup.space", key=f"k{n}")
         with mock.patch.object(beacon_client, "SPOOL_MAX_BYTES", 10):
+            self.refuse(1)
+            sent = beacon_client.send("backup.space", key="big")
+        self.assertEqual((sent.ok, sent.queued), (False, False))
+        self.assertIn("larger than the spool's limit", sent.problem or "")
+        self.assertEqual(self.keys(), ["k0", "k1"])
+        self.assertEqual(beacon_client.flush().dropped_total, 1)
+
+    def test_the_spool_limit_is_in_bytes(self) -> None:
+        key = "\u00e9" * 1000
+        request = json.dumps({"path": "/v1/events", "key": "0" * 32, "queued_at": self.clock, "body": {"kind": "backup.space", "key": key}})
+        # The request fits in characters, not in bytes.
+        with mock.patch.object(beacon_client, "SPOOL_MAX_BYTES", len(request.encode()) - 1):
             self.refuse()
-            beacon_client.send("backup.space", key="big")
-        self.assertEqual([cast("dict[str, object]", f["body"])["key"] for f in self.files()], ["big"])
+            sent = beacon_client.send("backup.space", key=key)
+        self.assertEqual((sent.ok, sent.queued), (False, False))
+        self.assertFalse(os.path.exists(self.spool) and self.files())
 
     def test_off_without_a_folder(self) -> None:
         os.environ.pop("BEACON_SPOOL_DIR")

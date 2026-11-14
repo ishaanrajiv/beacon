@@ -1020,3 +1020,29 @@ fn a_spool_name_another_process_takes_first_is_not_overwritten() {
     send_while_away(&dir, "mine");
     assert_eq!(spooled_keys(&dir), ["theirs", "mine"]);
 }
+
+#[test]
+fn a_request_larger_than_the_whole_spool_is_not_queued_and_evicts_nothing() {
+    let dir = scratch("spool-oversized");
+    send_while_away(&dir, "k0");
+    send_while_away(&dir, "k1");
+    crate::spool::fault::limit_bytes(10);
+    let backup = example("backup");
+    let spool = dir.to_str().unwrap();
+    let (code, text) = refused(&[
+        "send",
+        "backup.space",
+        "used_percent=96",
+        "--key",
+        "big",
+        "--decls",
+        &backup,
+        "--spool",
+        spool,
+        "--server",
+        NOBODY,
+    ]);
+    assert_eq!(code, 3);
+    assert!(text.contains("larger than the spool's limit"), "{text}");
+    assert_eq!(spooled_keys(&dir), ["k0", "k1"]);
+}

@@ -53,6 +53,15 @@ fn random_hex(bytes: usize) -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The spool's byte limit; a test may lower it.
+fn max_bytes() -> u64 {
+    #[cfg(test)]
+    if let Some(bytes) = fault::max_bytes() {
+        return bytes;
+    }
+    MAX_BYTES
+}
+
 /// When a request file was queued and its place among those queued in that millisecond, from its
 /// name: `<ms>-<sequence>.json`, or the older `<ms>-<sequence>-<hex>.json`.
 fn position(name: &str) -> Option<(i64, u32)> {
@@ -205,8 +214,20 @@ impl Spool {
     }
 
     /// Keeps the request to send later. Answers how many of the oldest were dropped to make room.
+    /// A request larger than the whole spool is not kept, and drops nothing.
     pub fn queue(&self, path: &str, key: &str, body: &Value, now_ms: i64) -> Result<usize, Problem> {
         let data = json!({"path": path, "key": key, "queued_at": now_ms, "body": body}).to_string();
+        let incoming = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        if incoming > max_bytes() {
+            return Err(Problem::new(
+                format!("spool {}", self.dir.display()),
+                format!("can't keep it: it is {incoming} bytes"),
+                format!(
+                    "the request is larger than the spool's limit of {} bytes on its own; send less in it",
+                    max_bytes()
+                ),
+            ));
+        }
         std::fs::create_dir_all(&self.dir).map_err(|e| self.problem(format!("can't be made: {e}")))?;
         // Removed only once the new file is written, so a failed write loses nothing.
         let (replaced, names): (Vec<String>, Vec<String>) = self.names().into_iter().partition(|name| {
@@ -224,8 +245,8 @@ impl Spool {
             .collect();
         let mut total: u64 = files.iter().map(|(_, size)| size).sum();
         let mut evicted = Vec::new();
-        let incoming = u64::try_from(data.len()).unwrap_or(u64::MAX);
-        while !files.is_empty() && (files.len() >= MAX_FILES || total.saturating_add(incoming) > MAX_BYTES) {
+        while !files.is_empty() && (files.len() >= MAX_FILES || total.saturating_add(incoming) > max_bytes())
+        {
             let (name, size) = files.remove(0);
             total -= size;
             evicted.push(name);
@@ -319,6 +340,16 @@ pub mod fault {
     thread_local! {
         static FAIL_WRITE: Cell<bool> = const { Cell::new(false) };
         static TAKE_NAME: RefCell<Option<String>> = const { RefCell::new(None) };
+        static MAX_BYTES: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    /// The spool's byte limit, on this thread, is `bytes`.
+    pub fn limit_bytes(bytes: u64) {
+        MAX_BYTES.with(|max| max.set(Some(bytes)));
+    }
+
+    pub(super) fn max_bytes() -> Option<u64> {
+        MAX_BYTES.with(Cell::get)
     }
 
     /// Another process writes `contents` under the name the next request file is about to get,

@@ -499,18 +499,51 @@ test("the spool is bounded, oldest dropped first", async () => {
       bodies().map((b) => b["key"]),
       ["k1", "k2"],
     );
-    client.SPOOL_LIMITS.files = limits.files;
-    client.SPOOL_LIMITS.bytes = 10;
-    refuse(1);
-    await client.send("backup.space", { key: "big" });
-    assert.deepEqual(
-      bodies().map((b) => b["key"]),
-      ["big"],
-    );
-    assert.equal(client.runtime.droppedTotal, 3);
   } finally {
     Object.assign(client.SPOOL_LIMITS, limits);
   }
+});
+
+test("a request larger than the whole spool is not queued and evicts nothing", async () => {
+  useSpool();
+  const limits = { ...client.SPOOL_LIMITS };
+  let sent: client.Sent | undefined;
+  try {
+    for (const n of [0, 1]) {
+      refuse(n === 0 ? 3 : 1);
+      await client.send("backup.space", { key: `k${n}` });
+    }
+    client.SPOOL_LIMITS.bytes = 10;
+    refuse(1);
+    sent = await client.send("backup.space", { key: "big" });
+  } finally {
+    Object.assign(client.SPOOL_LIMITS, limits);
+  }
+  assert.deepEqual([sent.ok, sent.queued], [false, false]);
+  assert.match(sent.problem ?? "", /larger than the spool's limit/);
+  assert.deepEqual(
+    bodies().map((b) => b["key"]),
+    ["k0", "k1"],
+  );
+  assert.equal(client.runtime.droppedTotal, 1);
+});
+
+test("the spool's limit is in bytes, not UTF-16 units", async () => {
+  useSpool();
+  const limits = { ...client.SPOOL_LIMITS };
+  const key = "\u00e9".repeat(1000);
+  const request = JSON.stringify({ path: "/v1/events", key: "0".repeat(32), queued_at: clock, body: { kind: "backup.space", key } });
+  let sent: client.Sent | undefined;
+  try {
+    // The request fits in UTF-16 units, not in bytes.
+    client.SPOOL_LIMITS.bytes = request.length + 100;
+    refuse();
+    sent = await client.send("backup.space", { key });
+  } finally {
+    Object.assign(client.SPOOL_LIMITS, limits);
+  }
+  assert.deepEqual([sent.ok, sent.queued], [false, false]);
+  assert.deepEqual(spooled(), []);
 });
 
 test("off without a folder", async () => {
