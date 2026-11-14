@@ -248,7 +248,8 @@ impl Store {
     /// it no longer has closes in the same transaction (`Input::KindRemoved`): nothing could
     /// resolve it any more.
     pub fn publish_with(&self, decl: &Declarations, keep: bool, now: i64) -> Result<Published> {
-        if RESERVED_SOURCES.contains(&decl.source.as_str()) {
+        // `trail` may be published: its kinds join Beacon's own Trail kinds.
+        if RESERVED_SOURCES.contains(&decl.source.as_str()) && decl.source != builtin::TRAIL_SOURCE {
             return Err(Error::new(
                 ErrorKind::Conflict,
                 "registry source",
@@ -369,63 +370,6 @@ impl Store {
         }
         self.write(now, |w| w.snapshot(snapshot, false))
     }
-
-    /// `POST /v1/trail` with `type: "snapshot"`, after the server mapped each firing entry to
-    /// `trail.severe`, `trail.warning` or `trail.info` (slots `title` and `body`, labels). Covers
-    /// those three kinds: severe alerts open and resolve; a warning or info entry is recorded
-    /// once per appearance. Observes `trail` with `[trail] stale_after`.
-    pub fn apply_trail_snapshot(
-        &self,
-        sent_at: i64,
-        firing: Vec<SnapshotEntry>,
-        now: i64,
-    ) -> Result<SnapshotAnswer> {
-        let snapshot = Snapshot {
-            source: "trail".into(),
-            observed: true,
-            reason: None,
-            stale_after: Duration::from_ms(self.settings().trail_stale_after),
-            sent_at: Some(sent_at),
-            kinds: Some(vec![
-                builtin::TRAIL_SEVERE.into(),
-                builtin::TRAIL_WARNING.into(),
-                builtin::TRAIL_INFO.into(),
-            ]),
-            firing,
-        };
-        self.write(now, |w| w.snapshot(&snapshot, true))
-    }
-
-    /// `POST /v1/trail` with `type: "notice"`, mapped by the server to an event of
-    /// `trail.severe_notice`, `trail.warning` or `trail.info` keyed by the notice id. Recorded
-    /// once per id: a repeat answers the item with `repeat: true`. A `late` notice (its `ts` more
-    /// than `delivery.late` old) is recorded with its push suppressed `late`.
-    pub fn apply_trail_notice(&self, id: &str, event: &Event, late: bool, now: i64) -> Result<EventAnswer> {
-        self.write(now, |w| {
-            let known: Option<i64> = w
-                .conn
-                .prepare_cached("SELECT item FROM notices WHERE id = ?1")?
-                .query_row([id], |r| r.get(0))
-                .optional()?;
-            if let Some(item) = known {
-                let item = rows::load(w.conn, item)?.map(|row| row.item(now, w.s));
-                return Ok(EventAnswer {
-                    outcome: EventOutcome::Ignored,
-                    item,
-                    repeat: true,
-                });
-            }
-            w.late = late;
-            let answer = w.event(event, "notice", false)?;
-            w.late = false;
-            if let Some(item) = &answer.item {
-                w.conn
-                    .prepare_cached("INSERT INTO notices (id, item) VALUES (?1, ?2)")?
-                    .execute(params![id, item.id])?;
-            }
-            Ok(answer)
-        })
-    }
 }
 
 fn bump(conn: &Connection) -> Result<()> {
@@ -508,6 +452,23 @@ fn check_shape(
             "send a path like `/system`, or an https:// link",
         ));
     }
+    problems
+}
+
+/// Every problem one snapshot entry has against its kind: its shape, its category, its values.
+pub(crate) fn entry_problems(at: &str, entry: &SnapshotEntry, kind: &Kind, check_key: bool) -> Vec<Problem> {
+    let mut problems = check_shape(
+        at,
+        &entry.kind,
+        kind,
+        &entry.key,
+        check_key,
+        &entry.labels,
+        entry.context.as_deref(),
+        entry.url.as_deref(),
+    );
+    problems.extend(check_category(at, &entry.kind, kind, entry.category.as_deref()));
+    problems.extend(check_values(at, &entry.kind, kind, &entry.facts, &entry.slots));
     problems
 }
 
@@ -596,7 +557,10 @@ impl Tx<'_, '_> {
                 [&decl.source],
             )?;
             for mut row in open {
-                if !row.life.is_open() || decl.kinds.contains_key(&row.kind) {
+                let stays = decl.kinds.contains_key(&row.kind)
+                    || (decl.source == builtin::TRAIL_SOURCE
+                        && builtin::TRAIL_BUILTIN.contains(&row.kind.as_str()));
+                if !row.life.is_open() || stays {
                     continue;
                 }
                 self.apply(&mut row, Input::KindRemoved, None)?;
@@ -798,7 +762,7 @@ impl Tx<'_, '_> {
 
     /// Checks and applies a snapshot. `builtin` is Trail's, which may cover update and record
     /// kinds and has already been mapped.
-    fn snapshot(&mut self, snap: &Snapshot, builtin: bool) -> Result<SnapshotAnswer> {
+    pub(crate) fn snapshot(&mut self, snap: &Snapshot, builtin: bool) -> Result<SnapshotAnswer> {
         let Some(decl) = self.registry.get(&snap.source) else {
             if let Some(unreadable) = self.unreadable.get(&snap.source) {
                 let mut problem = unreadable.problem.clone();

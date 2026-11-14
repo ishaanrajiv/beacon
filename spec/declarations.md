@@ -36,7 +36,7 @@ repeat = ["2h", "6h"]
 
 | Field | Type | Required | Rule |
 |---|---|---|---|
-| `source` | string | yes | Lowercase letters, digits and hyphens, starting with a letter, at most 32 characters. `beacon` and `trail` are reserved. |
+| `source` | string | yes | Lowercase letters, digits and hyphens, starting with a letter, at most 32 characters. `beacon` is reserved. `trail` adds kinds for Trail's rules ("Kinds for Trail's rules"). |
 | `name` | string | yes | 1 to 24 characters. Shown beside every item from this source. |
 | `icon` | string | no, `bell` | One of the icon names below. |
 | `kinds` | table | yes, at least one | `[kinds."<source>.<name>"]` tables. |
@@ -259,8 +259,8 @@ An alert that isn't `one_off` recovers: its row and its banner change to the rec
 
 `crates/core/builtin/beacon.toml` and `crates/core/builtin/trail.toml` are always loaded, with the
 same parser and checks, except that their sources are reserved and their titles may be a slot on
-its own. A service can't publish source `beacon` or `trail`. `spec/delivery.md` says when each is
-posted.
+its own. A service can't publish source `beacon`; source `trail` can only be added to (below).
+`spec/delivery.md` says when each is posted.
 
 | Kind | Class | Push | Title | When |
 |---|---|---|---|---|
@@ -277,6 +277,32 @@ posted.
 
 Trail's kinds carry Trail's title and body in slots `title` (40) and `body` (150). Their link is
 `[trail] open` in `beacon.toml`.
+
+### Kinds for Trail's rules
+
+The four built-in Trail kinds give every severe rule one push level and Trail's free text. To give
+a rule its own class, push level, copy, facts, actions and repeats, declare a kind for it in a
+folder with `source = "trail"` and name it in the rule's `kind` (`spec/api.md`, `POST /v1/trail`).
+`examples/homelab-ish/trail/beacon/kinds.toml` declares an urgent and a normal alert.
+
+- Its kinds are named `trail.<name>`, may not take a built-in's name (`trail.severe`,
+  `trail.severe_notice`, `trail.warning`, `trail.info`), and are checked like any other kind, copy
+  rules included (a title needs words of its own). `beacon check`, `beacon gen` and
+  `beacon publish` take the folder; `PUT /v1/registry/trail` stores it.
+- The built-in kinds are always there as well. `GET /v1/registry/trail` and `GET /v1/kinds` list
+  both; `DELETE /v1/registry/trail` removes only the published ones.
+- `name` and `icon` are required by the file format and **ignored**: Trail's items keep Beacon's
+  ("Monitoring", `gauge`).
+- A kind without `open` gets `[trail] open`, like the built-in ones.
+- Facts are filled by name from Trail's post: `value` and `since` from a firing entry's `value`
+  (a number) and `since` (a time), `alert` from Trail's `alert`, `trail_source` from Trail's
+  `source`, and any other name from the entry's `labels`, or for a notice from its event's
+  `props` (a notice has no `value` or `since` of its own, so those come from `props` too). Slots
+  `title` and `body` take Trail's title and body; any other slot is read like a fact, as text.
+  Declare a fact optional (`"string?"`) when a rule may not send it.
+- A metric rule (a snapshot entry) names an alert, action, update or record that isn't a one-off
+  alert; an event rule (a notice) names a one-off alert, an update or a record. Anything else
+  falls back to the severity's built-in kind.
 
 ## Reaching the server
 

@@ -651,7 +651,7 @@ fn trails_webhook_becomes_trail_items() {
     });
     let r = lab.post("/v1/trail", &snapshot);
     assert_eq!(r.status, 200, "{:?}", r.json);
-    assert_eq!(r.json, json!({"ok": true}));
+    assert_eq!(r.json, json!({"ok": true, "fallbacks": []}));
     let inbox = lab.get("/v1/inbox").json;
     let severe = &inbox["alerts"]["open"][0];
     assert_eq!(severe["kind"], "trail.severe");
@@ -712,6 +712,91 @@ fn trails_webhook_becomes_trail_items() {
         Some(&notice),
     );
     assert_eq!(proxied.status, 403);
+}
+
+#[test]
+fn trail_rules_can_name_a_published_kind() {
+    let lab = start();
+    let folder =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/homelab-ish/trail/beacon");
+    let decl = beacon_core::decl::load(&folder, &Default::default()).unwrap();
+    let r = lab.put("/v1/registry/trail", &decl.to_json());
+    assert_eq!(r.status, 200, "{:?}", r.json);
+    assert_eq!(r.json["kinds"], 2);
+    let kinds: Vec<Value> = lab.get("/v1/kinds").json["kinds"].as_array().unwrap().clone();
+    let trail: Vec<&str> = kinds
+        .iter()
+        .filter(|k| k["source"] == "trail")
+        .map(|k| k["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        trail,
+        [
+            "trail.disk_full",
+            "trail.info",
+            "trail.queue_backlog",
+            "trail.severe",
+            "trail.severe_notice",
+            "trail.warning"
+        ]
+    );
+    assert_eq!(
+        lab.get("/v1/registry/trail").json["kinds"]
+            .as_object()
+            .unwrap()
+            .len(),
+        6
+    );
+    let entry = |key: &str, kind: Option<&str>| {
+        let mut e = json!({"key": key, "source": "shop", "alert": "disk_full", "severity": "severe", "title": "Disk is nearly full", "labels": {"disk": "data"}, "value": 96.0, "since": T0});
+        if let Some(kind) = kind {
+            e["kind"] = json!(kind);
+        }
+        e
+    };
+    let r = lab.post(
+        "/v1/trail",
+        &json!({"type": "snapshot", "sent_at": T0, "firing": [entry("a", Some("trail.disk_full")), entry("b", None), entry("c", Some("trail.nope"))]}),
+    );
+    assert_eq!(r.status, 200, "{:?}", r.json);
+    let fallbacks = r.json["fallbacks"].as_array().unwrap();
+    assert_eq!(fallbacks.len(), 1);
+    assert_eq!(
+        (fallbacks[0]["key"].clone(), fallbacks[0]["kind"].clone()),
+        (json!("c"), json!("trail.nope"))
+    );
+    assert!(
+        fallbacks[0]["problem"]["fix"]
+            .as_str()
+            .unwrap()
+            .contains("beacon publish")
+    );
+    let open = lab.get("/v1/inbox").json["alerts"]["open"].clone();
+    let kind_of =
+        |key: &str| open.as_array().unwrap().iter().find(|i| i["key"] == key).unwrap()["kind"].clone();
+    assert_eq!(kind_of("a"), "trail.disk_full");
+    assert_eq!(kind_of("b"), "trail.severe");
+    assert_eq!(kind_of("c"), "trail.severe");
+    assert_eq!(
+        lab.post(
+            "/v1/trail",
+            &json!({"type": "snapshot", "sent_at": T0, "firing": []})
+        )
+        .status,
+        200
+    );
+    // DELETE removes only what was published.
+    assert_eq!(
+        raw(lab.addr(), "DELETE", "/v1/registry/trail", &[JSON], None).status,
+        200
+    );
+    assert_eq!(
+        lab.get("/v1/registry/trail").json["kinds"]
+            .as_object()
+            .unwrap()
+            .len(),
+        4
+    );
 }
 
 #[test]

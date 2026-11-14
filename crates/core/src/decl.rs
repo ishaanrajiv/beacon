@@ -836,12 +836,27 @@ pub fn validate(decl: &Declarations, check: &Check) -> Vec<Problem> {
             "use lowercase letters, digits and hyphens, starting with a letter, at most 32 characters, like `backup`",
         ));
     }
-    if !check.builtin && RESERVED_SOURCES.contains(&decl.source.as_str()) {
+    // `trail` may be published to add kinds Trail's rules name; `beacon` is Beacon's alone.
+    if !check.builtin
+        && RESERVED_SOURCES.contains(&decl.source.as_str())
+        && decl.source != crate::builtin::TRAIL_SOURCE
+    {
         problems.push(Problem::new(
             format!("{FILE}: source"),
             format!("`{}` is Beacon's own source", decl.source),
             "name the source after your service",
         ));
+    }
+    if !check.builtin && decl.source == crate::builtin::TRAIL_SOURCE {
+        for name in decl.kinds.keys() {
+            if crate::builtin::TRAIL_BUILTIN.contains(&name.as_str()) {
+                problems.push(Problem::new(
+                    format!("{FILE}: kinds.\"{name}\""),
+                    format!("`{name}` is one of Beacon's own Trail kinds, which are always there"),
+                    "give yours another name, like `trail.disk_full`, and name it in the rule's `kind`",
+                ));
+            }
+        }
     }
     let name_len = decl.name.trim().chars().count();
     if name_len == 0 {

@@ -27,8 +27,8 @@ store.set_trail_open(&config.trail.open)?;
 | `DELETE /v1/registry/{source}` | `unpublish(source) -> bool` |
 | `POST /v1/events` | `apply_event(&Event, idempotency_key, now) -> EventAnswer` |
 | `POST /v1/snapshots` | `apply_snapshot(&Snapshot, now) -> SnapshotAnswer` |
-| `POST /v1/trail` snapshot | `apply_trail_snapshot(sent_at, Vec<SnapshotEntry>, now)` (map Trail's entries to `trail.*` kinds first) |
-| `POST /v1/trail` notice | `apply_trail_notice(id, &Event, late, now) -> EventAnswer` |
+| `POST /v1/trail` snapshot | `apply_trail_snapshot(sent_at, Vec<TrailAlert>, now) -> (SnapshotAnswer, Vec<Fallback>)`: each entry becomes the kind it names, or its severity's built-in kind (`TrailAlert::builtin`) with a `Fallback` |
+| `POST /v1/trail` notice | `apply_trail_notice(&TrailAlert, late, now) -> (EventAnswer, Vec<Fallback>)` |
 | `POST /v1/presence` | `heartbeat(&Heartbeat, now) -> Option<active_until>` |
 | `GET /v1/inbox` | `inbox(&InboxQuery, now) -> Inbox` (ETag: `W/"<version>"`) |
 | `GET /v1/items/{id}` | `item_detail(id, now) -> Option<ItemDetail>`; `item(id, now)` for the bare item |
@@ -55,7 +55,7 @@ owns "did you mean" for unknown fields and the body limits.
 ## Layout
 
 `lib.rs` (open, migrate, transactions), `rows.rs` (an item's row), `engine.rs` (deciding and
-recording inside a transaction), `producers.rs`, `clients.rs`, `reads.rs`, `jobs.rs`,
+recording inside a transaction), `producers.rs`, `trail.rs` (Trail's webhook), `clients.rs`, `reads.rs`, `jobs.rs`,
 `schema.sql` (version 1), `migrate_2.sql` (version 2: devices out to `devices.sql`, attempts keep
 six characters, items keep a chosen category). `cargo test -p beacon-store`
 runs every case against an in-memory database, plus one file database across a restart.

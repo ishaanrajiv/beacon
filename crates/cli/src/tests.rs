@@ -279,6 +279,17 @@ fn publish_puts_each_source_in_its_json_form() {
 }
 
 #[test]
+fn a_trail_folder_is_checked_generated_and_published() {
+    let trail = example("trail");
+    beacon(&["check", &trail]).unwrap();
+    beacon(&["gen", &trail, "--lang", "typescript"]).unwrap();
+    let fake = Fake::start(vec![]);
+    beacon(&["publish", &trail, "--server", &fake.url]).unwrap();
+    assert_eq!(fake.last().path, "/v1/registry/trail");
+    assert!(fake.last().body["kinds"]["trail.disk_full"].is_object());
+}
+
+#[test]
 fn publish_keep_asks_beacon_to_keep_the_other_kinds() {
     let fake = Fake::start(vec![(
         200,

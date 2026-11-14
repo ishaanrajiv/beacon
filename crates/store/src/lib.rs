@@ -23,6 +23,7 @@ mod jobs;
 mod producers;
 mod reads;
 mod rows;
+mod trail;
 
 #[cfg(test)]
 mod tests;
@@ -37,7 +38,9 @@ pub use producers::{
 pub use reads::{
     Acted, AttemptView, DeviceView, HistoryEntry, Inbox, InboxQuery, ItemDetail, SourceView, VisitSummary,
 };
+pub use trail::{Fallback, TrailAlert};
 
+use beacon_core::builtin;
 use beacon_core::decl::Declarations;
 use beacon_core::delivery::Settings;
 use rusqlite::{Connection, Transaction, TransactionBehavior};
@@ -67,6 +70,8 @@ pub(crate) struct Inner {
     pub unreadable: BTreeMap<String, Unreadable>,
     /// Beacon's own declarations, with `[trail] open` applied.
     pub builtin: Vec<Declarations>,
+    /// `[trail] open`: the link of every `trail.*` kind that declares none.
+    pub trail_open: Option<String>,
 }
 
 impl Store {
@@ -125,6 +130,7 @@ impl Store {
             registry: BTreeMap::new(),
             unreadable: BTreeMap::new(),
             builtin,
+            trail_open: None,
         };
         inner.reload_registry()?;
         Ok(Store {
@@ -143,6 +149,7 @@ impl Store {
                 }
             }
         }
+        inner.trail_open = Some(open.to_string());
         inner.reload_registry()
     }
 
@@ -173,7 +180,7 @@ impl Store {
             conn,
             registry,
             unreadable,
-            builtin: _,
+            ..
         } = &mut *inner;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -214,6 +221,21 @@ impl Inner {
         }
         let (published, unreadable) = producers::load_registry(&self.conn)?;
         for decl in published {
+            // Kinds published for `trail` join Beacon's own; its name and icon stay Beacon's.
+            if decl.source == builtin::TRAIL_SOURCE
+                && let Some(trail) = registry.get_mut(builtin::TRAIL_SOURCE)
+            {
+                for (name, mut kind) in decl.kinds {
+                    if builtin::TRAIL_BUILTIN.contains(&name.as_str()) {
+                        continue;
+                    }
+                    if kind.open.is_none() {
+                        kind.open.clone_from(&self.trail_open);
+                    }
+                    trail.kinds.insert(name, kind);
+                }
+                continue;
+            }
             registry.insert(decl.source.clone(), decl);
         }
         self.registry = registry;

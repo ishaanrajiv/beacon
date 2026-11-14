@@ -316,7 +316,8 @@ impl Store {
                     icon: decl.icon,
                     kinds: decl.kinds.len(),
                     builtin,
-                    published: if builtin { None } else { published },
+                    // `trail` is published when kinds were published for it beside Beacon's own.
+                    published: if decl.source == "beacon" { None } else { published },
                     observed: observed || decl.source == "beacon",
                     reason,
                     last_snapshot,

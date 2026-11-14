@@ -1750,15 +1750,13 @@ fn trail_going_quiet_opens_source_stopped() {
 
 // ---------- Trail ----------
 
-fn trail_entry(kind: &str, key: &str, title: &str) -> SnapshotEntry {
-    SnapshotEntry {
-        kind: kind.into(),
+fn trail_entry(kind: &str, key: &str, title: &str) -> TrailAlert {
+    TrailAlert {
         key: key.into(),
-        slots: json!({"title": title, "body": "From Trail"})
-            .as_object()
-            .cloned()
-            .unwrap(),
-        ..SnapshotEntry::default()
+        builtin: kind.into(),
+        title: title.into(),
+        body: "From Trail".into(),
+        ..TrailAlert::default()
     }
 }
 
@@ -1770,21 +1768,22 @@ fn trail_snapshots_open_severe_alerts_and_record_warnings_once_per_appearance() 
         trail_entry("trail.severe", "cpu hot", "CPU is hot"),
         trail_entry("trail.warning", "disk 80", "Disk is filling"),
     ];
-    let first = store.apply_trail_snapshot(T0, firing.clone(), T0).unwrap();
+    let (first, fallbacks) = store.apply_trail_snapshot(T0, firing.clone(), T0).unwrap();
+    assert!(fallbacks.is_empty());
     assert_eq!(first.opened.len(), 2);
     let severe = store.item(first.opened[0], T0).unwrap().unwrap();
     assert_eq!(severe.url.as_deref(), Some("/trail"));
     assert_eq!(severe.key, "cpu hot", "Trail's keys are kept as they are");
-    let second = store
+    let (second, _) = store
         .apply_trail_snapshot(T0 + MINUTE, firing.clone(), T0 + MINUTE)
         .unwrap();
     assert!(second.opened.is_empty());
     assert_eq!(second.updated.len(), 1);
-    let gone = store
+    let (gone, _) = store
         .apply_trail_snapshot(T0 + 2 * MINUTE, vec![], T0 + 2 * MINUTE)
         .unwrap();
     assert_eq!(gone.resolved, [severe.id]);
-    let back = store
+    let (back, _) = store
         .apply_trail_snapshot(T0 + 3 * MINUTE, firing, T0 + 3 * MINUTE)
         .unwrap();
     assert_eq!(back.opened.len(), 1, "the warning again");
@@ -1794,28 +1793,272 @@ fn trail_snapshots_open_severe_alerts_and_record_warnings_once_per_appearance() 
 #[test]
 fn trail_notices_are_recorded_once_and_late_ones_not_pushed() {
     let store = store();
-    let notice = |key: &str| {
-        event(
-            "trail.severe_notice",
-            key,
-            json!({}),
-            json!({"title": "Login failed", "body": "Three times"}),
-        )
+    let notice = |id: &str| TrailAlert {
+        key: id.into(),
+        builtin: "trail.severe_notice".into(),
+        title: "Login failed".into(),
+        body: "Three times".into(),
+        ..TrailAlert::default()
     };
-    let first = store
-        .apply_trail_notice("n-1", &notice("n-1"), false, T0)
-        .unwrap();
+    let (first, _) = store.apply_trail_notice(&notice("n-1"), false, T0).unwrap();
     assert_eq!(first.outcome, EventOutcome::Opened);
     assert_eq!(item(&first).push.status, S::Queued);
-    let again = store
-        .apply_trail_notice("n-1", &notice("n-1"), false, T0 + MINUTE)
+    let (again, _) = store
+        .apply_trail_notice(&notice("n-1"), false, T0 + MINUTE)
         .unwrap();
     assert!(again.repeat);
     assert_eq!(item(&again).id, item(&first).id);
-    let late = store
-        .apply_trail_notice("n-2", &notice("n 2 with spaces"), true, T0)
+    let (late, _) = store
+        .apply_trail_notice(&notice("n 2 with spaces"), true, T0)
         .unwrap();
     assert_eq!(item(&late).push.reason, Some(R::Late));
+}
+
+const TRAIL_KINDS: &str = include_str!("../../../examples/homelab-ish/trail/beacon/kinds.toml");
+
+/// The example's rule kinds, and a one-off alert and an update for event rules.
+fn trail_store() -> Store {
+    let store = store();
+    store.set_trail_open("/trail").unwrap();
+    let mut decl = parse(TRAIL_KINDS, &Check::default()).unwrap();
+    let extra = parse(
+        r#"
+source = "trail"
+name = "Monitoring"
+
+[kinds."trail.login_failed"]
+class = "alert"
+push = "urgent"
+one_off = true
+title = "Sign-in failed for {user}"
+body = "{body}"
+facts = { user = "string" }
+slots = { body = 150 }
+preview = "Sign-in failed"
+actions = ["acknowledge"]
+
+[kinds."trail.deploy_noted"]
+class = "update"
+push = "silent"
+title = "A deploy was noted"
+body = "{title}"
+slots = { title = 40 }
+"#,
+        &Check::default(),
+    )
+    .unwrap();
+    decl.kinds.extend(extra.kinds);
+    let published = store.publish(&decl, T0 - DAY).unwrap();
+    assert_eq!(published.kinds, 4);
+    store
+}
+
+fn disk(key: &str, kind: Option<&str>, value: f64) -> TrailAlert {
+    TrailAlert {
+        key: key.into(),
+        kind: kind.map(Value::from),
+        builtin: "trail.severe".into(),
+        title: "Disk is nearly full on the shop server".into(),
+        body: "Free space is low.".into(),
+        labels: [("trail_source".to_string(), "shop".to_string())].into(),
+        trail_labels: json!({"disk": "data"}).as_object().cloned().unwrap(),
+        source: "shop".into(),
+        alert: "disk_full".into(),
+        value: Some(json!(value)),
+        since: Some(json!(T0 - HOUR)),
+        ..TrailAlert::default()
+    }
+}
+
+#[test]
+fn trail_kinds_join_the_built_in_ones_and_can_be_removed() {
+    let store = trail_store();
+    let trail = store.declarations("trail").unwrap().unwrap();
+    assert_eq!(trail.name, "Monitoring");
+    for name in [
+        "trail.severe",
+        "trail.info",
+        "trail.disk_full",
+        "trail.login_failed",
+    ] {
+        assert!(trail.kinds.contains_key(name), "{name}");
+    }
+    assert_eq!(trail.kinds["trail.disk_full"].open.as_deref(), Some("/system"));
+    assert_eq!(trail.kinds["trail.queue_backlog"].open.as_deref(), Some("/trail"));
+    let view = store.sources().unwrap();
+    let view = view.iter().find(|s| s.source == "trail").unwrap();
+    assert_eq!((view.builtin, view.published), (true, Some(T0 - DAY)));
+    // A built-in name can't be published.
+    let mut bad = parse(TRAIL_KINDS, &Check::default()).unwrap();
+    let severe = bad.kinds["trail.disk_full"].clone();
+    bad.kinds.insert("trail.severe".into(), severe);
+    assert!(
+        beacon_core::decl::validate(&bad, &Check::default())
+            .iter()
+            .any(|p| p.message.contains("Beacon's own Trail kinds"))
+    );
+    // Removing the published kinds leaves Beacon's own.
+    let (answer, _) = store
+        .apply_trail_snapshot(T0, vec![disk("d", Some("trail.disk_full"), 96.0)], T0)
+        .unwrap();
+    assert!(store.unpublish("trail").unwrap());
+    let trail = store.declarations("trail").unwrap().unwrap();
+    assert_eq!(trail.kinds.len(), 4);
+    assert!(trail.kinds.contains_key("trail.severe_notice"));
+    assert_eq!(
+        store.item(answer.opened[0], T0).unwrap().unwrap().kind,
+        "trail.disk_full"
+    );
+}
+
+#[test]
+fn a_trail_entry_naming_a_kind_becomes_that_kind() {
+    let store = trail_store();
+    let (answer, fallbacks) = store
+        .apply_trail_snapshot(
+            T0,
+            vec![disk("shop.disk{disk=data}", Some("trail.disk_full"), 96.5)],
+            T0,
+        )
+        .unwrap();
+    assert!(fallbacks.is_empty(), "{fallbacks:?}");
+    let it = store.item(answer.opened[0], T0).unwrap().unwrap();
+    assert_eq!(it.kind, "trail.disk_full");
+    assert_eq!(it.title, "Disk data is nearly full");
+    assert_eq!(it.body, "96.5% used since 11:00. Backups stop when it fills.");
+    assert_eq!(it.push.level, PushLevel::Urgent);
+    assert_eq!(it.url.as_deref(), Some("/system"));
+    assert_eq!(it.labels["trail_source"], "shop");
+    assert_eq!(it.alert.as_ref().unwrap().next_repeat, Some(T0 + 30 * MINUTE));
+    let detail = store.item_detail(it.id, T0).unwrap().unwrap();
+    assert_eq!(detail.facts["value"], 96.5);
+    assert_eq!(detail.facts["since"], T0 - HOUR);
+    // Ongoing: it updates; absent: it resolves with the kind's recovery text.
+    let (again, _) = store
+        .apply_trail_snapshot(
+            T0 + MINUTE,
+            vec![disk("shop.disk{disk=data}", Some("trail.disk_full"), 97.0)],
+            T0 + MINUTE,
+        )
+        .unwrap();
+    assert_eq!(again.updated, [it.id]);
+    let (gone, _) = store
+        .apply_trail_snapshot(T0 + 2 * MINUTE, vec![], T0 + 2 * MINUTE)
+        .unwrap();
+    assert_eq!(gone.resolved, [it.id]);
+    assert_eq!(
+        store.item(it.id, T0).unwrap().unwrap().title,
+        "Disk data has room again"
+    );
+
+    // The normal one: a label converted to the fact's type, a float value made whole, Trail's
+    // body in the body slot.
+    let mut backlog = disk("shop.queue{queue=email}", Some("trail.queue_backlog"), 150.0);
+    backlog.trail_labels = json!({"queue": "email"}).as_object().cloned().unwrap();
+    backlog.body = "Mail goes out late.".into();
+    let (answer, fallbacks) = store
+        .apply_trail_snapshot(T0 + 3 * MINUTE, vec![backlog], T0 + 3 * MINUTE)
+        .unwrap();
+    assert!(fallbacks.is_empty(), "{fallbacks:?}");
+    let it = store.item(answer.opened[0], T0).unwrap().unwrap();
+    assert_eq!(it.title, "The email queue is backing up");
+    assert_eq!(it.body, "150 jobs are waiting. Mail goes out late.");
+    assert_eq!(it.push.level, PushLevel::Normal);
+}
+
+#[test]
+fn a_trail_entry_whose_kind_doesnt_fit_falls_back_to_its_severity() {
+    let store = trail_store();
+    let mut no_label = disk("b", Some("trail.disk_full"), 96.0);
+    no_label.trail_labels = serde_json::Map::new();
+    let mut not_a_string = disk("d", None, 96.0);
+    not_a_string.kind = Some(json!(3));
+    let firing = vec![
+        disk("a", Some("trail.disk_ful"), 96.0),
+        no_label,
+        disk("c", Some("trail.login_failed"), 96.0),
+        not_a_string,
+        disk("e", Some("trail.warning"), 96.0),
+    ];
+    let (answer, fallbacks) = store.apply_trail_snapshot(T0, firing, T0).unwrap();
+    assert_eq!(answer.opened.len(), 5, "no alert is lost");
+    for id in &answer.opened {
+        assert_eq!(store.item(*id, T0).unwrap().unwrap().kind, "trail.severe");
+    }
+    let keys: Vec<&str> = fallbacks.iter().map(|f| f.key.as_str()).collect();
+    assert_eq!(keys, ["a", "b", "c", "d", "e"]);
+    assert!(
+        fallbacks[0]
+            .problem
+            .fix
+            .contains("did you mean `trail.disk_full`?"),
+        "{:?}",
+        fallbacks[0]
+    );
+    assert!(
+        fallbacks[1].problem.at.ends_with("facts.disk"),
+        "{:?}",
+        fallbacks[1]
+    );
+    assert!(
+        fallbacks[2].problem.message.contains("one-off"),
+        "{:?}",
+        fallbacks[2]
+    );
+    assert_eq!(fallbacks[3].kind, "3");
+    assert!(
+        fallbacks[4]
+            .problem
+            .message
+            .contains("not a kind published for trail")
+    );
+    assert!(fallbacks.iter().all(|f| f.became == "trail.severe"));
+}
+
+#[test]
+fn a_trail_notice_naming_a_kind_becomes_that_kind() {
+    let store = trail_store();
+    let notice = |id: &str, kind: &str, props: Value| TrailAlert {
+        key: id.into(),
+        kind: Some(json!(kind)),
+        builtin: "trail.severe_notice".into(),
+        title: "Sign-in failed".into(),
+        body: "Three wrong passwords.".into(),
+        source: "shop".into(),
+        alert: "login_failed".into(),
+        props: props.as_object().cloned().unwrap(),
+        ..TrailAlert::default()
+    };
+    let (answer, fallbacks) = store
+        .apply_trail_notice(
+            &notice("n-1", "trail.login_failed", json!({"user": "sam"})),
+            false,
+            T0,
+        )
+        .unwrap();
+    assert!(fallbacks.is_empty(), "{fallbacks:?}");
+    let it = item(&answer);
+    assert_eq!(
+        (it.kind.as_str(), it.title.as_str()),
+        ("trail.login_failed", "Sign-in failed for sam")
+    );
+    assert!(it.alert.as_ref().unwrap().one_off);
+    // An update kind is recorded once per notice.
+    let (answer, _) = store
+        .apply_trail_notice(&notice("n-2", "trail.deploy_noted", json!({})), false, T0)
+        .unwrap();
+    assert_eq!(item(&answer).kind, "trail.deploy_noted");
+    // An alert that stays open, or a missing property, falls back.
+    let (answer, fallbacks) = store
+        .apply_trail_notice(&notice("n-3", "trail.disk_full", json!({})), false, T0)
+        .unwrap();
+    assert_eq!(item(&answer).kind, "trail.severe_notice");
+    assert!(fallbacks[0].problem.message.contains("stays open"));
+    let (answer, fallbacks) = store
+        .apply_trail_notice(&notice("n-4", "trail.login_failed", json!({})), false, T0)
+        .unwrap();
+    assert_eq!(item(&answer).kind, "trail.severe_notice");
+    assert!(fallbacks[0].problem.fix.contains("props"), "{:?}", fallbacks[0]);
 }
 
 // ---------- the inbox ----------

@@ -133,6 +133,17 @@ fn round_trips_through_json() {
 }
 
 #[test]
+fn trail_may_be_extended_with_kinds_of_its_own() {
+    let trail = example("trail");
+    assert_eq!(trail.source, "trail");
+    assert_eq!(trail.kinds["trail.disk_full"].push, PushLevel::Urgent);
+    assert_eq!(trail.kinds["trail.queue_backlog"].push, PushLevel::Normal);
+    // Checked like any other kind: copy rules included.
+    let text = "source = \"trail\"\nname = \"Monitoring\"\n[kinds.\"trail.hot\"]\nclass = \"alert\"\npush = \"urgent\"\ntitle = \"{title}\"\nslots = { title = 40 }\none_off = true\nactions = [\"acknowledge\"]\npreview = \"Hot\"\n";
+    assert!(problems(text).contains("words of its own"), "{}", problems(text));
+}
+
+#[test]
 fn stored_declarations_are_stamped_and_read_back() {
     for name in ["backup", "assistant", "ship"] {
         let decl = example(name);
@@ -256,6 +267,10 @@ fn file_level_problems() {
         (
             "source = \"beacon\"\nname = \"Mine\"\n[kinds.\"beacon.thing\"]\nclass = \"record\"\ntitle = \"Thing happened\"".to_string(),
             "Beacon's own source",
+        ),
+        (
+            "source = \"trail\"\nname = \"Monitoring\"\n[kinds.\"trail.warning\"]\nclass = \"record\"\ntitle = \"Thing happened\"".to_string(),
+            "one of Beacon's own Trail kinds",
         ),
         (format!("source = \"backup\"{kind}"), "no display name"),
         (format!("source = \"backup\"\nname = \"Backups of every disk in the house\"{kind}"), "at most 24"),
