@@ -139,6 +139,7 @@ the bare prefix (`/beacon/`) gets a `200` rather than a `404`.
       "source": "backup",
       "name": "Backups",
       "icon": "archive",
+      "service": "backup",
       "kinds": 4,
       "builtin": false,
       "published": 1794571200000,
@@ -152,7 +153,8 @@ the bare prefix (`/beacon/`) gets a `200` rather than a `404`.
 }
 ```
 
-Sorted by `source`. `beacon` and `trail` are listed with `builtin: true`; `published` is null for
+Sorted by `source`. `service` is the label its items carry (`spec/declarations.md`). `beacon` and
+`trail` are listed with `builtin: true`; `published` is null for
 `beacon`, and for `trail` until kinds are published for it (`spec/declarations.md`, "Kinds for
 Trail's rules"), when it is that time and `kinds` counts both.
 `observed` is false while the source is unobserved (`spec/delivery.md`, "Sources"), and `reason`
@@ -252,7 +254,7 @@ One notification of a declared kind.
 | `key` | string | `""` | 0 to 128 printable ASCII characters, no spaces. Which alert or action this is, across events: `(kind, key)` names one. |
 | `facts` | object | `{}` | Every required fact of the kind, of its type; no undeclared ones (`422`). |
 | `slots` | object | `{}` | Every slot of the kind, each a string; no undeclared ones (`422`). Longer text is cut, not refused. |
-| `labels` | object of strings | `{}` | At most 16. Names snake_case (at most 32 characters), values at most 128 characters. Silences match on them. |
+| `labels` | object of strings | `{}` | At most 16. Names snake_case (at most 32 characters), values at most 128 characters. Silences match on them. Without a `service` label, the item gets `service` = its source's `service` (`spec/declarations.md`), which may make it 17. |
 | `state` | string | `"firing"` for an alert, `"open"` for an action | Alert: `"firing"` or `"resolved"`. Action: `"open"` or `"resolved"`. Update and record: must be absent (`400`). |
 | `context` | string or null | null | Required (1 to 128 characters) when the kind declares `context = true`; must be null or absent otherwise (`400`). Like `assistant:thread:42`. |
 | `url` | string or null | the kind's rendered `open` | Overrides the link. Starts with `/` or `https://`, at most 1024 characters. |
@@ -380,7 +382,8 @@ else in Trail changes. Local access only. Every item it makes belongs to source 
 - Trail's keys and notice ids are used as item keys as they are (up to 200 and 256 characters, any
   text): the key rule of `POST /v1/events` doesn't apply to them.
 - Each item's slots are Trail's `title` (cut to 40) and `body` (cut to 150). Its labels are
-  `trail_source` (Trail's `source`) and `trail_alert` (Trail's `alert`), then Trail's `labels`:
+  `service` (Trail's `service` label, else Trail's `source`), `trail_source` (Trail's `source`)
+  and `trail_alert` (Trail's `alert`), then Trail's `labels`:
   a label whose name isn't snake_case is dropped, values are cut to 128 characters, and at most 16
   are kept. A notice's labels are the same. Its link is `[trail] open`.
 - Trail listing one key twice in a snapshot counts once.

@@ -542,9 +542,17 @@ fn snapshots(app: &App, req: &Request) -> Answer {
 }
 
 /// Trail's labels as Beacon keeps them: snake_case names, values cut to 128, at most 16 with
-/// `trail_source` and `trail_alert` first. Others are dropped rather than refusing the body.
+/// `service`, `trail_source` and `trail_alert` first. Others are dropped rather than refusing the body.
 fn trail_labels(labels: Option<&Value>, source: &str, alert: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
+    // The service it is about: Trail's own `service` label, else the source Trail heard it from.
+    let service = labels
+        .and_then(|l| l.get("service"))
+        .and_then(Value::as_str)
+        .unwrap_or(source);
+    if !service.is_empty() {
+        out.insert("service".to_string(), cut(service, 128));
+    }
     if !source.is_empty() {
         out.insert("trail_source".to_string(), cut(source, 128));
     }
@@ -1104,9 +1112,12 @@ mod tests {
     fn trail_labels_are_kept_valid() {
         let labels = json!({"Bad Name": "x", "queue": "y".repeat(300)});
         let out = trail_labels(Some(&labels), "web", "errors");
+        assert_eq!(out["service"], "web", "the source Trail heard it from");
         assert_eq!(out["trail_source"], "web");
         assert_eq!(out["trail_alert"], "errors");
         assert_eq!(out["queue"].len(), 128);
         assert!(!out.contains_key("Bad Name"));
+        let own = json!({"service": "shop-api"});
+        assert_eq!(trail_labels(Some(&own), "web", "errors")["service"], "shop-api");
     }
 }

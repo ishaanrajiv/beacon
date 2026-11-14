@@ -133,6 +133,43 @@ fn round_trips_through_json() {
 }
 
 #[test]
+fn service_defaults_to_the_source_and_is_checked() {
+    let backup = example("backup");
+    assert_eq!((backup.service.as_str(), backup.service()), ("backup", "backup"));
+    assert_eq!(backup.to_json()["service"], "backup");
+    assert!(
+        backup.to_publish_json().get("service").is_none(),
+        "an older server takes it"
+    );
+    let named = parse(
+        &format!("service = \"mail-worker\"\n{}", one_kind(UPDATE)),
+        &Check::default(),
+    )
+    .unwrap();
+    assert_eq!(named.service, "mail-worker");
+    assert_eq!(named.to_publish_json()["service"], "mail-worker");
+    let back = Declarations::from_json(named.to_publish_json(), &Check::default()).unwrap();
+    assert_eq!(back, named);
+    // Missing from JSON: the source.
+    let back = Declarations::from_json(backup.to_publish_json(), &Check::default()).unwrap();
+    assert_eq!(back.service, "backup");
+    for bad in [
+        "Mail",
+        "mail worker",
+        "mail--worker",
+        "-mail",
+        "mail_",
+        &"m".repeat(65),
+    ] {
+        let text = format!("service = \"{bad}\"\n{}", one_kind(UPDATE));
+        assert!(problems(&text).contains("is not a service name"), "{bad}");
+    }
+    for good in ["mail_worker", "mail-worker", "m2"] {
+        assert!(is_service(good), "{good}");
+    }
+}
+
+#[test]
 fn trail_may_be_extended_with_kinds_of_its_own() {
     let trail = example("trail");
     assert_eq!(trail.source, "trail");

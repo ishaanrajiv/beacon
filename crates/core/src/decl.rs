@@ -67,6 +67,10 @@ pub struct Declarations {
     /// What people see as the source's name ("Backups").
     pub name: String,
     pub icon: Icon,
+    /// The service its items are about: every item gets it as the label `service` unless the
+    /// event set one (a deploy's silence matches on it). Defaults to the source.
+    #[serde(default)]
+    pub service: String,
     pub kinds: BTreeMap<String, Kind>,
 }
 
@@ -251,15 +255,40 @@ impl Declarations {
         serde_json::to_value(self).unwrap_or(Value::Null)
     }
 
+    /// What `beacon publish` sends: the JSON form, without `service` when it is the source's own
+    /// name (its default), so a server from before `service` takes it too. The generated
+    /// emitters' declarations hash is over this.
+    pub fn to_publish_json(&self) -> Value {
+        let mut value = self.to_json();
+        if self.service == self.source
+            && let Some(map) = value.as_object_mut()
+        {
+            map.remove("service");
+        }
+        value
+    }
+
+    /// The service its items are labelled with: `service`, else the source.
+    pub fn service(&self) -> &str {
+        if self.service.is_empty() {
+            &self.source
+        } else {
+            &self.service
+        }
+    }
+
     /// Reads declarations sent as JSON and checks them like a file's.
     pub fn from_json(value: Value, check: &Check) -> Result<Declarations, Vec<Problem>> {
-        let decl: Declarations = serde_json::from_value(value).map_err(|e| {
+        let mut decl: Declarations = serde_json::from_value(value).map_err(|e| {
             vec![Problem::new(
                 "declarations",
                 e.to_string(),
                 "publish with `beacon publish <folder>`, which builds this from kinds.toml",
             )]
         })?;
+        if decl.service.is_empty() {
+            decl.service.clone_from(&decl.source);
+        }
         let problems = validate(&decl, check);
         if problems.is_empty() {
             Ok(decl)
@@ -317,6 +346,12 @@ impl Declarations {
             .and_then(Value::as_str)
             .and_then(Icon::parse)
             .unwrap_or(Icon::Bell);
+        let service = map
+            .get("service")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(source)
+            .to_string();
         let mut kinds = BTreeMap::new();
         let mut unreadable = BTreeMap::new();
         match map.get("kinds") {
@@ -340,6 +375,7 @@ impl Declarations {
                 source: source.to_string(),
                 name,
                 icon,
+                service,
                 kinds,
             },
             format: map.get("format").and_then(Value::as_u64),
@@ -407,7 +443,7 @@ fn stored_actions(value: &Value) -> Value {
 
 // ---------- reading the TOML ----------
 
-const FILE_FIELDS: [&str; 4] = ["source", "name", "icon", "kinds"];
+const FILE_FIELDS: [&str; 5] = ["source", "name", "icon", "service", "kinds"];
 const KIND_FIELDS: [&str; 18] = [
     "class",
     "push",
@@ -490,6 +526,8 @@ pub fn parse(text: &str, check: &Check) -> Result<Declarations, Vec<Problem>> {
         }),
     };
 
+    let service = string(FILE, &table, "service", &mut problems).unwrap_or_else(|| source.clone());
+
     let mut kinds = BTreeMap::new();
     match table.get("kinds") {
         None => {}
@@ -521,6 +559,7 @@ pub fn parse(text: &str, check: &Check) -> Result<Declarations, Vec<Problem>> {
         source,
         name,
         icon,
+        service,
         kinds,
     };
     problems.extend(validate(&decl, check));
@@ -857,6 +896,13 @@ pub fn validate(decl: &Declarations, check: &Check) -> Vec<Problem> {
                 ));
             }
         }
+    }
+    if !is_service(decl.service()) {
+        problems.push(Problem::new(
+            format!("{FILE}: service"),
+            format!("`{}` is not a service name", decl.service()),
+            "use a snake_case or kebab-case name of at most 64 characters, like `backup` or `mail-worker`; leave it out to use the source",
+        ));
     }
     let name_len = decl.name.trim().chars().count();
     if name_len == 0 {
@@ -1467,6 +1513,21 @@ fn check_actions(at: &str, kind: &Kind, used: &mut BTreeSet<String>, problems: &
             }
         }
     }
+}
+
+/// Whether `text` can be a service's name: lowercase letters and digits, words joined by `_` or
+/// `-`, starting with a letter, at most 64 characters.
+pub fn is_service(text: &str) -> bool {
+    text.len() <= 64
+        && text.starts_with(|c: char| c.is_ascii_lowercase())
+        && !text.ends_with(['_', '-'])
+        && !text.contains("__")
+        && !text.contains("--")
+        && !text.contains("_-")
+        && !text.contains("-_")
+        && text
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
 /// Whether `text` can be a notification category: `^[A-Z][A-Z0-9_]{0,39}$`.

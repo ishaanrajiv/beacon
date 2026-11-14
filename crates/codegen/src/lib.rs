@@ -72,7 +72,7 @@ pub fn generate(decl: &Declarations, language: Language) -> String {
 /// A hash of the declarations' JSON form (FNV-1a, 64 bits, as 16 hex digits). It changes whenever
 /// anything published would change, and not when only the TOML's comments or layout do.
 pub fn hash(decl: &Declarations) -> String {
-    let text = decl.to_json().to_string();
+    let text = decl.to_publish_json().to_string();
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in text.bytes() {
         hash ^= u64::from(byte);

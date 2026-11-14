@@ -659,7 +659,7 @@ fn trails_webhook_becomes_trail_items() {
     assert_eq!(severe["title"], "Errors are high");
     assert_eq!(
         severe["labels"],
-        json!({"queue": "email", "trail_alert": "errors", "trail_source": "web"})
+        json!({"queue": "email", "service": "web", "trail_alert": "errors", "trail_source": "web"})
     );
     assert_eq!(severe["url"], "/");
     let warning = &inbox["activity"]["items"][0];

@@ -253,7 +253,8 @@ A source is **observed** until it says otherwise or goes quiet:
   one (checked at least every 30 seconds), makes it **unobserved**. A source that has never posted
   a snapshot is never stale.
 - Becoming unobserved, for a source that declares at least one alert kind (and for `trail`),
-  opens one `beacon.source_stopped` alert (key = the source, fact `source_name`, slot `reason`;
+  opens one `beacon.source_stopped` alert (key = the source, label `service` = the source's
+  service, so a deploy's silence of that service mutes it, fact `source_name`, slot `reason`;
   "It stopped reporting." when stale), push `normal`, decided like any alert (`opened`, or
   `reopened` within the flap window). Its source is `beacon`, which is always observed, so the rule
   it reports on never mutes it; a silence can.

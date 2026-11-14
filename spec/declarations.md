@@ -16,6 +16,7 @@ facts and slots; Beacon writes the words. A service keeps its declarations in on
 source = "backup"          # required: the service's name
 name = "Backups"           # required: what people see as the source's name
 icon = "archive"           # optional, default "bell": one of the icons below
+service = "backup"         # optional, default the source: the label `service` on every item
 
 [kinds."backup.failed"]    # one table per kind
 class = "alert"
@@ -39,6 +40,7 @@ repeat = ["2h", "6h"]
 | `source` | string | yes | Lowercase letters, digits and hyphens, starting with a letter, at most 32 characters. `beacon` is reserved. `trail` adds kinds for Trail's rules ("Kinds for Trail's rules"). |
 | `name` | string | yes | 1 to 24 characters. Shown beside every item from this source. |
 | `icon` | string | no, `bell` | One of the icon names below. |
+| `service` | string | no, the source | The service this source's items are about: lowercase letters and digits, words joined by `_` or `-`, starting with a letter, at most 64 characters (`backup`, `mail-worker`). Every item of the source gets it as the label `service` unless the event or snapshot entry set that label itself, so a deploy's silence matching `labels.service` (`spec/api.md`, "Silences") mutes everything the service sends. For `trail` it is ignored: each Trail item's `service` is Trail's `service` label, else Trail's `source`. |
 | `kinds` | table | yes, at least one | `[kinds."<source>.<name>"]` tables. |
 
 Any other top-level field is an error, with the name you probably meant.
@@ -359,6 +361,7 @@ default, except that a missing `throttle` means `"10m"` and `null` means `"none"
   "source": "backup",
   "name": "Backups",
   "icon": "archive",
+  "service": "backup",
   "kinds": {
     "backup.failed": {
       "class": "alert",
@@ -386,5 +389,7 @@ default, except that a missing `throttle` means `"10m"` and `null` means `"none"
 
 A custom action is an object in `actions`: `{"id": "review", "label": "Review", "url": "/code/pulls/{number}/review"}`
 (`url` null or absent when it has none). `open`, `preview`, `recovered` and `recovered_body` are
-null when the kind has none. Durations are written in the largest unit that divides them (`"2h"`,
+null when the kind has none. `beacon publish` leaves `service` out when it is the source's name
+(missing means the source), so a server from before `service` takes the body; the declarations
+hash of a generated emitter (`spec/clients.md`) is over that same JSON. Durations are written in the largest unit that divides them (`"2h"`,
 not `"120m"`).

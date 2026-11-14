@@ -172,7 +172,7 @@ pub fn publish(raw: Vec<String>) -> Done {
             decl.source,
             if keep { "?keep=true" } else { "" }
         );
-        let answer = http.request("PUT", &path, Some(&decl.to_json()))?;
+        let answer = http.request("PUT", &path, Some(&decl.to_publish_json()))?;
         if answer.ok() {
             let json = answer.json();
             let mut line = format!("published  {}", summary(&decl));

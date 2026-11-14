@@ -126,6 +126,8 @@ pub struct SourceView {
     pub source: String,
     pub name: String,
     pub icon: Icon,
+    /// The service its items are labelled with (`service`).
+    pub service: String,
     pub kinds: usize,
     pub builtin: bool,
     pub published: Option<i64>,
@@ -314,6 +316,7 @@ impl Store {
                     source: decl.source.clone(),
                     name: decl.name.clone(),
                     icon: decl.icon,
+                    service: decl.service().to_string(),
                     kinds: decl.kinds.len(),
                     builtin,
                     // `trail` is published when kinds were published for it beside Beacon's own.
@@ -335,6 +338,7 @@ impl Store {
                     source: source.clone(),
                     name: source.clone(),
                     icon: Icon::Bell,
+                    service: source.clone(),
                     kinds: 0,
                     builtin: false,
                     published: Some(u.published),

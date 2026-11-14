@@ -2810,3 +2810,76 @@ fn a_replacing_publish_closes_what_it_removed_the_kind_of() {
         Some(ItemState::Done)
     );
 }
+
+// ---------- the service label ----------
+
+#[test]
+fn every_item_carries_its_service_so_a_deploys_silence_matches_it() {
+    let store = store();
+    // A source that names its service; another that doesn't (its source is its service).
+    let mut ship = parse(SHIP, &Check::default()).unwrap();
+    ship.service = "deployer".into();
+    store.publish(&ship, T0).unwrap();
+    assert_eq!(store.sources().unwrap()[1].service, "backup");
+    let silence = store
+        .open_silence(
+            &NewSilence {
+                matcher: SilenceMatch {
+                    labels: [("service".to_string(), "backup".to_string())].into(),
+                    ..SilenceMatch::default()
+                },
+                until: T0 + HOUR,
+                reason: "Deploying backup".into(),
+                client: "api".into(),
+            },
+            T0,
+        )
+        .unwrap();
+    // The event set no label: it gets the source's service, and the silence mutes it.
+    let it = item(&store.apply_event(&failed(), None, T0).unwrap());
+    assert_eq!(it.labels["service"], "backup");
+    assert_eq!(
+        (it.push.status, it.push.reason),
+        (S::Suppressed, Some(R::Silenced))
+    );
+    assert_eq!(store.silence(silence.id, T0).unwrap().unwrap().matched, 1);
+    // An event's own label wins.
+    let mut own = down();
+    own.labels.insert("service".into(), "website".into());
+    assert_eq!(
+        item(&store.apply_event(&own, None, T0).unwrap()).labels["service"],
+        "website"
+    );
+    // The declared service, on a snapshot entry too.
+    let failed_deploy = event(
+        "ship.failed",
+        "web",
+        json!({"app": "web"}),
+        json!({"cause": "The build broke"}),
+    );
+    let deploy = item(&store.apply_event(&failed_deploy, None, T0).unwrap());
+    assert_eq!(deploy.labels["service"], "deployer");
+    let entry = SnapshotEntry {
+        kind: "backup.space".into(),
+        facts: json!({"used_percent": 97}).as_object().cloned().unwrap(),
+        ..SnapshotEntry::default()
+    };
+    let answer = store.apply_snapshot(&snapshot(vec![entry]), T0).unwrap();
+    let space = store.item(answer.opened[0], T0).unwrap().unwrap();
+    assert_eq!(space.labels["service"], "backup");
+    // Beacon's own items about a source carry that source's service.
+    let mut off = snapshot(vec![]);
+    off.observed = false;
+    off.reason = Some("The bucket didn't answer.".into());
+    store.apply_snapshot(&off, T0 + MINUTE).unwrap();
+    let stopped = store
+        .inbox(&InboxQuery::default(), T0 + MINUTE)
+        .unwrap()
+        .alerts
+        .open
+        .into_iter()
+        .find(|i| i.kind == "beacon.source_stopped")
+        .unwrap();
+    assert_eq!(stopped.labels["service"], "backup");
+    assert_eq!(stopped.push.reason, Some(R::Silenced));
+}

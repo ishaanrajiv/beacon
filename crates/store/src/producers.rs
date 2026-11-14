@@ -3,7 +3,7 @@
 //! transaction; a snapshot is all or nothing.
 
 use crate::Store;
-use crate::engine::{NewItem, Tx, open_input};
+use crate::engine::{NewItem, SERVICE_LABEL, Tx, open_input};
 use crate::error::{Error, ErrorKind, Result};
 use crate::rows::{self, Row};
 use beacon_core::Problem;
@@ -660,7 +660,7 @@ impl Tx<'_, '_> {
         let fields = Fields {
             facts: (!keep).then_some(facts),
             slots: (!keep).then_some(slots),
-            labels: event.labels.clone(),
+            labels: with_service(event.labels.clone(), decl),
             context: event.context.clone(),
             url: event.url.clone(),
             category: event.category.clone(),
@@ -925,7 +925,7 @@ impl Tx<'_, '_> {
             let fields = Fields {
                 facts: Some(entry.facts.clone()),
                 slots: Some(entry.slots.clone()),
-                labels: entry.labels.clone(),
+                labels: with_service(entry.labels.clone(), decl),
                 context: entry.context.clone(),
                 url: entry.url.clone(),
                 category: entry.category.clone(),
@@ -1013,6 +1013,13 @@ impl Tx<'_, '_> {
             .map_or_else(|| source.to_string(), |decl| decl.name.clone())
     }
 
+    /// The labels of Beacon's own items about `source`: its service, so a deploy's silence of
+    /// the service mutes "Can't check" too.
+    fn about(&self, source: &str) -> BTreeMap<String, String> {
+        let service = self.registry.get(source).map_or(source, Declarations::service);
+        BTreeMap::from([(SERVICE_LABEL.to_string(), service.to_string())])
+    }
+
     /// A snapshot was taken: the source is observed, with a fresh `last_snapshot`. If it wasn't,
     /// its open `beacon.source_stopped` resolves (or, with none, `beacon.source_observed` is
     /// recorded) and its alerts muted `unobserved` are decided again.
@@ -1047,6 +1054,7 @@ impl Tx<'_, '_> {
                 let mut new = NewItem::new(builtin::SOURCE_OBSERVED, source);
                 new.facts
                     .insert("source_name".into(), json!(self.source_name(source)));
+                new.labels = self.about(source);
                 self.record_builtin(new)?;
             }
         }
@@ -1094,7 +1102,7 @@ impl Tx<'_, '_> {
                     json!(self.source_name(source)),
                 )])),
                 slots: Some(Map::from_iter([("reason".to_string(), json!(reason))])),
-                labels: BTreeMap::new(),
+                labels: self.about(source),
                 context: None,
                 url: None,
                 category: None,
@@ -1105,6 +1113,7 @@ impl Tx<'_, '_> {
         let mut new = NewItem::new(builtin::SOURCE_UNOBSERVED, source);
         new.facts
             .insert("source_name".into(), json!(self.source_name(source)));
+        new.labels = self.about(source);
         new.slots.insert("reason".into(), json!(reason));
         self.record_builtin(new)?;
         Ok(())
@@ -1118,6 +1127,14 @@ impl Tx<'_, '_> {
         self.suppress(row, reason)?;
         Ok(true)
     }
+}
+
+/// An event's labels with `service` added when it set none: its source's service.
+fn with_service(mut labels: BTreeMap<String, String>, decl: &Declarations) -> BTreeMap<String, String> {
+    if !labels.contains_key(SERVICE_LABEL) {
+        labels.insert(SERVICE_LABEL.into(), decl.service().to_string());
+    }
+    labels
 }
 
 /// The values an event or snapshot entry sets on an item.
