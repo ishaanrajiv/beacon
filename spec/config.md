@@ -166,7 +166,9 @@ database of a newer version than it knows, so going back to an older Beacon afte
 changed the schema needs the database as it was. Before it moves a database to a newer schema,
 Beacon keeps a consistent copy of it (SQLite's `VACUUM INTO`) at
 `data_dir/previous/v<old version>/beacon.db`, mode 600, written under another name and renamed so
-it is whole or absent. If the copy can't be made (the folder isn't writable, the disk is full),
+it is whole or absent, and synced to disk (the file, then the folders that name it) before the
+migration starts, so a power cut can't leave an upgraded database without it. If the copy can't
+be made (the folder isn't writable, the disk is full),
 Beacon doesn't migrate: it stops at start with the problem, and the database is unchanged.
 
 To go back to the Beacon that wrote version N:

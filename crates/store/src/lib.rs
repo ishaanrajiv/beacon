@@ -343,6 +343,8 @@ fn keep_previous(conn: &Connection, dir: &Path) -> Result<()> {
             ),
         )
     };
+    // Which folders this makes, so their own entries can be made durable below.
+    let made: Vec<&Path> = dir.ancestors().take(2).filter(|d| !d.exists()).collect();
     std::fs::create_dir_all(dir).map_err(|e| fail(e.to_string()))?;
     let partial = dir.join("beacon.db.partial");
     let _ = std::fs::remove_file(&partial);
@@ -358,5 +360,17 @@ fn keep_previous(conn: &Connection, dir: &Path) -> Result<()> {
         let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
         let _ = std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o600));
     }
-    std::fs::rename(&partial, dir.join("beacon.db")).map_err(|e| fail(e.to_string()))
+    // On disk before the migration may commit: the copy's bytes, then its name, then the names of
+    // the folders made for it. A power cut after the upgrade must not find the upgraded database
+    // without the copy this promised.
+    let sync = |path: &Path| std::fs::File::open(path).and_then(|file| file.sync_all());
+    sync(&partial).map_err(|e| fail(e.to_string()))?;
+    std::fs::rename(&partial, dir.join("beacon.db")).map_err(|e| fail(e.to_string()))?;
+    sync(dir).map_err(|e| fail(e.to_string()))?;
+    for folder in made {
+        if let Some(parent) = folder.parent() {
+            sync(parent).map_err(|e| fail(e.to_string()))?;
+        }
+    }
+    Ok(())
 }
