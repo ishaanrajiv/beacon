@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import threading
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -77,7 +78,7 @@ class ClientTest(unittest.TestCase):
         self.beacon = FakeBeacon()
         self.env = mock.patch.dict(os.environ, {"BEACON_URL": self.beacon.url}, clear=False)
         self.env.start()
-        for name in ("BEACON_TOKEN", "BEACON_STRICT", "BEACON_DISABLED"):
+        for name in ("BEACON_TOKEN", "BEACON_STRICT", "BEACON_DISABLED", "BEACON_SPOOL_DIR"):
             os.environ.pop(name, None)
         # No real waiting between attempts; the delays asked for are recorded.
         self.sleeps: list[float] = []
@@ -269,6 +270,154 @@ class ClientTest(unittest.TestCase):
         )
         beacon_client.snapshot("ship", [beacon_client.entry("ship.failed", facts={"app": "web"}, slots={"cause": "x"})])
         self.assertEqual(self.beacon.body()["source"], "ship")
+
+
+class SpoolTest(unittest.TestCase):
+    """The spool, against a fake Beacon that refuses (503, or no answer), then accepts."""
+
+    def setUp(self) -> None:
+        self.beacon = FakeBeacon()
+        self.folder = tempfile.TemporaryDirectory()
+        self.spool = os.path.join(self.folder.name, "spool")
+        self.env = mock.patch.dict(os.environ, {"BEACON_URL": self.beacon.url, "BEACON_SPOOL_DIR": self.spool})
+        self.env.start()
+        for name in ("BEACON_TOKEN", "BEACON_STRICT", "BEACON_DISABLED"):
+            os.environ.pop(name, None)
+        self.sleep = mock.patch("time.sleep")
+        self.sleep.start()
+        self.clock = 1794535200000
+        self.now = mock.patch.object(beacon_client._Runtime, "now_ms", self.now_ms)  # pyright: ignore[reportPrivateUsage] - the test sets the spool's clock
+        self.now.start()
+        beacon_client._beacon.dropped_total = 0  # pyright: ignore[reportPrivateUsage] - a fresh count per test
+
+    def tearDown(self) -> None:
+        self.now.stop()
+        self.sleep.stop()
+        self.env.stop()
+        self.beacon.close()
+        self.folder.cleanup()
+
+    def now_ms(self) -> int:
+        return self.clock
+
+    def refuse(self, times: int = 3) -> None:
+        refusal: tuple[int, object] = (503, {})
+        self.beacon.answers.extend([refusal] * times)
+
+    def files(self) -> list[dict[str, object]]:
+        names = sorted(n for n in os.listdir(self.spool) if n.endswith(".json") and not n.startswith("."))
+        return [cast("dict[str, object]", json.loads(Path(self.spool, n).read_text())) for n in names]
+
+    def test_a_send_beacon_cant_take_is_queued_then_sent_first_with_its_key(self) -> None:
+        self.refuse()
+        sent = beacon_client.send("backup.space", facts={"used_percent": 96})
+        self.assertTrue(sent.ok)
+        self.assertTrue(sent.queued)
+        self.assertEqual(sent.status, 503)
+        [spooled] = self.files()
+        self.assertEqual(spooled["path"], "/v1/events")
+        self.assertEqual(spooled["queued_at"], self.clock)
+        first_key = self.beacon.requests[0].headers["idempotency-key"]
+        self.assertEqual(spooled["key"], first_key)
+        # Beacon is back: the next send delivers the queued one first, with the key it was first sent with.
+        self.beacon.requests.clear()
+        sent = beacon_client.send("backup.finished", facts={"size": "2 GB", "took": 1000})
+        self.assertEqual((sent.ok, sent.queued), (True, False))
+        self.assertEqual([self.beacon.body(i)["kind"] for i in range(2)], ["backup.space", "backup.finished"])
+        self.assertEqual(self.beacon.requests[0].headers["idempotency-key"], first_key)
+        self.assertEqual(self.files(), [])
+
+    def test_no_answer_is_queued_too_and_a_generated_file_flushes(self) -> None:
+        self.beacon.close()
+        sent = backup_kinds.backup_space(used_percent=96)
+        self.assertTrue(sent.queued)
+        self.assertIn("no answer from Beacon", sent.problem or "")
+        self.assertEqual(len(self.files()), 1)
+        flushed = backup_kinds.flush()
+        self.assertEqual((flushed.sent, flushed.left), (0, 1))
+        self.beacon = FakeBeacon()
+        os.environ["BEACON_URL"] = self.beacon.url
+        flushed = backup_kinds.flush()
+        self.assertEqual((flushed.sent, flushed.left, flushed.dropped), (1, 0, 0))
+        self.assertEqual(self.beacon.body()["kind"], "backup.space")
+
+    def test_a_refusal_is_never_queued(self) -> None:
+        self.beacon.answers.append((422, {"error": {"at": "event kind", "message": "no", "fix": ""}}))
+        sent = beacon_client.send("backup.faild")
+        self.assertEqual((sent.ok, sent.queued, sent.status), (False, False, 422))
+        self.assertFalse(os.path.exists(self.spool) and self.files())
+
+    def test_a_flush_keeps_order_and_stops_at_the_first_that_cant_go(self) -> None:
+        for n in range(3):
+            self.refuse()
+            beacon_client.send("backup.space", key=f"k{n}", facts={"used_percent": 90 + n})
+            self.clock += 1
+        # Queued in order behind the first: the 2nd and 3rd sends tried the spool once, then waited.
+        self.assertEqual([cast("dict[str, object]", f["body"])["key"] for f in self.files()], ["k0", "k1", "k2"])
+        self.beacon.requests.clear()
+        self.beacon.answers[:] = [(200, {}), (503, {})]
+        flushed = beacon_client.flush()
+        self.assertEqual((flushed.sent, flushed.left), (1, 2))
+        self.assertEqual([self.beacon.body(i)["key"] for i in range(2)], ["k0", "k1"])
+        flushed = beacon_client.flush()
+        self.assertEqual((flushed.sent, flushed.left), (2, 0))
+        self.assertEqual([self.beacon.body(i)["key"] for i in range(2, 4)], ["k1", "k2"])
+
+    def test_a_refusal_during_a_flush_is_dropped_and_counted(self) -> None:
+        for n in range(2):
+            self.refuse()
+            beacon_client.send("backup.space", key=f"k{n}")
+            self.clock += 1
+        self.beacon.answers[:] = [(422, {}), (200, {})]
+        flushed = beacon_client.flush()
+        self.assertEqual((flushed.sent, flushed.left, flushed.dropped), (1, 0, 1))
+
+    def test_after_24_hours_a_request_is_dropped_and_counted(self) -> None:
+        self.refuse()
+        beacon_client.send("backup.space")
+        self.clock += 24 * 60 * 60 * 1000 + 1
+        self.beacon.requests.clear()
+        flushed = beacon_client.flush()
+        self.assertEqual((flushed.sent, flushed.left, flushed.dropped, flushed.dropped_total), (0, 0, 1, 1))
+        self.assertEqual(self.beacon.requests, [])
+
+    def test_a_newer_snapshot_replaces_a_queued_one_and_an_old_one_is_dropped(self) -> None:
+        with mock.patch("time.time", return_value=self.clock / 1000):
+            self.refuse()
+            beacon_client.snapshot("backup", [beacon_client.entry("backup.space", facts={"used_percent": 96})])
+            self.refuse(1)
+            beacon_client.snapshot("ship", [])
+            self.refuse(1)
+            beacon_client.snapshot("backup", [])
+        self.assertEqual([cast("dict[str, object]", f["body"])["source"] for f in self.files()], ["ship", "backup"])
+        self.assertEqual(cast("dict[str, object]", self.files()[1]["body"])["firing"], [])
+        self.clock += 5 * 60 * 1000 + 1
+        self.beacon.requests.clear()
+        flushed = beacon_client.flush()
+        self.assertEqual((flushed.sent, flushed.dropped), (0, 2))
+        self.assertEqual(self.beacon.requests, [])
+
+    def test_the_spool_is_bounded_oldest_dropped_first(self) -> None:
+        sent: beacon_client.Sent | None = None
+        with mock.patch.object(beacon_client, "SPOOL_MAX_FILES", 2):
+            for n in range(3):
+                self.refuse(1 if n else 3)
+                sent = beacon_client.send("backup.space", key=f"k{n}")
+                self.clock += 1
+        self.assertIn("dropped the 1 oldest", (sent.problem if sent else None) or "")
+        self.assertEqual([cast("dict[str, object]", f["body"])["key"] for f in self.files()], ["k1", "k2"])
+        self.assertEqual(beacon_client.flush().dropped_total, 1)
+        with mock.patch.object(beacon_client, "SPOOL_MAX_BYTES", 10):
+            self.refuse()
+            beacon_client.send("backup.space", key="big")
+        self.assertEqual([cast("dict[str, object]", f["body"])["key"] for f in self.files()], ["big"])
+
+    def test_off_without_a_folder(self) -> None:
+        os.environ.pop("BEACON_SPOOL_DIR")
+        self.refuse()
+        sent = beacon_client.send("backup.space")
+        self.assertEqual((sent.ok, sent.queued), (False, False))
+        self.assertEqual(beacon_client.flush(), beacon_client.Flushed(sent=0, left=0, dropped=0, dropped_total=0, problem=None))
 
 
 if __name__ == "__main__":

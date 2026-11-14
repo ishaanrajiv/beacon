@@ -712,3 +712,202 @@ fn no_answer_exits_3() {
     assert_eq!(code, 3);
     assert!(text.contains("no answer from Beacon"), "{text}");
 }
+
+// ---------- the spool ----------
+
+/// The request files a spool holds, oldest first.
+fn spooled(dir: &Path) -> Vec<Value> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".json") && !n.starts_with('.'))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+        .iter()
+        .map(|n| serde_json::from_slice(&std::fs::read(dir.join(n)).unwrap()).unwrap())
+        .collect()
+}
+
+/// An address nothing listens on.
+const NOBODY: &str = "http://127.0.0.1:9";
+
+#[test]
+fn a_send_beacon_cant_take_is_spooled_and_flush_sends_it_with_its_key() {
+    let dir = scratch("spool-send");
+    let spool = dir.join("spool");
+    let spool = spool.to_str().unwrap();
+    let fake = Fake::start(vec![(503, json!({})), (503, json!({})), (503, json!({}))]);
+    let backup = example("backup");
+    let send = |server: &str| {
+        beacon(&[
+            "send",
+            "backup.space",
+            "used_percent=96",
+            "--decls",
+            &backup,
+            "--spool",
+            spool,
+            "--server",
+            server,
+        ])
+    };
+    send(&fake.url).unwrap();
+    let [file] = spooled(Path::new(spool)).try_into().unwrap();
+    assert_eq!(file["path"], "/v1/events");
+    assert_eq!(file["queued_at"], NOW);
+    assert_eq!(file["body"]["kind"], "backup.space");
+    let key = fake.requests()[0].header("idempotency-key").unwrap().to_string();
+    assert_eq!(file["key"], key.as_str());
+
+    // No answer at all is queued too, behind the first.
+    send(NOBODY).unwrap();
+    assert_eq!(spooled(Path::new(spool)).len(), 2);
+    let (code, text) = refused(&["flush", "--spool", spool, "--server", NOBODY]);
+    assert_eq!(code, 3);
+    assert!(text.contains("2 still wait"), "{text}");
+
+    // Beacon is back: the oldest goes first, with the key it was first sent with.
+    let fake = Fake::start(vec![]);
+    beacon(&["flush", "--spool", spool, "--server", &fake.url]).unwrap();
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].header("idempotency-key"), Some(key.as_str()));
+    assert_eq!(requests[0].body["facts"], json!({"used_percent": 96}));
+    assert!(spooled(Path::new(spool)).is_empty());
+}
+
+#[test]
+fn a_flush_drops_a_refusal_and_whatever_is_too_old_and_reads_any_clients_files() {
+    let dir = scratch("spool-flush");
+    // Written as the Python and TypeScript emitters write them (spec/clients.md, "The spool").
+    let file = |name: &str, path: &str, queued_at: i64, body: Value| {
+        let request = json!({"path": path, "key": "0".repeat(32), "queued_at": queued_at, "body": body});
+        std::fs::write(dir.join(name), request.to_string()).unwrap();
+    };
+    file(
+        "001794484700000-000000-aaaaaaaa.json",
+        "/v1/events",
+        NOW - 86_400_001,
+        json!({"kind": "backup.space", "key": "old"}),
+    );
+    file(
+        "001794571100000-000000-bbbbbbbb.json",
+        "/v1/snapshots",
+        NOW - 100_000,
+        json!({"source": "backup", "observed": true, "firing": [], "sent_at": NOW - 300_001}),
+    );
+    file(
+        "001794571190000-000000-cccccccc.json",
+        "/v1/events",
+        NOW - 10_000,
+        json!({"kind": "backup.faild", "key": ""}),
+    );
+    file(
+        "001794571199000-000000-dddddddd.json",
+        "/v1/events",
+        NOW - 1_000,
+        json!({"kind": "backup.space", "key": "new"}),
+    );
+    std::fs::write(dir.join("001794571199500-000000-eeeeeeee.json"), "not json").unwrap();
+    let fake = Fake::start(vec![(422, json!({})), (200, json!({}))]);
+    let dir_text = dir.to_str().unwrap();
+    beacon(&["flush", "--spool", dir_text, "--server", &fake.url, "--json"]).unwrap();
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 2, "only the two still in time are sent");
+    assert_eq!(requests[0].body["kind"], "backup.faild");
+    assert_eq!(requests[1].body["key"], "new");
+    assert_eq!(
+        requests[1].header("idempotency-key"),
+        Some("0".repeat(32).as_str())
+    );
+    assert!(spooled(&dir).is_empty());
+}
+
+#[test]
+fn a_refusal_is_never_spooled() {
+    let dir = scratch("spool-refused");
+    let fake = Fake::start(vec![(
+        422,
+        json!({"error": {"at": "event", "message": "no", "fix": ""}}),
+    )]);
+    let (code, _) = refused(&[
+        "send",
+        "backup.space",
+        "used_percent=96",
+        "--decls",
+        &example("backup"),
+        "--spool",
+        dir.to_str().unwrap(),
+        "--server",
+        &fake.url,
+    ]);
+    assert_eq!(code, 1);
+    assert!(spooled(&dir).is_empty());
+    let (code, _) = refused(&["flush"]);
+    assert_eq!(code, 2, "flush needs a spool");
+}
+
+#[test]
+fn with_a_spool_the_kinds_beacon_last_gave_check_a_send_while_it_is_away() {
+    let dir = scratch("spool-kinds");
+    let spool = dir.to_str().unwrap();
+    let decl = beacon_core::decl::load(Path::new(&example("ship")), &Default::default()).unwrap();
+    let fake = Fake::start(vec![(200, decl.to_json()), (200, json!({"outcome": "recorded"}))]);
+    let send = |server: &str| {
+        beacon(&[
+            "send",
+            "ship.drift",
+            "count=3",
+            "oldest=-1h",
+            "--spool",
+            spool,
+            "--server",
+            server,
+        ])
+    };
+    send(&fake.url).unwrap();
+    send(NOBODY).unwrap();
+    let [file] = spooled(&dir).try_into().unwrap();
+    assert_eq!(file["body"]["facts"]["count"], 3);
+    // Not a value it can check: refused here, not queued.
+    let (code, _) = refused(&[
+        "send",
+        "ship.drift",
+        "count=many",
+        "--spool",
+        spool,
+        "--server",
+        NOBODY,
+    ]);
+    assert_eq!(code, 1);
+}
+
+#[test]
+fn a_newer_snapshot_replaces_a_spooled_one_of_the_same_kinds() {
+    let dir = scratch("spool-snapshot");
+    let spool = dir.to_str().unwrap();
+    let backup = example("backup");
+    let snapshot = |fire: &str, kinds: &str| {
+        let mut args = vec!["snapshot", "backup", "--decls", &backup];
+        if !fire.is_empty() {
+            args.extend(["--fire", fire]);
+        }
+        if !kinds.is_empty() {
+            args.extend(["--kinds", kinds]);
+        }
+        args.extend(["--spool", spool, "--server", NOBODY]);
+        beacon(&args).unwrap();
+    };
+    snapshot("backup.space used_percent=96", "");
+    snapshot("backup.space used_percent=97", "backup.space");
+    snapshot("", "");
+    let files = spooled(&dir);
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0]["body"]["kinds"], json!(["backup.space"]));
+    assert_eq!(files[1]["body"]["firing"], json!([]));
+}

@@ -3,6 +3,7 @@
 
 use crate::args::{Args, pair};
 use crate::http::{Answer, Http};
+use crate::spool::{Spool, retryable};
 use crate::{Done, Fail, out};
 use beacon_core::Problem;
 use beacon_core::decl::{self, Check, Declarations, FactBase, Kind};
@@ -12,10 +13,12 @@ use beacon_core::problem::closest;
 use serde_json::{Map, Value, json};
 use std::path::Path;
 
-/// Where a command learns the kinds: a local folder (`--decls`), else the server's registry.
+/// Where a command learns the kinds: a local folder (`--decls`), else the server's registry, else,
+/// while Beacon doesn't answer, the copy of it the spool keeps.
 pub struct Kinds<'a> {
     folders: &'a [String],
     http: &'a Http,
+    spool: Option<Spool>,
 }
 
 impl<'a> Kinds<'a> {
@@ -23,6 +26,7 @@ impl<'a> Kinds<'a> {
         Kinds {
             folders: args.values("decls"),
             http,
+            spool: Spool::from_args(args),
         }
     }
 
@@ -49,22 +53,36 @@ impl<'a> Kinds<'a> {
                 format!("{hint}add the folder of `{source}`'s kinds.toml with --decls"),
             )]));
         }
-        let answer = self
+        let fetched = self
             .http
-            .request("GET", &format!("/v1/registry/{source}"), None)?;
-        if answer.status == 404 {
-            return Err(Fail::refused(vec![Problem::new(
-                format!("source {source}"),
-                format!("Beacon has no declarations for `{source}`"),
-                format!(
-                    "run `beacon publish <folder>` for `{source}`, or check the kind's name; --decls <folder> checks against a local kinds.toml instead"
-                ),
-            )]));
-        }
-        let answer = answer.into_result()?;
+            .request("GET", &format!("/v1/registry/{source}"), None)
+            .and_then(|answer| {
+                if answer.status == 404 {
+                    return Err(Fail::refused(vec![Problem::new(
+                        format!("source {source}"),
+                        format!("Beacon has no declarations for `{source}`"),
+                        format!(
+                            "run `beacon publish <folder>` for `{source}`, or check the kind's name; --decls <folder> checks against a local kinds.toml instead"
+                        ),
+                    )]));
+                }
+                answer.into_result()
+            });
+        let stored = match (fetched, &self.spool) {
+            (Ok(answer), spool) => {
+                let stored = answer.json();
+                if let Some(spool) = spool {
+                    spool.save_kinds(source, &stored);
+                }
+                stored
+            }
+            // Beacon is away: the kinds it last gave are good enough to queue this.
+            (Err(fail), Some(spool)) if fail.code == 3 => spool.kinds(source).ok_or(fail)?,
+            (Err(fail), _) => return Err(fail),
+        };
         // The server checked them when they were published; read them as tolerantly as it reads
         // its own, so a newer server's fields don't stop the command.
-        Declarations::from_stored(&answer.json())
+        Declarations::from_stored(&stored)
             .map(|stored| stored.decl)
             .map_err(|why| {
                 Fail::refused(vec![Problem::new(
@@ -273,6 +291,76 @@ fn check_context(at: &str, kind_name: &str, kind: &Kind, context: Option<&str>) 
     }
 }
 
+/// What became of a request: Beacon's answer, or kept in the spool to send later.
+pub enum Posted {
+    Answered(Answer),
+    Queued {
+        dir: String,
+        why: String,
+        dropped: usize,
+    },
+}
+
+/// Posts `body`, through the spool when there is one (`--spool` or `BEACON_SPOOL_DIR`): what waits
+/// there goes first, and while anything still waits, or Beacon doesn't answer, answers `408`, `429`
+/// or `5xx`, this is queued behind it rather than failing. A refusal is never queued.
+pub fn post(args: &Args, http: &Http, path: &str, body: &Value, now_ms: i64) -> Result<Posted, Fail> {
+    let Some(spool) = Spool::from_args(args) else {
+        return Ok(Posted::Answered(
+            http.request("POST", path, Some(body))?.into_result()?,
+        ));
+    };
+    let flushed = spool.flush(http, now_ms);
+    let why = if flushed.left > 0 {
+        format!(
+            "{} sent earlier still wait{}: {}",
+            flushed.left,
+            if flushed.left == 1 { "s" } else { "" },
+            flushed.problem.unwrap_or_default()
+        )
+    } else {
+        match http.request("POST", path, Some(body)) {
+            Ok(answer) if !retryable(answer.status) => {
+                return Ok(Posted::Answered(answer.into_result()?));
+            }
+            Ok(answer) => format!("Beacon answered {}", answer.status),
+            Err(fail) => fail
+                .problems
+                .iter()
+                .map(|p| p.message.clone())
+                .collect::<Vec<_>>()
+                .join("; "),
+        }
+    };
+    let dropped = spool.queue(path, http.key(), body, now_ms).map_err(|problem| {
+        Fail::unreachable(vec![
+            Problem::new(
+                args.server(),
+                why.clone(),
+                "check Beacon is running and --server or BEACON_URL points at it",
+            ),
+            problem,
+        ])
+    })?;
+    Ok(Posted::Queued {
+        dir: spool.dir.display().to_string(),
+        why,
+        dropped,
+    })
+}
+
+/// Says a request was queued: on stdout, or as JSON with `--json`.
+pub fn print_queued(args: &Args, what: &str, dir: &str, why: &str, dropped: usize) {
+    if args.flag("json") {
+        out(&json!({"queued": true, "spool": dir, "why": why, "dropped": dropped}).to_string());
+        return;
+    }
+    out(&format!("queued  {what}  in {dir}: {why}"));
+    if dropped > 0 {
+        out(&format!("  the spool was full: dropped the {dropped} oldest"));
+    }
+}
+
 fn print_answer(args: &Args, kind: &str, answer: &Answer) {
     if args.flag("json") {
         out(&answer.body);
@@ -291,7 +379,7 @@ pub fn send(raw: Vec<String>, now_ms: i64) -> Done {
     let args = Args::parse(
         "send",
         raw,
-        &["key", "label", "context", "open", "decls", "server"],
+        &["key", "label", "context", "open", "decls", "server", "spool"],
         &["resolve", "json"],
     )?;
     args.need("send", &["kind"])?;
@@ -300,7 +388,12 @@ pub fn send(raw: Vec<String>, now_ms: i64) -> Done {
 
 /// `beacon resolve <kind> [--key K] [--context C]`
 pub fn resolve(raw: Vec<String>, now_ms: i64) -> Done {
-    let args = Args::parse("resolve", raw, &["key", "context", "decls", "server"], &["json"])?;
+    let args = Args::parse(
+        "resolve",
+        raw,
+        &["key", "context", "decls", "server", "spool"],
+        &["json"],
+    )?;
     args.need("resolve", &["kind"])?;
     args.at_most("resolve", 1)?;
     event(&args, "resolve", true, now_ms)
@@ -349,10 +442,10 @@ fn event(args: &Args, command: &str, resolve: bool, now_ms: i64) -> Done {
     if resolve {
         body.insert("state".into(), json!("resolved"));
     }
-    let answer = http
-        .request("POST", "/v1/events", Some(&Value::Object(body)))?
-        .into_result()?;
-    print_answer(args, kind_name, &answer);
+    match post(args, &http, "/v1/events", &Value::Object(body), now_ms)? {
+        Posted::Answered(answer) => print_answer(args, kind_name, &answer),
+        Posted::Queued { dir, why, dropped } => print_queued(args, kind_name, &dir, &why, dropped),
+    }
     Ok(())
 }
 
@@ -404,6 +497,7 @@ pub fn snapshot(raw: Vec<String>, now_ms: i64) -> Done {
             "label",
             "decls",
             "server",
+            "spool",
         ],
         &["json"],
     )?;
@@ -474,9 +568,13 @@ pub fn snapshot(raw: Vec<String>, now_ms: i64) -> Done {
         body.insert("firing".into(), Value::Array(firing));
     }
 
-    let answer = http
-        .request("POST", "/v1/snapshots", Some(&Value::Object(body)))?
-        .into_result()?;
+    let answer = match post(&args, &http, "/v1/snapshots", &Value::Object(body), now_ms)? {
+        Posted::Answered(answer) => answer,
+        Posted::Queued { dir, why, dropped } => {
+            print_queued(&args, &format!("snapshot {source}"), &dir, &why, dropped);
+            return Ok(());
+        }
+    };
     if args.flag("json") {
         out(&answer.body);
     } else {
@@ -554,4 +652,41 @@ fn entry(
         entry.insert("labels".into(), Value::Object(labels.clone()));
     }
     Ok(Value::Object(entry))
+}
+
+/// `beacon flush [--spool DIR] [--server URL] [--json]`: sends what the spool holds, oldest first.
+pub fn flush(raw: Vec<String>, now_ms: i64) -> Done {
+    let args = Args::parse("flush", raw, &["spool", "server"], &["json"])?;
+    args.at_most("flush", 0)?;
+    let Some(spool) = Spool::from_args(&args) else {
+        return Err(Fail::usage(Problem::new(
+            "beacon flush",
+            "which spool?",
+            "write `beacon flush --spool <folder>`, or set BEACON_SPOOL_DIR",
+        )));
+    };
+    let http = Http::new(args.server());
+    let flushed = spool.flush(&http, now_ms);
+    if args.flag("json") {
+        out(&json!({
+            "sent": flushed.sent,
+            "left": flushed.left,
+            "dropped": flushed.dropped,
+            "problem": flushed.problem,
+        })
+        .to_string());
+    } else {
+        out(&format!(
+            "sent {}, waiting {}, dropped {}",
+            flushed.sent, flushed.left, flushed.dropped
+        ));
+    }
+    match flushed.problem {
+        Some(why) if flushed.left > 0 => Err(Fail::unreachable(vec![Problem::new(
+            args.server(),
+            format!("{} still wait: {why}", flushed.left),
+            "check Beacon is running and --server or BEACON_URL points at it, then run `beacon flush` again",
+        )])),
+        _ => Ok(()),
+    }
 }

@@ -23,12 +23,13 @@ take any kind by name, and `send` and `entry` any `category`, unchecked until Be
 | Behaviour | Rule |
 |---|---|
 | Typed | One function per kind. Facts and slots are required keyword arguments (`?` facts optional), typed as below. A kind that isn't declared has no function. |
-| One request | Each call is one `POST /v1/events` (or `/v1/snapshots`), sent before the call returns (Python) or resolves (TypeScript). Nothing is queued in memory or on disk: notifications are few, and a caller that must not wait runs the call off its main path. |
+| One request | Each call is one `POST /v1/events` (or `/v1/snapshots`), sent before the call returns (Python) or resolves (TypeScript). Nothing is queued in memory; on disk only with a spool. A caller that must not wait runs the call off its main path. |
+| Spool | Off unless given a folder (`spool_dir` / `spoolDir` in `configure`, or `BEACON_SPOOL_DIR`). Then a call Beacon couldn't take (no answer, `408`, `429`, `5xx`, after the retries) is kept on disk and sent later, before the next call and by `flush()`; see "The spool". |
 | Idempotent | Each call makes a random Idempotency-Key (32 hex characters) and sends it with every retry of that call, so a retry after a lost answer is recorded once. |
 | Retries | No answer, `408`, `429` or `5xx`: tried again after 1 s, then 3 s; three attempts at most. Each attempt times out after 5 s. Any other answer is final. |
 | Never throws | A failure returns a result with `ok` false and a `problem` string; it never raises into application code, unless strict mode is on. |
 | Strict mode | For tests: `BEACON_STRICT=1`, or `strict` in `configure`. A result that isn't `ok` raises `BeaconError` (Python) or rejects (TypeScript). |
-| Off switch | `BEACON_DISABLED=1`: every call returns `ok` at once and sends nothing. |
+| Off switch | `BEACON_DISABLED=1`: every call returns `ok` at once and sends nothing (and spools nothing). |
 | Where | `BEACON_URL` (default `http://127.0.0.1:8210`); `BEACON_TOKEN`, when set, is sent as `Authorization: Bearer` (the server's `auth.producer_token`). `configure()` overrides each. |
 | Up to date | The file's first three lines name the source and the generator's version, say not to edit it, and give a hash of the declarations' JSON form (`declarations: fnv1a64 <16 hex digits>`; FNV-1a over the compact JSON `beacon publish` sends, so comments and layout don't change it). `beacon gen --check` fails when the file differs from what the folder would generate now, and says whether the declarations changed. |
 
@@ -40,7 +41,8 @@ The result (`Sent`):
 | `status` | the HTTP status, or 0 when Beacon never answered (or when disabled) |
 | `outcome` | the event's `outcome` (`opened`, `updated`, `resolved`, `recorded`, `ignored`…), or null |
 | `item` | the item's id, or null |
-| `problem` | the first problem's text (`at: message\n  fix: …`) when not `ok`, else null |
+| `problem` | the first problem's text (`at: message\n  fix: …`) when not `ok`; why it waits when `queued`; else null |
+| `queued` | true when the call was kept in the spool to send later; `ok` is then true and `status` is Beacon's last answer, 0 for none |
 
 Fact types in the generated signatures:
 
@@ -81,6 +83,7 @@ class Sent:
     outcome: str | None
     item: int | None
     problem: str | None
+    queued: bool = False
 
 @dataclass(frozen=True)
 class Entry:
@@ -88,7 +91,17 @@ class Entry:
     kind: str
     body: Mapping[str, object]
 
-def configure(*, url: str | None = None, token: str | None = None, strict: bool | None = None, disabled: bool | None = None) -> None: ...
+def configure(*, url: str | None = None, token: str | None = None, strict: bool | None = None, disabled: bool | None = None, spool_dir: str | None = None) -> None: ...
+
+@dataclass(frozen=True)
+class Flushed:
+    sent: int           # delivered now
+    left: int           # still waiting
+    dropped: int        # dropped by this flush
+    dropped_total: int  # dropped by this process since it started
+    problem: str | None # why the first still waiting couldn't go
+
+def flush() -> Flushed: ...
 
 # (end of the runtime)
 SOURCE = "backup"
@@ -162,10 +175,12 @@ def unobserved(reason: str, *, stale_after: str | None = None) -> Sent: ...
 
 // (the runtime of clients/node/beacon_client.ts:)
 export const DEFAULT_URL = "http://127.0.0.1:8210";
-export interface Sent { ok: boolean; status: number; outcome: string | null; item: number | null; problem: string | null }
+export interface Sent { ok: boolean; status: number; outcome: string | null; item: number | null; problem: string | null; queued: boolean }
+export interface Flushed { sent: number; left: number; dropped: number; droppedTotal: number; problem: string | null }
 export interface Entry { readonly kind: string; readonly body: Readonly<Record<string, unknown>> }
 export class BeaconError extends Error {}
-export function configure(options: { url?: string; token?: string; strict?: boolean; disabled?: boolean }): void;
+export function configure(options: { url?: string; token?: string; strict?: boolean; disabled?: boolean; spoolDir?: string }): void;
+export function flush(): Promise<Flushed>;
 // (end of the runtime)
 
 export const SOURCE = "backup";
@@ -188,10 +203,52 @@ export function unobserved(reason: string, options: { stale_after?: string } = {
 It type-checks under `tsc --strict --noEmit` with `noUnusedLocals`, `noUnusedParameters`,
 `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes` and `noPropertyAccessFromIndexSignature`
 on (it needs `lib: ["dom"]` or `@types/node` for `fetch`), reads `process.env` when there is one,
-and uses `AbortSignal.timeout` for the 5 s limit. An optional fact is an optional property; a kind
+and uses `AbortSignal.timeout` for the 5 s limit. The spool needs Node: it loads `node:fs/promises`
+only when a spool folder is set, so the file still type-checks and runs in a browser without one. An optional fact is an optional property; a kind
 whose function would take only `Common` can be called with no argument. The argument object is an
 object literal at the call, so an undeclared fact or slot is an excess-property error, and so is a
 `category` on a kind that declares no categories.
+
+## The spool
+
+A notification sent while Beacon restarts (every deploy of it) is otherwise lost. With a spool
+folder, the emitters and the `beacon` command keep it instead:
+
+- **What is kept.** A call that gets no answer (it can't connect, or times out), or `408`, `429` or
+  `5xx`, after its retries, is written to the folder and answered `queued` (`ok` true), not failed.
+  Any other answer is final: a `4xx` is never kept, since sending it again would be refused again.
+- **When it is sent.** Before every call, the folder is flushed first; and by `flush()` (or `beacon
+  flush`), which a service can call on a timer. A flush sends the files oldest first, one attempt
+  each, and stops at the first that still can't go, so order is kept. While anything still waits,
+  a new call isn't tried: it is queued behind, in order. A file answered `2xx` is removed; a file
+  answered `4xx` is removed and counted as dropped, and the flush goes on.
+- **Recorded once.** Each request carries the Idempotency-Key made when it was first sent, and
+  keeps it in its file, so a request that did arrive but whose answer was lost is recorded once
+  (`spec/delivery.md`, "Idempotency").
+- **Snapshots.** A snapshot keeps its `sent_at`. A new snapshot replaces any waiting one of the
+  same source covering the same kinds (the same `kinds`, or both none): it says all the older one
+  did. One of other kinds stays, in order. A waiting snapshot is dropped, not sent, once its
+  `sent_at` is more than 5 minutes old (Beacon would refuse it, `spec/api.md`).
+- **Bounded.** A file waits at most 24 hours (Beacon's idempotency window), then is dropped. The
+  folder holds at most 1,000 files and 8 MB: queuing one more drops the oldest first. Every drop is
+  counted: `Flushed.dropped` (this flush) and `dropped_total` / `droppedTotal` (this process), the
+  `queued` answer's `problem` when it had to drop the oldest, and `beacon flush`'s `dropped`.
+
+The files are the same for every client, so the Python and TypeScript emitters and the command can
+share one folder, and any of them flushes the others'. One file per request, named
+`<ms since 1970, 15 digits>-<6-digit sequence>-<8 hex>.json`, so the names sort oldest first, and
+written to a temporary name starting with `.` and then renamed, so a reader never sees half of one.
+It holds:
+
+```json
+{"path": "/v1/events", "key": "<32 hex>", "queued_at": 1794571200000, "body": {"kind": "backup.failed", "key": "nightly", "facts": {}}}
+```
+
+Names that don't end `.json`, or start with `.`, are not requests: the command keeps the
+declarations it last read from Beacon there (`.kinds-<source>.json`), so `send` and `snapshot` can
+still check their values and queue while Beacon is away. A file that doesn't read as a request is
+dropped and counted. Two processes flushing one folder at once may both send a file; its
+Idempotency-Key (an event) or `sent_at` (a snapshot) keeps that harmless. Use one folder per Beacon.
 
 ## The `beacon` command
 
@@ -203,6 +260,7 @@ beacon gen <folder> --lang python|typescript [--out FILE] [--check]
 beacon send <kind> [name=value]... [--key K] [--resolve] [--label name=value]... [--context C] [--open LINK] [--decls FOLDER] [--server URL] [--json]
 beacon resolve <kind> [--key K] [--context C] [--decls FOLDER] [--server URL] [--json]
 beacon snapshot <source> [--fire '<kind> [key=K] [context=C] [url=LINK] name=value...']... [--kinds K,K] [--stale-after D] [--unobserved REASON] [--label name=value]... [--decls FOLDER] [--server URL] [--json]
+beacon flush [--spool DIR] [--server URL] [--json]
 beacon silence add [--source S] [--kind K [--key K]] [--label name=value]... (--for D | --until TIME) --reason R [--server URL]
 beacon silence extend <id> (--for D | --until TIME) [--server URL]
 beacon silence end <id> [--server URL]
@@ -220,6 +278,7 @@ the emitters.
 | `gen` | Writes the emitter file to `--out`, or prints it without one. `--check` (needs `--out`) writes nothing and fails if the file differs. |
 | `send` | One `POST /v1/events`. |
 | `resolve` | `send --resolve`: an event with state `resolved` and no values. |
+| `flush` | Sends what the spool (`--spool`, else `BEACON_SPOOL_DIR`) holds, as "The spool" says, and prints `sent N, waiting N, dropped N` (`--json`: `{"sent", "left", "dropped", "problem"}`). Exit `3` while any still wait. |
 | `snapshot` | One `POST /v1/snapshots`, with `sent_at` now. Each `--fire` is one entry, written like a `send` in one quoted word (`'…'` or `"…"` inside keep spaces; `key=`, `context=` and `url=` set the entry's own fields); none means nothing is firing. `--label` applies to every entry. `--unobserved REASON` posts `observed: false` and needs no declarations. |
 | `silence add` | `POST /v1/silences`; prints the silence's id. |
 | `silence extend` | `PATCH /v1/silences/{id}`. |
@@ -251,7 +310,13 @@ beacon snapshot backup --unobserved "The bucket's status page didn't load."
 beacon silence add --label service=dashboard --for 30m --reason "Deploying dashboard"
 ```
 
-Exit status: `0` done; `1` refused, by a local check or by Beacon (every problem printed to stderr
+`send`, `resolve` and `snapshot` take `--spool DIR` (else `BEACON_SPOOL_DIR`): what Beacon can't
+take is queued there, as "The spool" says, and the command prints `queued  <kind>  in <dir>: <why>`
+(`--json`: `{"queued": true, "spool", "why", "dropped"}`) and exits `0`. While Beacon doesn't
+answer, the kinds come from the copy the spool keeps of what Beacon last gave; with none yet, the
+command fails as it would without a spool.
+
+Exit status: `0` done (or queued); `1` refused, by a local check or by Beacon (every problem printed to stderr
 as `at: message` and `  fix: …`); `2` the command line is wrong; `3` Beacon didn't answer, or
 answered `5xx`, after the retries above. `--json` prints Beacon's answer to stdout. The command
 retries like the emitters, with one Idempotency-Key per invocation.
