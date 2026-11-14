@@ -9,8 +9,11 @@ use crate::problem::Problem;
 pub const BEACON: &str = include_str!("../builtin/beacon.toml");
 pub const TRAIL: &str = include_str!("../builtin/trail.toml");
 
-/// Beacon's kind for a source that stopped reporting (`spec/delivery.md`, "Sources").
+/// Beacon's update for a source with no alert kinds that stopped reporting (`spec/delivery.md`,
+/// "Sources").
 pub const SOURCE_UNOBSERVED: &str = "beacon.source_unobserved";
+/// Beacon's alert for a source with alert kinds that stopped reporting: its alerts are on hold.
+pub const SOURCE_STOPPED: &str = "beacon.source_stopped";
 /// Beacon's record for a source that reported again.
 pub const SOURCE_OBSERVED: &str = "beacon.source_observed";
 /// Beacon's one notice for a flapping alert.
@@ -47,11 +50,21 @@ mod tests {
         let all = declarations().unwrap();
         let beacon = &all[0];
         assert_eq!(beacon.source, "beacon");
-        for name in [SOURCE_UNOBSERVED, SOURCE_OBSERVED, FLAPPING, CATCH_UP, BUDGET] {
+        for name in [
+            SOURCE_UNOBSERVED,
+            SOURCE_STOPPED,
+            SOURCE_OBSERVED,
+            FLAPPING,
+            CATCH_UP,
+            BUDGET,
+        ] {
             assert!(beacon.kinds.contains_key(name), "{name}");
         }
         assert_eq!(beacon.kinds[SOURCE_UNOBSERVED].push, PushLevel::None);
         assert_eq!(beacon.kinds[SOURCE_OBSERVED].class, Class::Record);
+        let stopped = &beacon.kinds[SOURCE_STOPPED];
+        assert_eq!((stopped.class, stopped.push), (Class::Alert, PushLevel::Normal));
+        assert!(!stopped.one_off);
         let trail = &all[1];
         assert_eq!(trail.kinds[TRAIL_SEVERE].class, Class::Alert);
         assert_eq!(trail.kinds[TRAIL_SEVERE].push, PushLevel::Urgent);

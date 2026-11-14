@@ -1218,8 +1218,30 @@ fn an_unobserved_source_mutes_its_alerts_until_it_reports_again() {
             .status,
         S::Queued
     );
-    // Unobserved twice records one notice.
+    // Unobserved twice opens one alert, which pushes: it belongs to `beacon`, never muted by
+    // the rule it reports on.
     store.apply_snapshot(&s, T0 + MINUTE).unwrap();
+    let open = store
+        .inbox(&InboxQuery::default(), T0 + MINUTE)
+        .unwrap()
+        .alerts
+        .open;
+    let stopped: Vec<_> = open
+        .iter()
+        .filter(|i| i.kind == "beacon.source_stopped")
+        .collect();
+    assert_eq!(stopped.len(), 1);
+    let stopped = stopped[0].clone();
+    assert_eq!(stopped.source, "beacon");
+    assert_eq!(stopped.key, "backup");
+    assert_eq!(stopped.title, "Can't check Backups");
+    assert_eq!(
+        stopped.body,
+        "The bucket didn't answer. Its alerts are on hold until it reports again."
+    );
+    assert_eq!(stopped.push.level, PushLevel::Normal);
+    assert_eq!(stopped.push.status, S::Queued);
+    sent(&store, T0 + MINUTE);
     store
         .apply_snapshot(
             &snapshot(vec![SnapshotEntry {
@@ -1235,6 +1257,12 @@ fn an_unobserved_source_mutes_its_alerts_until_it_reports_again() {
     let after = store.item(it.id, T0).unwrap().unwrap();
     assert_eq!(after.state, Some(ItemState::Open));
     assert_eq!(after.push.status, S::Queued, "decided again (unmuted)");
+    // Observed again: the alert resolves with its recovery, in place of the record.
+    let back = store.item(stopped.id, T0).unwrap().unwrap();
+    assert_eq!(back.state, Some(ItemState::Resolved));
+    assert_eq!(back.title, "Checking Backups again");
+    assert_eq!(back.body, "Its alerts are back on. Lasted 2 min.");
+    assert_eq!(back.push.status, S::Queued, "the recovery");
     let all = InboxQuery {
         classes: vec![Class::Update, Class::Record],
         ..InboxQuery::default()
@@ -1248,7 +1276,71 @@ fn an_unobserved_source_mutes_its_alerts_until_it_reports_again() {
         .map(|i| i.kind)
         .filter(|k| k.starts_with("beacon."))
         .collect();
+    assert!(kinds.is_empty(), "{kinds:?}");
+}
+
+#[test]
+fn a_source_with_no_alert_kinds_records_an_update_and_a_record() {
+    let store = store();
+    let notes = r#"
+source = "notes"
+name = "Notes"
+icon = "book"
+
+[kinds."notes.saved"]
+class = "update"
+push = "silent"
+title = "Note saved"
+"#;
+    store
+        .publish(&parse(notes, &Check::default()).unwrap(), T0 - DAY)
+        .unwrap();
+    let snap = |observed: bool| Snapshot {
+        source: "notes".into(),
+        observed,
+        reason: (!observed).then(|| "The folder didn't load.".into()),
+        stale_after: None,
+        sent_at: None,
+        kinds: Some(vec![]),
+        firing: vec![],
+    };
+    store.apply_snapshot(&snap(false), T0).unwrap();
+    store.apply_snapshot(&snap(true), T0 + MINUTE).unwrap();
+    let all = InboxQuery {
+        classes: vec![Class::Update, Class::Record],
+        ..InboxQuery::default()
+    };
+    let inbox = store.inbox(&all, T0 + MINUTE).unwrap();
+    let kinds: Vec<&str> = inbox.activity.items.iter().map(|i| i.kind.as_str()).collect();
     assert_eq!(kinds, ["beacon.source_observed", "beacon.source_unobserved"]);
+    assert_eq!(inbox.activity.items[1].push.status, S::None);
+    assert!(inbox.alerts.open.is_empty());
+}
+
+#[test]
+fn a_silence_still_mutes_source_stopped() {
+    let store = store();
+    store
+        .open_silence(
+            &NewSilence {
+                matcher: SilenceMatch {
+                    kind: Some("beacon.source_stopped".into()),
+                    ..SilenceMatch::default()
+                },
+                reason: "Moving the backups".into(),
+                until: T0 + HOUR,
+                client: "api".into(),
+            },
+            T0,
+        )
+        .unwrap();
+    let mut s = snapshot(vec![]);
+    s.observed = false;
+    s.reason = Some("The bucket didn't answer.".into());
+    store.apply_snapshot(&s, T0).unwrap();
+    let open = store.inbox(&InboxQuery::default(), T0).unwrap().alerts.open;
+    let stopped = open.iter().find(|i| i.kind == "beacon.source_stopped").unwrap();
+    assert_eq!(stopped.push.reason, Some(R::Silenced));
 }
 
 #[test]
@@ -1268,16 +1360,42 @@ fn a_source_goes_stale_without_snapshots() {
         .unwrap();
     assert!(!source.observed);
     assert_eq!(source.reason.as_deref(), Some("It stopped reporting."));
-    let unobserved = store
+    let stopped = store
         .inbox(&InboxQuery::default(), T0 + 5 * MINUTE)
         .unwrap()
-        .activity
-        .items
+        .alerts
+        .open
         .into_iter()
-        .find(|i| i.kind == "beacon.source_unobserved")
+        .find(|i| i.kind == "beacon.source_stopped")
         .unwrap();
-    assert_eq!(unobserved.title, "Can't check Backups");
-    assert_eq!(unobserved.push.status, S::None);
+    assert_eq!(stopped.title, "Can't check Backups");
+    assert_eq!(
+        stopped.body,
+        "It stopped reporting. Its alerts are on hold until it reports again."
+    );
+    assert_eq!(stopped.push.status, S::Queued);
+}
+
+#[test]
+fn trail_going_quiet_opens_source_stopped() {
+    let store = store();
+    store.apply_trail_snapshot(T0, vec![], T0).unwrap();
+    store.run_due(T0 + 11 * MINUTE).unwrap();
+    let stopped = store
+        .inbox(&InboxQuery::default(), T0 + 11 * MINUTE)
+        .unwrap()
+        .alerts
+        .open
+        .into_iter()
+        .find(|i| i.kind == "beacon.source_stopped")
+        .unwrap();
+    assert_eq!(stopped.key, "trail");
+    assert_eq!(stopped.push.status, S::Queued);
+    store
+        .apply_trail_snapshot(T0 + 12 * MINUTE, vec![], T0 + 12 * MINUTE)
+        .unwrap();
+    let after = store.item(stopped.id, T0).unwrap().unwrap();
+    assert_eq!(after.state, Some(ItemState::Resolved));
 }
 
 // ---------- Trail ----------

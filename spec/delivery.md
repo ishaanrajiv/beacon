@@ -218,14 +218,19 @@ A source is **observed** until it says otherwise or goes quiet:
 - A snapshot with `observed: false` and a `reason`, or no snapshot for `stale_after` after the last
   one (checked at least every 30 seconds), makes it **unobserved**. A source that has never posted
   a snapshot is never stale.
-- Becoming unobserved records one `beacon.source_unobserved` update (key = the source, fact
-  `source_name`, slot `reason`; "It stopped reporting." when stale). Its push is `none`; clients
-  show it on their system page.
+- Becoming unobserved, for a source that declares at least one alert kind (and for `trail`),
+  opens one `beacon.source_stopped` alert (key = the source, fact `source_name`, slot `reason`;
+  "It stopped reporting." when stale), push `normal`, decided like any alert (`opened`, or
+  `reopened` within the flap window). Its source is `beacon`, which is always observed, so the rule
+  it reports on never mutes it; a silence can.
+- A source with no alert kind records one `beacon.source_unobserved` update instead (the same key,
+  fact and slot). Its push is `none`; clients show it on their system page.
 - While unobserved, the source's alerts don't push (`unobserved`), and nothing about them changes:
   not hearing from a source is not a recovery. Its actions and updates push as usual.
-- A snapshot with `observed: true` makes it observed again and records `beacon.source_observed`.
-  Each of its alerts still open whose push was suppressed `unobserved` is decided again
-  (`unmuted`).
+- A snapshot with `observed: true` makes it observed again. Its open `beacon.source_stopped`
+  resolves ("Checking {source_name} again", with how long it lasted, and a recovery push if its
+  push was sent); with none open, Beacon records `beacon.source_observed`. Each of its alerts
+  still open whose push was suppressed `unobserved` is decided again (`unmuted`).
 - Source `trail` follows the same rules through `POST /v1/trail`. Source `beacon` is always observed.
 
 ## The budget

@@ -299,7 +299,7 @@ limit) posts one after each check, so a restart or a missed post is put right at
 |---|---|---|---|
 | `source` | string | required | A published source (`422` otherwise). Not `beacon` or `trail`. |
 | `observed` | bool | `true` | false: the source couldn't see what it watches (see below). |
-| `reason` | string | required when `observed` is false | 1 to 100 characters, a sentence for a person: "The usage page didn't load." Becomes the `reason` slot of `beacon.source_unobserved`. |
+| `reason` | string | required when `observed` is false | 1 to 100 characters, a sentence for a person: "The usage page didn't load." Becomes the `reason` slot of `beacon.source_stopped` (or, for a source with no alert kind, `beacon.source_unobserved`). |
 | `stale_after` | duration | `[delivery] snapshot_stale_after` (`15m`) | `1m` to `7d`. With no snapshot for this long, the source becomes unobserved. |
 | `sent_at` | integer ms | none | When the source made it. If sent: `409` when older than the newest snapshot already taken from this source, more than 5 minutes old, or more than 1 minute in the future. |
 | `kinds` | list of kind names | every `alert` and `action` kind of the source | The kinds this snapshot is complete for. Each must be an alert or action kind of the source (`422`). |
@@ -314,12 +314,14 @@ With `observed: true`, in one transaction:
    a snapshot opened it.
 3. An action you closed (done or dismissed) whose `(kind, key)` is still listed stays closed. It
    opens again as a new item only after a snapshot without it, followed by one with it.
-4. The source is observed again (if it wasn't, Beacon records `beacon.source_observed`), its
+4. The source is observed again (if it wasn't, its open `beacon.source_stopped` resolves, or with
+   none open Beacon records `beacon.source_observed`), its
    `last_snapshot` is now and its `stale_after` is the one given.
 
 With `observed: false`, nothing opens or resolves (`firing` is ignored): the source is unobserved
 with `reason`, and its alerts are muted until a snapshot with `observed: true`
-(`spec/delivery.md`, "Sources").
+(`spec/delivery.md`, "Sources"). A source that declares an alert kind opens a
+`beacon.source_stopped` alert saying so.
 
 The snapshot is all or nothing: if any entry fails a check, `422` with every problem
 (`at` like `snapshot firing[2] facts.used_percent`), and nothing changes.
@@ -353,8 +355,8 @@ else in Trail changes. Local access only. Every item it makes belongs to source 
   are kept. A notice's labels are the same. Its link is `[trail] open`.
 - Trail listing one key twice in a snapshot counts once.
 - A snapshot also observes source `trail`, with `stale_after` = `[trail] stale_after` (`11m`:
-  Trail re-posts every 5 minutes). If Trail stops posting, `trail` becomes unobserved and its
-  alerts are muted.
+  Trail re-posts every 5 minutes). If Trail stops posting, `trail` becomes unobserved, its
+  alerts are muted, and `beacon.source_stopped` (key `trail`) opens and pushes.
 
 **`notice`** (`{"type": "notice", "id", "source", "alert", "severity", "title", "body", "ts", "event"}`):
 

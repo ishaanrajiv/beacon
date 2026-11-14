@@ -838,7 +838,8 @@ impl Tx<'_, '_> {
     }
 
     /// A snapshot was taken: the source is observed, with a fresh `last_snapshot`. If it wasn't,
-    /// `beacon.source_observed` is recorded and its alerts muted `unobserved` are decided again.
+    /// its open `beacon.source_stopped` resolves (or, with none, `beacon.source_observed` is
+    /// recorded) and its alerts muted `unobserved` are decided again.
     pub(crate) fn observe(&mut self, source: &str, stale_after: i64, sent_at: Option<i64>) -> Result<()> {
         let was_unobserved = self.unobserved(source)?;
         self.conn
@@ -852,10 +853,27 @@ impl Tx<'_, '_> {
             return Ok(());
         }
         self.version()?;
-        let mut new = NewItem::new(builtin::SOURCE_OBSERVED, source);
-        new.facts
-            .insert("source_name".into(), json!(self.source_name(source)));
-        self.record_builtin(new)?;
+        let stopped =
+            rows::latest(self.conn, builtin::SOURCE_STOPPED, source)?.filter(|row| row.life.is_open());
+        match (stopped, self.kind(builtin::SOURCE_STOPPED)) {
+            (Some(_), Some((_, kind))) => {
+                let keep = Fields {
+                    facts: None,
+                    slots: None,
+                    labels: BTreeMap::new(),
+                    context: None,
+                    url: None,
+                    category: None,
+                };
+                self.route(builtin::SOURCE_STOPPED, kind, source, true, keep)?;
+            }
+            _ => {
+                let mut new = NewItem::new(builtin::SOURCE_OBSERVED, source);
+                new.facts
+                    .insert("source_name".into(), json!(self.source_name(source)));
+                self.record_builtin(new)?;
+            }
+        }
         let muted = rows::query(
             self.conn,
             "WHERE source = ?1 AND class = 'alert' AND state = 'open' AND push_status = 'suppressed' \
@@ -869,8 +887,9 @@ impl Tx<'_, '_> {
         Ok(())
     }
 
-    /// The source can't see what it watches, or went stale: unobserved with `reason`. Records
-    /// `beacon.source_unobserved` when it was observed.
+    /// The source can't see what it watches, or went stale: unobserved with `reason`. When it
+    /// was observed, opens `beacon.source_stopped` if it declares an alert kind, else records
+    /// `beacon.source_unobserved`.
     pub(crate) fn unobserve(&mut self, source: &str, reason: &str) -> Result<()> {
         if source == "beacon" {
             return Ok(());
@@ -884,6 +903,27 @@ impl Tx<'_, '_> {
             .execute(params![source, reason])?;
         self.version()?;
         if was_unobserved {
+            return Ok(());
+        }
+        // A source whose alerts are now on hold says so with an alert of Beacon's own, which
+        // its own source being unobserved can't mute.
+        let has_alerts = self
+            .registry
+            .get(source)
+            .is_some_and(|decl| decl.kinds.values().any(|kind| kind.class == Class::Alert));
+        if has_alerts && let Some((_, kind)) = self.kind(builtin::SOURCE_STOPPED) {
+            let fields = Fields {
+                facts: Some(Map::from_iter([(
+                    "source_name".to_string(),
+                    json!(self.source_name(source)),
+                )])),
+                slots: Some(Map::from_iter([("reason".to_string(), json!(reason))])),
+                labels: BTreeMap::new(),
+                context: None,
+                url: None,
+                category: None,
+            };
+            self.route(builtin::SOURCE_STOPPED, kind, source, false, fields)?;
             return Ok(());
         }
         let mut new = NewItem::new(builtin::SOURCE_UNOBSERVED, source);
