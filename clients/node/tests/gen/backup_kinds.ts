@@ -290,26 +290,30 @@ class BeaconRuntime {
       const fs = await this.fs();
       await fs.mkdir(spool, { recursive: true });
       let names = await this.spooled(fs, spool);
+      // Removed only once the new file is written, so a failed write loses nothing.
+      const replaced: string[] = [];
       if (path === "/v1/snapshots") {
         for (const name of names) {
           const older = await this.readSpooled(fs, spool, name);
-          if (older?.path === path && this.sameSnapshot(older.body, body)) await this.drop(fs, spool, name);
+          if (older?.path === path && this.sameSnapshot(older.body, body)) replaced.push(name);
         }
-        names = await this.spooled(fs, spool);
+        names = names.filter((name) => !replaced.includes(name));
       }
       const sizes: number[] = [];
       for (const name of names) sizes.push(await fs.stat(`${spool}/${name}`).then((s) => s.size, () => 0));
       let total = sizes.reduce((a, b) => a + b, 0);
+      const evicted: string[] = [];
       while (names.length > 0 && (names.length >= SPOOL_LIMITS.files || total + data.length > SPOOL_LIMITS.bytes)) {
-        await this.drop(fs, spool, names.shift() ?? "");
+        evicted.push(names.shift() ?? "");
         total -= sizes.shift() ?? 0;
-        dropped += 1;
       }
-      this.droppedTotal += dropped;
       const sequence = String(this.sequence++ % 1_000_000).padStart(6, "0");
       const name = `${String(now).padStart(15, "0")}-${sequence}-${this.idempotencyKey().slice(0, 8)}.json`;
       await fs.writeFile(`${spool}/.${name}.tmp`, data);
       await fs.rename(`${spool}/.${name}.tmp`, `${spool}/${name}`);
+      for (const old of [...replaced, ...evicted]) await this.drop(fs, spool, old);
+      dropped = evicted.length;
+      this.droppedTotal += dropped;
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       return { ...sent, ok: false, queued: false, problem: `${why}\n  and the spool ${spool} can't be written: ${reason}` };
@@ -338,6 +342,8 @@ class BeaconRuntime {
     };
     if (spool === undefined || this.disabled()) return done(0, null);
     const fs = await this.fs();
+    // Two snapshots of one source and kinds can both be here for a moment (a newer one is written
+    // before the older one it replaces is removed): sending the older, then the newer, is right.
     const names = await this.spooled(fs, spool);
     for (const [index, name] of names.entries()) {
       const request = await this.readSpooled(fs, spool, name);

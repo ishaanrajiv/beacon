@@ -382,6 +382,34 @@ test("a newer snapshot replaces a queued one, and an old one is dropped", async 
   assert.equal(seen.length, 0);
 });
 
+test("a snapshot whose replacement can't be written is kept", async () => {
+  useSpool();
+  const realNow = Date.now;
+  const realFs = client.runtime.fs;
+  Date.now = () => clock;
+  let sent: client.Sent | undefined;
+  try {
+    refuse();
+    await client.snapshot("backup", [client.entry("backup.space", { facts: { used_percent: 96 } })]);
+    client.runtime.fs = async () => ({
+      ...(await realFs.call(client.runtime)),
+      writeFile: async () => {
+        throw new Error("ENOSPC: no space left on device");
+      },
+    });
+    refuse(1);
+    sent = await client.snapshot("backup", []);
+  } finally {
+    Date.now = realNow;
+    client.runtime.fs = realFs;
+  }
+  assert.deepEqual([sent.ok, sent.queued], [false, false]);
+  assert.match(sent.problem ?? "", /can't be written/);
+  const [kept] = bodies();
+  assert.equal(bodies().length, 1);
+  assert.equal((kept?.["firing"] as unknown[]).length, 1);
+});
+
 test("the spool is bounded, oldest dropped first", async () => {
   useSpool();
   const limits = { ...client.SPOOL_LIMITS };

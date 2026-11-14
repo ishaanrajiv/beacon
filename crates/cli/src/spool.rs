@@ -119,6 +119,8 @@ impl Spool {
 
     /// Writes a file under a temporary name, then renames it, so no reader sees half of it.
     fn write(&self, name: &str, data: &[u8]) -> std::io::Result<()> {
+        #[cfg(test)]
+        fault::check()?;
         let temporary = self.path(&format!(".{name}.tmp"));
         std::fs::write(&temporary, data)?;
         std::fs::rename(&temporary, self.path(name))
@@ -128,18 +130,14 @@ impl Spool {
     pub fn queue(&self, path: &str, key: &str, body: &Value, now_ms: i64) -> Result<usize, Problem> {
         let data = json!({"path": path, "key": key, "queued_at": now_ms, "body": body}).to_string();
         std::fs::create_dir_all(&self.dir).map_err(|e| self.problem(format!("can't be made: {e}")))?;
-        if path == SNAPSHOTS {
-            for name in self.names() {
-                let replaced = self
-                    .read(&name)
-                    .is_some_and(|old| old["path"] == SNAPSHOTS && same_snapshot(&old["body"], body));
-                if replaced {
-                    self.drop_file(&name);
-                }
-            }
-        }
-        let mut files: Vec<(String, u64)> = self
-            .names()
+        // Removed only once the new file is written, so a failed write loses nothing.
+        let (replaced, names): (Vec<String>, Vec<String>) = self.names().into_iter().partition(|name| {
+            path == SNAPSHOTS
+                && self
+                    .read(name)
+                    .is_some_and(|old| old["path"] == SNAPSHOTS && same_snapshot(&old["body"], body))
+        });
+        let mut files: Vec<(String, u64)> = names
             .into_iter()
             .map(|n| {
                 let size = std::fs::metadata(self.path(&n)).map_or(0, |m| m.len());
@@ -147,13 +145,12 @@ impl Spool {
             })
             .collect();
         let mut total: u64 = files.iter().map(|(_, size)| size).sum();
-        let mut dropped = 0;
+        let mut evicted = Vec::new();
         let incoming = u64::try_from(data.len()).unwrap_or(u64::MAX);
         while !files.is_empty() && (files.len() >= MAX_FILES || total.saturating_add(incoming) > MAX_BYTES) {
             let (name, size) = files.remove(0);
-            self.drop_file(&name);
             total -= size;
-            dropped += 1;
+            evicted.push(name);
         }
         // Within one millisecond, the next number after what is already there keeps the order.
         let prefix = format!("{now_ms:015}-");
@@ -166,7 +163,10 @@ impl Spool {
         let name = format!("{prefix}{sequence:06}-{}.json", random_hex(4));
         self.write(&name, data.as_bytes())
             .map_err(|e| self.problem(format!("can't be written: {e}")))?;
-        Ok(dropped)
+        for old in replaced.iter().chain(&evicted) {
+            self.drop_file(old);
+        }
+        Ok(evicted.len())
     }
 
     /// Past 24 hours, or a snapshot past what `sent_at` allows.
@@ -182,6 +182,8 @@ impl Spool {
     /// Sends the spooled requests oldest first, once each, and stops at the first that still can't
     /// go, so order is kept. A refusal (4xx) will never be taken: it is dropped and counted.
     pub fn flush(&self, http: &Http, now_ms: i64) -> Flushed {
+        // Two snapshots of one source and kinds can both be here for a moment (a newer one is written
+        // before the older one it replaces is removed): sending the older, then the newer, is right.
         let names = self.names();
         let mut done = Flushed {
             sent: 0,
@@ -237,5 +239,27 @@ impl Spool {
     pub fn kinds(&self, source: &str) -> Option<Value> {
         let text = std::fs::read(self.kinds_file(source)).ok()?;
         serde_json::from_slice(&text).ok()
+    }
+}
+
+/// Faults the tests inject, one thread at a time, so tests running beside each other don't see them.
+#[cfg(test)]
+pub mod fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_WRITE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// The next file the spool writes on this thread fails, as on a full disk.
+    pub fn fail_next_write() {
+        FAIL_WRITE.with(|fail| fail.set(true));
+    }
+
+    pub(super) fn check() -> std::io::Result<()> {
+        if FAIL_WRITE.with(|fail| fail.replace(false)) {
+            return Err(std::io::Error::other("no space left on device"));
+        }
+        Ok(())
     }
 }

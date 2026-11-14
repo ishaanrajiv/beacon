@@ -227,12 +227,15 @@ folder, the emitters and the `beacon` command keep it instead:
   (`spec/delivery.md`, "Idempotency").
 - **Snapshots.** A snapshot keeps its `sent_at`. A new snapshot replaces any waiting one of the
   same source covering the same kinds (the same `kinds`, or both none): it says all the older one
-  did. One of other kinds stays, in order. A waiting snapshot is dropped, not sent, once its
-  `sent_at` is more than 5 minutes old (Beacon would refuse it, `spec/api.md`).
+  did. The new one is written first and the older removed after, so a write that fails loses
+  neither; for that moment both wait, and a flush sends the older, then the newer, which is right.
+  One of other kinds stays, in order. A waiting snapshot is dropped, not sent, once its `sent_at`
+  is more than 5 minutes old (Beacon would refuse it, `spec/api.md`).
 - **Bounded.** A file waits at most 24 hours (Beacon's idempotency window), then is dropped. The
-  folder holds at most 1,000 files and 8 MB: queuing one more drops the oldest first. Every drop is
-  counted: `Flushed.dropped` (this flush) and `dropped_total` / `droppedTotal` (this process), the
-  `queued` answer's `problem` when it had to drop the oldest, and `beacon flush`'s `dropped`.
+  folder holds at most 1,000 files and 8 MB: queuing one more drops the oldest first, once the new
+  one is written. Every drop is counted: `Flushed.dropped` (this flush) and `dropped_total` /
+  `droppedTotal` (this process), the `queued` answer's `problem` when it had to drop the oldest,
+  and `beacon flush`'s `dropped`.
 
 The files are the same for every client, so the Python and TypeScript emitters and the command can
 share one folder, and any of them flushes the others'. One file per request, named

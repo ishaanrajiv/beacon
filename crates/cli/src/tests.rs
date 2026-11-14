@@ -911,3 +911,25 @@ fn a_newer_snapshot_replaces_a_spooled_one_of_the_same_kinds() {
     assert_eq!(files[0]["body"]["kinds"], json!(["backup.space"]));
     assert_eq!(files[1]["body"]["firing"], json!([]));
 }
+
+#[test]
+fn a_snapshot_whose_replacement_cant_be_written_is_kept() {
+    let dir = scratch("spool-replace-fails");
+    let spool = dir.to_str().unwrap();
+    let backup = example("backup");
+    let snapshot = |fire: &[&str]| {
+        let mut args = vec!["snapshot", "backup", "--decls", &backup];
+        args.extend(fire);
+        args.extend(["--spool", spool, "--server", NOBODY]);
+        args.into_iter().map(str::to_string).collect::<Vec<_>>()
+    };
+    let first = snapshot(&["--fire", "backup.space used_percent=96"]);
+    beacon(&first.iter().map(String::as_str).collect::<Vec<_>>()).unwrap();
+    crate::spool::fault::fail_next_write();
+    let second = snapshot(&[]);
+    let (code, text) = refused(&second.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(code, 3);
+    assert!(text.contains("can't be written"), "{text}");
+    let [kept] = spooled(&dir).try_into().unwrap();
+    assert_eq!(kept["body"]["firing"].as_array().map(Vec::len), Some(1));
+}

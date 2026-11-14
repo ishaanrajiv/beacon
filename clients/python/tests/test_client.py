@@ -5,6 +5,7 @@ Run from clients/python: `python3 -m unittest discover -s tests`.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sys
@@ -14,7 +15,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
@@ -396,6 +397,25 @@ class SpoolTest(unittest.TestCase):
         flushed = beacon_client.flush()
         self.assertEqual((flushed.sent, flushed.dropped), (0, 2))
         self.assertEqual(self.beacon.requests, [])
+
+    def test_a_snapshot_whose_replacement_cant_be_written_is_kept(self) -> None:
+        real_open = open
+
+        def full_disk(file: str, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+            if any(c in mode for c in "wxa"):
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real_open(file, mode, *args, **kwargs)
+
+        with mock.patch("time.time", return_value=self.clock / 1000):
+            self.refuse()
+            beacon_client.snapshot("backup", [beacon_client.entry("backup.space", facts={"used_percent": 96})])
+            self.refuse(1)
+            with mock.patch("builtins.open", full_disk):
+                sent = beacon_client.snapshot("backup", [])
+        self.assertEqual((sent.ok, sent.queued), (False, False))
+        self.assertIn("can't be written", sent.problem or "")
+        [kept] = self.files()
+        self.assertEqual(len(cast("list[object]", cast("dict[str, object]", kept["body"])["firing"])), 1)
 
     def test_the_spool_is_bounded_oldest_dropped_first(self) -> None:
         sent: beacon_client.Sent | None = None

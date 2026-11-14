@@ -299,8 +299,8 @@ class _Runtime:
     def drop(self, spool: str, name: str) -> None:
         try:
             os.remove(os.path.join(spool, name))
-        except FileNotFoundError:
-            pass
+        except OSError:
+            pass  # Already gone, or not ours to remove: never an error for the caller.
 
     def expired(self, request: Mapping[str, object], now: int) -> bool:
         """Past 24 hours (the server's idempotency window), or a snapshot past what `sent_at` allows."""
@@ -327,19 +327,19 @@ class _Runtime:
         try:
             os.makedirs(spool, exist_ok=True)
             names = self.spooled(spool)
+            # Removed only once the new file is written, so a failed write loses nothing.
+            replaced: list[str] = []
             if path == "/v1/snapshots":
                 for name in names:
                     older = self.read_spooled(spool, name)
                     if older is not None and older["path"] == path and self.same_snapshot(self.object(older["body"]), body):
-                        self.drop(spool, name)
-                names = self.spooled(spool)
+                        replaced.append(name)
+                names = [name for name in names if name not in replaced]
             sizes = [self.size(spool, name) for name in names]
-            dropped = 0
+            evicted: list[str] = []
             while names and (len(names) >= SPOOL_MAX_FILES or sum(sizes) + len(data) > SPOOL_MAX_BYTES):
-                self.drop(spool, names.pop(0))
+                evicted.append(names.pop(0))
                 sizes.pop(0)
-                dropped += 1
-            self.dropped_total += dropped
             name = f"{now:015d}-{next(self._sequence) % 1_000_000:06d}-{secrets.token_hex(4)}.json"
             temporary = os.path.join(spool, f".{name}.tmp")
             with open(temporary, "wb") as file:
@@ -348,6 +348,10 @@ class _Runtime:
         except OSError as error:
             problem = f"{sent.problem or f'Beacon answered {sent.status}'}\n  and the spool {spool} can't be written: {error}"
             return Sent(ok=False, status=sent.status, outcome=None, item=None, problem=problem)
+        for old in replaced + evicted:
+            self.drop(spool, old)
+        dropped = len(evicted)
+        self.dropped_total += dropped
         why = sent.problem or f"Beacon answered {sent.status}"
         if dropped:
             why += f"\n  the spool was full: dropped the {dropped} oldest"
@@ -358,6 +362,8 @@ class _Runtime:
         spool = self.spool_dir()
         if spool is None or self.disabled():
             return Flushed(sent=0, left=0, dropped=0, dropped_total=self.dropped_total, problem=None)
+        # Two snapshots of one source and kinds can both be here for a moment (a newer one is written
+        # before the older one it replaces is removed): sending the older, then the newer, is right.
         names = self.spooled(spool)
         sent = dropped = 0
         for index, name in enumerate(names):
