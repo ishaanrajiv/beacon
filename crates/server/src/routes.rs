@@ -83,7 +83,14 @@ pub static ROUTES: &[Route] = &[
         path: "/v1/registry/{source}",
         summary: "Publish a source's declarations.",
         access: Access::Producer,
-        params: &[SOURCE],
+        params: &[
+            SOURCE,
+            p(
+                "keep",
+                "query",
+                "true: add or replace the body's kinds and keep the others; else replace them all.",
+            ),
+        ],
     },
     Route {
         method: "DELETE",

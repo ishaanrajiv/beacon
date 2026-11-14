@@ -163,6 +163,7 @@ stop).
 | `resolved`, within `flap_window` of resolving | fire | `open` | The same item reopens: `times.opened` now, `times.resolved`, `acknowledged` and `dismissed` cleared, `seen = false`, text back to the firing text, repeats rescheduled. Count the openings within the window; more than `flap_openings` (3) → flapping (below). Decide (`reopened`). |
 | `open`, `dismissed` | fire | unchanged | Facts, slots, text and labels updated. No push. When nothing it shows or stores would change (facts, slots, labels, rendered text and buttons, link, category, context), nothing is written: no history row, no new `version`, no copy to Trail; the answer is still `updated` with the item as it is. |
 | `open`, `dismissed` | resolve (an event, or absent from its source's snapshot) | `resolved` | `times.resolved` now. Text becomes the recovery text, with `{lasted}` from `times.opened` to now. `seen = false`. A held push is suppressed (`closed`); a queued one stops ("Sending"). Repeats cancelled. If the item's push was `sent`, or a device may have a firing push of it ("Sending"), and it isn't flapping, a **recovery** push: the recovery text, same collapse id, `passive`, no category; the item's `push.status` follows it (`queued`, then `sent`). It is not subject to silences, quiet hours, presence or throttle; only to `push = false` (suppressed, `push_off`). |
+| `open`, `dismissed` | its kind removed by a publish (`spec/api.md`, `PUT /v1/registry/{source}`) | `resolved` | `times.resolved` now, history `kind_removed`. It keeps its text and `seen`: nothing recovered. A held push is suppressed (`closed`); a queued one stops. The recovery push goes out on the same terms as above (its text is the item's, unchanged), so a banner a device has is replaced. |
 | `resolved` | resolve | unchanged | Nothing (`outcome: "ignored"`). |
 | `open`, `dismissed` | acknowledge | unchanged | `acknowledged` now. Repeats cancelled. A one-off alert resolves instead (no recovery text: it keeps its own). |
 | `open` | dismiss | `dismissed` | Leaves Needs you; stays in Alerts. Repeats cancelled. A held push is suppressed (`closed`). A one-off alert resolves instead. |
@@ -197,6 +198,7 @@ stop).
 | `open` | snooze until T | `snoozed` | `times.snoozed_until = T`. The same. |
 | `snoozed` | T passes | `open` | `seen = false`. Decide (`woke`). |
 | `open`, `snoozed` | resolve (an event, or absent from its source's snapshot) | `resolved` | `times.resolved`. The same. `seen` unchanged: you didn't miss anything. |
+| `open`, `snoozed` | its kind removed by a publish | `resolved` | The same, with history `kind_removed`. |
 | `done`, `dismissed`, `resolved` | done, dismiss, snooze | unchanged | `200` when the effect already holds, else `409` (`spec/api.md`). |
 | `open`, `snoozed` | a custom action without a url | `done` | Recorded in `acted`. |
 

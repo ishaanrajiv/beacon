@@ -169,10 +169,24 @@ nobody published.
 
 Body: the declarations in their JSON form. `beacon publish` sends this.
 
-- `200` `{"ok": true, "source": "backup", "kinds": 4}`: stored, replacing the source's earlier
-  declarations entirely.
+| Parameter | Default | |
+|---|---|---|
+| `keep` | `false` | `true`: the body's kinds are added, or replace the kinds of the same name, and kinds already published that the body lacks stay. The source's own fields (`name`, `icon`…) take the body's values. `beacon publish --keep` sends it. |
+
+A deploy publishes with `?keep=true` *before* it restarts a service, so neither the old code still
+running nor the new code about to start can send a kind Beacon doesn't know; after the restart a
+plain publish removes what the new code no longer declares.
+
+- `200` `{"ok": true, "source": "backup", "kinds": 4, "kept": [], "closed": 0}`: stored. `kinds` is
+  how many the source now has; `kept` names the kinds a `keep` publish kept that the body lacks.
+  Without `keep` the body replaces the source's earlier declarations entirely, and each alert or
+  action of a kind it no longer has that is still open (alert `open` or `dismissed`, action `open`
+  or `snoozed`) closes in the same transaction: it resolves, with history step `kind_removed`, and
+  keeps its text (nothing recovered, so no recovery text is written). No push goes out but the
+  usual recovery of an alert a device has or may have the firing push of (`spec/delivery.md`,
+  "Sending"), which replaces that banner. `closed` counts them; a `keep` publish closes nothing.
 - `400` with every problem, when they fail a check (`spec/declarations.md`), including the
-  server's `banned_words`.
+  server's `banned_words`; or `keep` isn't `true`, `false`, `1` or `0`.
 - `409` when `{source}` is `beacon` or `trail`, or differs from the body's `source`.
 
 ### `DELETE /v1/registry/{source}`
@@ -615,7 +629,8 @@ The item, plus:
 `history[].what` is one of `recorded` (an update or record made), `opened`, `reopened`, `updated`, `resolved`, `acknowledged`,
 `dismissed`, `done`, `snoozed`, `woke` (a snooze ended), `seen`, `action` (a custom action; see
 `acted`), `push_held`, `push_released`, `push_sent`, `push_failed`, `push_suppressed`, `repeated`,
-`recovery_sent`, `flapping`, `settled`. `attempts[].status` is `accepted`, `rejected` or
+`recovery_sent`, `flapping`, `settled`, `kind_removed` (resolved because a publish removed its kind:
+`PUT /v1/registry/{source}`). A client shows a step it doesn't know by its name. `attempts[].status` is `accepted`, `rejected` or
 `uncertain` (`spec/apns.md`). `device` is the token's last six characters. `404` for an unknown id.
 
 ### `POST /v1/items/{id}/actions`

@@ -293,11 +293,15 @@ keeps them:
 3. An event or snapshot entry of a kind the registry doesn't have is refused with `422`, and the
    fix names the closest declared kind and says to declare and publish it.
 4. Items already stored keep the text, class and push they were given. Republishing never
-   rewrites history. An open alert or action whose kind was removed stays open until its
-   producer resolves it or you close it; events for that kind are refused.
+   rewrites history. An alert or action still open whose kind a publish removed can never be
+   resolved by its producer (events for that kind are refused), so the publish closes it: it
+   resolves with history step `kind_removed` and keeps its text (`spec/api.md`,
+   `PUT /v1/registry/{source}`).
 
-A deploy pipeline runs `beacon publish` for a service after deploying it, so the server always
-knows the kinds the running code sends.
+A deploy pipeline publishes in two steps, so neither the old code still running nor the new code
+about to start can send a kind the server doesn't know: `beacon publish --keep` before it restarts
+the service (the new kinds are added, and kinds the folder no longer has stay), then a plain
+`beacon publish` once the new code runs (the source's declarations become exactly the folder's).
 
 ### Reading back what was stored
 

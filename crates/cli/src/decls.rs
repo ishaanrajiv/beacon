@@ -7,6 +7,7 @@ use crate::{Done, Fail, out};
 use beacon_codegen::Language;
 use beacon_core::Problem;
 use beacon_core::decl::{self, Check, Declarations};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -155,19 +156,37 @@ pub fn generate(raw: Vec<String>) -> Done {
     Ok(())
 }
 
-/// `beacon publish <folder>... [--server URL]`
+/// `beacon publish <folder>... [--keep] [--server URL]`. With `--keep`, kinds already published
+/// that a folder lacks stay (a deploy's first step, before the restart).
 pub fn publish(raw: Vec<String>) -> Done {
-    let args = Args::parse("publish", raw, &["server"], &[])?;
+    let args = Args::parse("publish", raw, &["server"], &["keep"])?;
     args.need("publish", &["folder"])?;
     // Everything is checked before anything is sent.
     let loaded = load_all(&args.positional)?;
     let http = Http::new(args.server());
     let mut problems = Vec::new();
     for (folder, decl) in loaded {
-        let path = format!("/v1/registry/{}", decl.source);
+        let keep = args.flag("keep");
+        let path = format!(
+            "/v1/registry/{}{}",
+            decl.source,
+            if keep { "?keep=true" } else { "" }
+        );
         let answer = http.request("PUT", &path, Some(&decl.to_json()))?;
         if answer.ok() {
-            out(&format!("published  {}", summary(&decl)));
+            let json = answer.json();
+            let mut line = format!("published  {}", summary(&decl));
+            if let Some(kept) = json["kept"].as_array().filter(|k| !k.is_empty()) {
+                let names: Vec<&str> = kept.iter().filter_map(Value::as_str).collect();
+                line.push_str(&format!(", kept {}", names.join(", ")));
+            }
+            if let Some(closed) = json["closed"].as_u64().filter(|n| *n > 0) {
+                line.push_str(&format!(
+                    ", closed {closed} open {} of removed kinds",
+                    if closed == 1 { "item" } else { "items" }
+                ));
+            }
+            out(&line);
         } else if answer.status >= 500 {
             return Err(Fail::unreachable(answer.problems()));
         } else {

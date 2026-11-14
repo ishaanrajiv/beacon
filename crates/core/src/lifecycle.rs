@@ -61,6 +61,9 @@ pub enum Input {
     Open,
     /// An event with `state: "resolved"`, or absent from its source's snapshot.
     Resolve,
+    /// Its kind was removed by a publish: nothing can resolve it any more, so it closes as
+    /// resolved, keeping its own text (`spec/declarations.md`, "Reaching the server").
+    KindRemoved,
     /// A button.
     Press(Press),
     /// A snoozed action's time came.
@@ -108,6 +111,8 @@ pub enum Outcome {
     Action,
     Settled,
     Repeated,
+    /// Closed because a publish removed its kind.
+    KindRemoved,
 }
 
 impl Outcome {
@@ -127,6 +132,7 @@ impl Outcome {
             Outcome::Action => "action",
             Outcome::Settled => "settled",
             Outcome::Repeated => "repeated",
+            Outcome::KindRemoved => "kind_removed",
         }
     }
 }
@@ -410,6 +416,15 @@ impl Life {
                 }
                 step
             }
+            (Open | Dismissed, Input::KindRemoved) => {
+                // Nothing recovered: it keeps its text and `seen`. A device that has or may have
+                // its firing push still gets the usual recovery, which replaces that banner.
+                self.resolve(now);
+                let mut step = Step::new(Outcome::KindRemoved);
+                step.close_held = true;
+                step.recovery = !self.one_off && !self.flapping;
+                step
+            }
             (Open | Dismissed, Input::Press(Press::Acknowledge)) => {
                 self.times.acknowledged = Some(now);
                 self.next_repeat = None;
@@ -529,6 +544,10 @@ impl Life {
             (Open | Snoozed, Input::Resolve) => {
                 self.times.resolved = Some(now);
                 closing(self, Resolved, Outcome::Resolved)
+            }
+            (Open | Snoozed, Input::KindRemoved) => {
+                self.times.resolved = Some(now);
+                closing(self, Resolved, Outcome::KindRemoved)
             }
             (Open | Snoozed, Input::Press(Press::Done)) => {
                 self.times.done = Some(now);

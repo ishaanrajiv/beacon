@@ -23,7 +23,7 @@ store.set_trail_open(&config.trail.open)?;
 | `GET /v1/registry` | `sources() -> Vec<SourceView>` (with each source's `problem`) |
 | `GET /v1/health` | `unreadable() -> Vec<Unreadable>`: published sources it can't (all) read back |
 | `GET /v1/registry/{source}`, `GET /v1/kinds` | `declarations(source) -> Option<Declarations>`, `all_declarations()` |
-| `PUT /v1/registry/{source}` | `publish(&Declarations, now)` (run the checks with `banned_words` first) |
+| `PUT /v1/registry/{source}` | `publish(&Declarations, now)`, or `publish_with(&Declarations, keep, now)` for `?keep=true` (run the checks with `banned_words` first) `-> Published` (kinds, kept, closed) |
 | `DELETE /v1/registry/{source}` | `unpublish(source) -> bool` |
 | `POST /v1/events` | `apply_event(&Event, idempotency_key, now) -> EventAnswer` |
 | `POST /v1/snapshots` | `apply_snapshot(&Snapshot, now) -> SnapshotAnswer` |

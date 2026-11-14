@@ -141,6 +141,15 @@ const REASON_MAX: usize = 100;
 /// The reason a source that stopped posting snapshots is unobserved.
 pub const STALE_REASON: &str = "It stopped reporting.";
 
+/// What a publish did: how many kinds the source now has, which it kept (`keep`), and the open
+/// alerts and actions it closed because their kind is gone.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Published {
+    pub kinds: usize,
+    pub kept: Vec<String>,
+    pub closed: Vec<i64>,
+}
+
 /// A published source whose stored declarations, or some of whose kinds, Beacon can't read back
 /// (written by a version that stored them differently). It is kept and reported, never dropped:
 /// `GET /v1/registry` shows its `problem`, `GET /v1/health` counts it, and events for what can't
@@ -229,7 +238,16 @@ impl Store {
 
     /// `PUT /v1/registry/{source}`: stores declarations that passed their checks (the server
     /// runs them with its `banned_words`), replacing the source's earlier ones.
-    pub fn publish(&self, decl: &Declarations, now: i64) -> Result<()> {
+    pub fn publish(&self, decl: &Declarations, now: i64) -> Result<Published> {
+        self.publish_with(decl, false, now)
+    }
+
+    /// `PUT /v1/registry/{source}`, with `keep` (`?keep=true`): the body's kinds are added or
+    /// replaced by name, and kinds already published that the body lacks stay. Without it the
+    /// body replaces the source's declarations, and every alert or action still open of a kind
+    /// it no longer has closes in the same transaction (`Input::KindRemoved`): nothing could
+    /// resolve it any more.
+    pub fn publish_with(&self, decl: &Declarations, keep: bool, now: i64) -> Result<Published> {
         if RESERVED_SOURCES.contains(&decl.source.as_str()) {
             return Err(Error::new(
                 ErrorKind::Conflict,
@@ -239,16 +257,23 @@ impl Store {
             ));
         }
         let mut inner = self.lock()?;
-        let text = decl.to_stored().to_string();
-        inner
-            .conn
-            .prepare_cached(
-                "INSERT INTO registry (source, decl, published) VALUES (?1, ?2, ?3) \
-                 ON CONFLICT (source) DO UPDATE SET decl = ?2, published = ?3",
-            )?
-            .execute(params![decl.source, text, now])?;
-        bump(&inner.conn)?;
-        inner.reload_registry()
+        let crate::Inner {
+            conn,
+            registry,
+            unreadable,
+            ..
+        } = &mut *inner;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| Error::sql("can't start a write", &e))?;
+        let published = {
+            let mut w = Tx::new(&tx, &self.settings, registry, now);
+            w.unreadable = unreadable;
+            w.store_declarations(decl, keep)?
+        };
+        tx.commit().map_err(|e| Error::sql("can't commit", &e))?;
+        inner.reload_registry()?;
+        Ok(published)
     }
 
     /// `DELETE /v1/registry/{source}`: false when nobody published it. Its items stay.
@@ -531,6 +556,56 @@ fn undeclared(at: &str, name: &str, registry: &BTreeMap<String, Declarations>) -
 }
 
 impl Tx<'_, '_> {
+    /// Stores a source's declarations (merged with what it had, with `keep`), and closes what a
+    /// replacing publish removed the kind of.
+    fn store_declarations(&mut self, decl: &Declarations, keep: bool) -> Result<Published> {
+        let mut stored = decl.to_stored();
+        let mut kept = Vec::new();
+        if keep {
+            let old: Option<String> = self
+                .conn
+                .prepare_cached("SELECT decl FROM registry WHERE source = ?1")?
+                .query_row([&decl.source], |r| r.get(0))
+                .optional()?;
+            let old: Option<Value> = old.and_then(|text| serde_json::from_str(&text).ok());
+            if let (Some(Value::Object(old_kinds)), Some(Value::Object(kinds))) =
+                (old.as_ref().and_then(|v| v.get("kinds")), stored.get_mut("kinds"))
+            {
+                // Kept as stored, even one this version can't read: `keep` removes nothing.
+                for (name, kind) in old_kinds {
+                    if !kinds.contains_key(name) {
+                        kinds.insert(name.clone(), kind.clone());
+                        kept.push(name.clone());
+                    }
+                }
+            }
+        }
+        let kinds = stored.get("kinds").and_then(Value::as_object).map_or(0, Map::len);
+        self.conn
+            .prepare_cached(
+                "INSERT INTO registry (source, decl, published) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT (source) DO UPDATE SET decl = ?2, published = ?3",
+            )?
+            .execute(params![decl.source, stored.to_string(), self.now])?;
+        self.version()?;
+        let mut closed = Vec::new();
+        if !keep {
+            let open = rows::query(
+                self.conn,
+                "WHERE source = ?1 AND state IN ('open', 'dismissed', 'snoozed') ORDER BY id",
+                [&decl.source],
+            )?;
+            for mut row in open {
+                if !row.life.is_open() || decl.kinds.contains_key(&row.kind) {
+                    continue;
+                }
+                self.apply(&mut row, Input::KindRemoved, None)?;
+                closed.push(row.id);
+            }
+        }
+        Ok(Published { kinds, kept, closed })
+    }
+
     /// The problem of a stored source that can't be read, when it covers `kind`.
     fn unreadable_kind(&self, at: &str, kind: &str) -> Option<Problem> {
         let unreadable = self.unreadable.get(source_of(kind))?;

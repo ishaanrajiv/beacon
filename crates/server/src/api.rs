@@ -403,6 +403,18 @@ fn health(app: &App) -> Reply {
 // ---------- the registry ----------
 
 fn publish(app: &App, req: &Request, source: &str) -> Answer {
+    let keep = match req.param("keep") {
+        None | Some("false" | "0") => false,
+        Some("true" | "1") => true,
+        Some(other) => {
+            return Err(Reply::problem(
+                400,
+                "registry keep",
+                format!("`{other}` is not true or false"),
+                "send ?keep=true to keep kinds the body lacks, or leave keep out to replace them",
+            ));
+        }
+    };
     let value: Value = Value::Object(object(req, "declarations")?);
     let check = Check {
         banned_words: app.config.banned_words.clone(),
@@ -420,10 +432,17 @@ fn publish(app: &App, req: &Request, source: &str) -> Answer {
             format!("PUT it to /v1/registry/{}", decl.source),
         ));
     }
-    app.store.publish(&decl, app.now()).map_err(store_error)?;
-    Ok(Reply::ok(
-        json!({"ok": true, "source": decl.source, "kinds": decl.kinds.len()}),
-    ))
+    let published = app
+        .store
+        .publish_with(&decl, keep, app.now())
+        .map_err(store_error)?;
+    Ok(Reply::ok(json!({
+        "ok": true,
+        "source": decl.source,
+        "kinds": published.kinds,
+        "kept": published.kept,
+        "closed": published.closed.len(),
+    })))
 }
 
 /// FNV-1a 64, for the kinds' ETag.

@@ -279,6 +279,19 @@ fn publish_puts_each_source_in_its_json_form() {
 }
 
 #[test]
+fn publish_keep_asks_beacon_to_keep_the_other_kinds() {
+    let fake = Fake::start(vec![(
+        200,
+        json!({"ok": true, "kinds": 5, "kept": ["backup.old"], "closed": 0}),
+    )]);
+    beacon(&["publish", &example("backup"), "--keep", "--server", &fake.url]).unwrap();
+    assert_eq!(fake.last().path, "/v1/registry/backup?keep=true");
+    let fake = Fake::start(vec![]);
+    beacon(&["publish", &example("backup"), "--server", &fake.url]).unwrap();
+    assert_eq!(fake.last().path, "/v1/registry/backup");
+}
+
+#[test]
 fn publish_reports_what_beacon_refused() {
     let problem = json!({"at": "kinds.\"backup.failed\".title", "message": "`Backups` is a banned word", "fix": "leave it out"});
     let fake = Fake::start(vec![(400, json!({"error": problem, "problems": [problem]}))]);

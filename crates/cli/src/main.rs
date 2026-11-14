@@ -34,6 +34,7 @@ Declare what a service sends (spec/declarations.md)
   beacon gen <folder> --lang python|typescript [--out FILE] [--check]
                                             write typed emitters; --check fails if FILE is stale
   beacon publish <folder>... [--server URL] check, then load the declarations into Beacon
+              [--keep]                      keep published kinds a folder lacks (before a restart)
 
 Send from a script (checked against the published kinds, or a local folder with --decls)
   beacon send <kind> [name=value]... [--key K] [--resolve] [--label name=value]...

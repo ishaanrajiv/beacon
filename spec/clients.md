@@ -198,7 +198,7 @@ object literal at the call, so an undeclared fact or slot is an excess-property 
 ```sh
 beacon serve [--config beacon.toml]
 beacon check <folder>...
-beacon publish <folder>... [--server URL]
+beacon publish <folder>... [--keep] [--server URL]
 beacon gen <folder> --lang python|typescript [--out FILE] [--check]
 beacon send <kind> [name=value]... [--key K] [--resolve] [--label name=value]... [--context C] [--open LINK] [--decls FOLDER] [--server URL] [--json]
 beacon resolve <kind> [--key K] [--context C] [--decls FOLDER] [--server URL] [--json]
@@ -216,7 +216,7 @@ the emitters.
 |---|---|
 | `serve` | Runs the server (`spec/config.md`). |
 | `check` | Reads and checks each folder's `kinds.toml` (a folder or the file itself), prints `ok  backup: 4 kinds` or every problem. Several folders are checked together: a source may appear once. |
-| `publish` | Checks, then `PUT /v1/registry/{source}` for each (`spec/declarations.md`, "Reaching the server"). |
+| `publish` | Checks, then `PUT /v1/registry/{source}` for each (`spec/declarations.md`, "Reaching the server"). `--keep` sends `?keep=true`: kinds already published that a folder lacks stay. Prints what it kept, and how many open items of removed kinds a plain publish closed. |
 | `gen` | Writes the emitter file to `--out`, or prints it without one. `--check` (needs `--out`) writes nothing and fails if the file differs. |
 | `send` | One `POST /v1/events`. |
 | `resolve` | `send --resolve`: an event with state `resolved` and no values. |

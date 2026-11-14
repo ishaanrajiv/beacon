@@ -2417,3 +2417,121 @@ fn a_stored_source_that_cant_be_read_is_kept_and_reported() {
     assert_eq!(store.unreadable().unwrap().len(), 1);
     store.apply_event(&failed(), None, T0 + MINUTE).unwrap();
 }
+
+// ---------- publishing ----------
+
+/// The backup example without some of its kinds, and under another display name.
+fn backup_without(kinds: &[&str], name: &str) -> beacon_core::decl::Declarations {
+    let mut decl = parse(BACKUP, &Check::default()).unwrap();
+    for kind in kinds {
+        decl.kinds.remove(*kind);
+    }
+    decl.name = name.into();
+    decl
+}
+
+#[test]
+fn a_keep_publish_adds_and_replaces_kinds_and_keeps_the_rest() {
+    let store = store();
+    let all = parse(BACKUP, &Check::default()).unwrap();
+    let mut body = backup_without(
+        &["backup.failed", "backup.stale", "backup.space"],
+        "Nightly backups",
+    );
+    let mut renamed = all.kinds["backup.space"].clone();
+    renamed.title = "Backup disk is filling".into();
+    body.kinds.insert("backup.disk".into(), renamed);
+    let published = store.publish_with(&body, true, T0).unwrap();
+    assert_eq!(published.kept, ["backup.failed", "backup.space", "backup.stale"]);
+    assert_eq!(published.kinds, all.kinds.len() + 1);
+    assert!(published.closed.is_empty());
+    let now = store.declarations("backup").unwrap().unwrap();
+    assert_eq!(
+        now.name, "Nightly backups",
+        "the source's own fields are the body's"
+    );
+    assert_eq!(now.kinds["backup.failed"], all.kinds["backup.failed"]);
+    assert!(now.kinds.contains_key("backup.disk"));
+    // The old code and the new can both send.
+    store.apply_event(&failed(), None, T0).unwrap();
+    let disk = event("backup.disk", "", json!({"used_percent": 91}), json!({}));
+    store.apply_event(&disk, None, T0).unwrap();
+    // A keep publish of the same kind replaces it by name.
+    let mut changed = parse(BACKUP, &Check::default()).unwrap();
+    changed.kinds.get_mut("backup.failed").unwrap().push = PushLevel::Normal;
+    store.publish_with(&changed, true, T0 + MINUTE).unwrap();
+    assert_eq!(
+        store.declarations("backup").unwrap().unwrap().kinds["backup.failed"].push,
+        PushLevel::Normal
+    );
+}
+
+#[test]
+fn a_replacing_publish_closes_what_it_removed_the_kind_of() {
+    let store = store();
+    store
+        .register_device(&"ab".repeat(32), "production", None, T0)
+        .unwrap();
+    // An alert whose push went out, one that never pushed, and an action, of kinds about to go.
+    let pushed = item(&store.apply_event(&failed(), None, T0).unwrap());
+    sent(&store, T0);
+    phone_active(&store, T0);
+    let quiet = event(
+        "backup.stale",
+        "",
+        json!({"since": DAY, "last_ok": T0 - DAY}),
+        json!({}),
+    );
+    let held = item(&store.apply_event(&quiet, None, T0).unwrap());
+    assert_eq!(held.push.status, S::Held);
+    let asked = item(&store.apply_event(&reminder("r1"), None, T0).unwrap());
+    let done = item(&store.apply_event(&reminder("r2"), None, T0).unwrap());
+    store.press(done.id, "done", None, "api", T0).unwrap();
+    // A kind that stays is untouched.
+    let space = event("backup.space", "", json!({"used_percent": 95}), json!({}));
+    let staying = item(&store.apply_event(&space, None, T0).unwrap());
+
+    let published = store
+        .publish(
+            &backup_without(&["backup.failed", "backup.stale"], "Backups"),
+            T0 + HOUR,
+        )
+        .unwrap();
+    assert_eq!(published.closed, [pushed.id, held.id]);
+    for id in [pushed.id, held.id] {
+        let it = store.item(id, T0 + HOUR).unwrap().unwrap();
+        assert_eq!(it.state, Some(ItemState::Resolved));
+        assert_eq!(it.times.unwrap().resolved, Some(T0 + HOUR));
+        assert!(history(&store, id).contains(&"kind_removed".to_string()));
+    }
+    let after = store.item(pushed.id, T0 + HOUR).unwrap().unwrap();
+    assert_eq!(after.title, pushed.title, "no recovery text is invented");
+    assert_eq!(after.body, pushed.body);
+    // Its firing push reached the phone: the usual recovery replaces the banner, with its text.
+    let jobs = store.pushes_due(T0 + HOUR).unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!((jobs[0].item, jobs[0].purpose.as_str()), (pushed.id, "recovery"));
+    assert_eq!(jobs[0].title, pushed.title);
+    // The held one never pushed: suppressed, closed.
+    let held = store.item(held.id, T0 + HOUR).unwrap().unwrap();
+    assert_eq!(
+        (held.push.status, held.push.reason),
+        (S::Suppressed, Some(R::Closed))
+    );
+    assert!(history(&store, held.id).contains(&"kind_removed".to_string()));
+    // Other sources and kept kinds are untouched.
+    for id in [asked.id, staying.id] {
+        assert!(store.item(id, T0 + HOUR).unwrap().unwrap().state == Some(ItemState::Open));
+    }
+    // The assistant's action closes when its own source drops the kind.
+    let mut assistant = parse(ASSISTANT, &Check::default()).unwrap();
+    assistant.kinds.remove("assistant.reminder");
+    let published = store.publish(&assistant, T0 + 2 * HOUR).unwrap();
+    assert_eq!(published.closed, [asked.id]);
+    let closed = store.item(asked.id, T0 + 2 * HOUR).unwrap().unwrap();
+    assert_eq!(closed.state, Some(ItemState::Resolved));
+    assert_eq!(
+        store.item(done.id, T0 + 2 * HOUR).unwrap().unwrap().state,
+        Some(ItemState::Done)
+    );
+}

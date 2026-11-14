@@ -31,7 +31,8 @@ pub use clients::{Heartbeat, NewSilence, PressAnswer, SeenTarget, SilenceView};
 pub use error::{Error, ErrorKind, Result};
 pub use jobs::{Attempt, Due, PushJob, PushNext, Ran, SinkRecord};
 pub use producers::{
-    Event, EventAnswer, EventOutcome, EventState, Snapshot, SnapshotAnswer, SnapshotEntry, Unreadable,
+    Event, EventAnswer, EventOutcome, EventState, Published, Snapshot, SnapshotAnswer, SnapshotEntry,
+    Unreadable,
 };
 pub use reads::{
     Acted, AttemptView, DeviceView, HistoryEntry, Inbox, InboxQuery, ItemDetail, SourceView, VisitSummary,

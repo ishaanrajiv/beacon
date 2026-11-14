@@ -1213,3 +1213,41 @@ fn readable_db_opens_beacon_db_but_never_the_devices() {
     assert_eq!(mode(&readable, "beacon.db-wal"), 0o644);
     assert_eq!(mode(&readable, "devices.db"), 0o600);
 }
+
+#[test]
+fn a_keep_publish_keeps_kinds_and_a_plain_one_closes_what_it_removed() {
+    let lab = start();
+    let down = lab.down().json["item"]["id"].clone();
+    let mut fewer = beacon_core::decl::parse(KINDS, &Default::default()).unwrap();
+    fewer.kinds.remove("lab.down");
+    let r = lab.put("/v1/registry/lab?keep=true", &fewer.to_json());
+    assert_eq!(r.status, 200, "{:?}", r.json);
+    assert_eq!(r.json["kept"], json!(["lab.down"]));
+    assert_eq!(
+        (r.json["kinds"].clone(), r.json["closed"].clone()),
+        (json!(3), json!(0))
+    );
+    assert_eq!(lab.item(&down)["state"], "open");
+    assert_eq!(
+        lab.put("/v1/registry/lab?keep=maybe", &fewer.to_json()).status,
+        400
+    );
+    let r = lab.put("/v1/registry/lab", &fewer.to_json());
+    assert_eq!(
+        (r.json["kinds"].clone(), r.json["closed"].clone()),
+        (json!(2), json!(1))
+    );
+    let item = lab.item(&down);
+    assert_eq!(
+        (item["state"].clone(), item["title"].clone()),
+        (json!("resolved"), json!("Website is down"))
+    );
+    let history = lab.get(&format!("/v1/items/{down}")).json["history"].clone();
+    assert!(
+        history
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["what"] == "kind_removed")
+    );
+}
