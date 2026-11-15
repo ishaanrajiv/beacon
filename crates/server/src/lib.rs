@@ -10,7 +10,8 @@
 //! caused it, and a push that was in flight is retried at start. So SIGTERM's default action,
 //! ending the process at once, loses nothing Beacon answered for; that is how it stops.
 //!
-//! - `http`: requests off the socket, replies onto it.
+//! - `httpd`: the HTTP/1.1 transport, kept identical in another server (its first lines say how).
+//! - `http`: Beacon's reply, and its way onto the transport.
 //! - `api`: routing, access rules, and one handler per route.
 //! - `routes`: the route list `GET /v1` sends, checked against `spec/api.md` by a test.
 //! - `push`: draining the push queue through Apple, and Live Activities.
@@ -18,6 +19,7 @@
 
 mod api;
 mod http;
+pub mod httpd;
 mod push;
 mod routes;
 mod sink;
@@ -38,6 +40,10 @@ use std::time::Duration;
 
 /// The version `GET /v1` and `GET /v1/health` report.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Connections open at once. One more is answered `503` and closed.
+pub const MAX_CONNECTIONS: usize = 64;
+/// The stack of each connection's thread, which also runs the routes.
+const STACK_BYTES: usize = 256 * 1024;
 /// The job thread looks at least this often (`spec/delivery.md`: "at least once a second").
 const MAX_SLEEP_MS: i64 = 1_000;
 
@@ -249,7 +255,7 @@ fn db_file(path: &Path, mode: u32) {
 pub struct Server {
     pub app: Arc<App>,
     addr: SocketAddr,
-    open: Arc<http::Open>,
+    open: Arc<httpd::Open>,
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
 }
@@ -273,7 +279,7 @@ impl Server {
                 "report it as a bug",
             )]
         })?;
-        let open = Arc::new(http::Open::default());
+        let open = Arc::new(httpd::Open::default());
         let stop = Arc::new(AtomicBool::new(false));
         let thread_failed = |e: std::io::Error| {
             vec![Problem::new(
@@ -283,8 +289,20 @@ impl Server {
             )]
         };
         let mut threads = Vec::new();
-        let handler: Arc<dyn http::Handler> = Arc::new(api::Api { app: app.clone() });
-        threads.push(http::serve(handler, listener, open.clone(), stop.clone()).map_err(thread_failed)?);
+        let transport = httpd::Config {
+            name: "beacon",
+            file: "beacon.toml",
+            body_bytes: app.config.body_bytes,
+            max_connections: MAX_CONNECTIONS,
+            // Unused: every request is in the free lane (`api::Api::lane`).
+            workers: 1,
+            stack_bytes: STACK_BYTES,
+            patience: httpd::Patience::default(),
+        };
+        let handler: Arc<dyn httpd::Handler> = Arc::new(api::Api { app: app.clone() });
+        threads.push(
+            httpd::serve(handler, listener, transport, open.clone(), stop.clone()).map_err(thread_failed)?,
+        );
         if jobs {
             let app = app.clone();
             threads.push(

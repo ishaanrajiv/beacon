@@ -51,7 +51,36 @@ when there are several (a declarations file, an event with three bad facts).
 | `413` | The body is over `limits.body_bytes`: by its Content-Length, or for a chunked body as soon as the chunks so far and the next chunk's size pass it. |
 | `422` | Readable, but not declared: an undeclared kind, or facts and slots that don't fit their kind. |
 | `502` | `POST /v1/live-activity` only: Apple didn't take the update. |
-| `503` | Storage failed (retry), or for `POST /v1/live-activity`, no APNs key is configured. |
+| `503` | Storage failed (retry), or for `POST /v1/live-activity`, no APNs key is configured, or too many connections are open ("Limits"). |
+
+### Limits
+
+The HTTP/1.1 transport that reads requests and writes answers (`crates/server/src/httpd.rs`) is
+shared with Trail: both carry the same file, byte for byte, so these limits and refusals are the
+same in both, and a fix to one is a fix to the other. What it refuses never reaches a route; the
+answer has the error body above and closes the connection.
+
+| Status | When |
+|---|---|
+| `400` | Not HTTP/1.1 Beacon can read: a bad request line, a method that is not 1 to 16 capital letters, a header line without a colon, a header name that is not an RFC 9110 token (letters, digits and a few marks such as `-`, `_` and `.`; no spaces, brackets or letters outside ASCII), a control character other than a tab (a bare CR or LF, NUL, DEL) in the request line, a header, a chunk's size line or a trailer, headers that are not UTF-8, a `Content-Length` that is not digits, two different `Content-Length`s, both a length and `Transfer-Encoding`, or a chunk whose size line is not hexadecimal, is over 1 KB, or does not match its data. |
+| `408` | The headers took more than 10 seconds to arrive, or the body more than 30. |
+| `413` | The body is over `limits.body_bytes`, as in the table above. |
+| `431` | The request line and headers are over 16 KB, or a chunked body's trailers are. |
+| `501` | A `Transfer-Encoding` other than a single `chunked` (a list, or two of the header). |
+| `503` | 64 connections are open already. It carries `Retry-After: 5`. |
+
+- A connection carries many requests, one after another, and is closed after 60 idle seconds.
+  `Connection` headers are read as lists, every one of them, in any case: `close` anywhere closes
+  the connection after the answer; otherwise `keep-alive` anywhere keeps it open, even on
+  HTTP/1.0; otherwise HTTP/1.1 stays open and HTTP/1.0 closes.
+  A whole response, from its first byte to its last, has to be taken within 30 seconds, as does
+  a `100 Continue`; a caller still taking it then is hung up on.
+- `HEAD` is answered as `GET` without the body. `Expect: 100-continue` is answered before the body
+  is read.
+- A header's value loses the spaces and tabs around it, and no other characters.
+- Every answer carries `Cache-Control: no-cache`; a `304` has no body and no `Content-Length`.
+- Requests are not queued for a worker: each connection's thread answers its own requests, and
+  the store takes them one at a time.
 
 ### Access
 

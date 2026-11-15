@@ -3,7 +3,8 @@
 //! wire: JSON bodies, unknown fields with the name you probably meant, and status codes.
 
 use crate::App;
-use crate::http::{Handler, Reply, Request};
+use crate::http::{Reply, Request};
+use crate::httpd::{Handler, Lane, Refusal, Response};
 use crate::push;
 use crate::routes::{Access, ROUTES, matches};
 use beacon_core::Problem;
@@ -24,16 +25,22 @@ pub(crate) struct Api {
 }
 
 impl Handler for Api {
-    fn body_limit(&self) -> usize {
-        self.app.config.body_bytes
+    /// No slots: the store already takes one request at a time on its own lock, and the job
+    /// thread shares it, so a queue in front would only turn a slow moment into `503`s.
+    fn lane(&self, _request: &Request) -> Lane {
+        Lane::Free
     }
 
-    fn handle(&self, request: Request) -> Reply {
+    fn handle(&self, request: Request) -> Response {
         let reply = route(&self.app, &request);
         if request.method != "GET" && reply.status < 300 {
             self.app.wake();
         }
-        reply
+        reply.into()
+    }
+
+    fn refused(&self, refusal: Refusal) -> Response {
+        Reply::problem(refusal.status, refusal.at, refusal.message, refusal.fix).into()
     }
 }
 

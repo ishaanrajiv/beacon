@@ -11,7 +11,7 @@ before every commit.
 |---|---|
 | `crates/core` | Types and pure functions: classes, push levels, declarations (`kinds.toml`), templates and rendering, Beacon's own kinds, the alert and action lifecycles, the delivery decision, quiet hours. No sockets, no database. |
 | `crates/store` | SQLite: items, alerts, silences, presence, the registry, push attempts in `beacon.db`; devices and their tokens in `devices.db`. Each method applies a core transition and records its decision in one transaction; `crates/store/README.md` maps routes and jobs to methods. |
-| `crates/server` | The HTTP/1.1 server on `std::net`, the API routes, the background jobs. |
+| `crates/server` | The HTTP/1.1 server on `std::net` (`src/httpd.rs`, shared with Trail), the API routes, the background jobs. |
 | `crates/apns` | Apple push: provider tokens, HTTP/2, payloads, retries. The only crate with reqwest, ring and base64. |
 | `crates/codegen` | `beacon gen`: typed emitters for Python and TypeScript. Each generated file is a client below plus one function per kind. |
 | `crates/cli` | The `beacon` binary: check, gen, publish, send, resolve, snapshot, silence; `serve` once the server lands. |
@@ -46,6 +46,12 @@ before every commit.
 - **Nothing private in the repository.** Examples use made-up services (`backup`, `assistant`,
   `ship`), `example.com` and loopback addresses. No real hostnames, addresses, domains, product
   names or people, in code, tests, specs or commit messages.
+- **The transport is shared.** `crates/server/src/httpd.rs` (reading requests under limits and
+  timeouts, the connection cap, the slots, writing answers) is kept byte for byte the same as
+  Trail's copy, and a check outside both repositories fails when they differ. Change it in both
+  in the same piece of work. It names neither server and uses only `std` (and `serde_json` in its
+  tests); what is Beacon's own (the error body, which requests take a slot, the numbers) goes in
+  through `httpd::Config` and `httpd::Handler`, from `lib.rs` and `api.rs`.
 - **Heavy jobs are capped.** Build with `CARGO_BUILD_JOBS=4` and `nice`: the machine this is
   written on runs other services. `scripts/check` sets the cap.
 
