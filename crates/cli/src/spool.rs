@@ -13,8 +13,12 @@ use std::path::{Path, PathBuf};
 const MAX_FILES: usize = 1000;
 /// And at most this many bytes.
 const MAX_BYTES: u64 = 8 * 1024 * 1024;
-/// A request older than this is dropped: Beacon's idempotency window (`spec/delivery.md`).
-const MAX_AGE_MS: i64 = 24 * 60 * 60 * 1000;
+/// A request older than this is dropped: an hour inside Beacon's 24-hour idempotency window
+/// (`spec/delivery.md`), which began when Beacon first took the request. That can be before it
+/// was queued here, when only the answer was lost.
+const MAX_AGE_MS: i64 = 23 * 60 * 60 * 1000;
+/// A temporary file this old was left by a process that stopped mid-write.
+const STALE_TEMPORARY_MS: i64 = 10 * 60 * 1000;
 /// A snapshot older than this would be refused for its `sent_at` (`spec/api.md`).
 const SNAPSHOT_MAX_AGE_MS: i64 = 5 * 60 * 1000;
 
@@ -80,8 +84,9 @@ fn position(name: &str) -> Option<(i64, u32)> {
     Some((ms.parse().ok()?, sequence.parse().ok()?))
 }
 
-/// Creates `path`, which must not exist yet, holding `data`, readable by this user only (mode 600):
-/// it holds notification text. A hard link to it shares the mode.
+/// Creates `path`, which must not exist yet, holding `data`, and syncs it to disk. Readable by this
+/// user only (mode 600): it holds notification text. A hard link to it shares the mode. A file
+/// that couldn't be written whole is removed, so a full disk leaves nothing behind.
 fn create_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
     #[cfg(test)]
     fault::check()?;
@@ -89,7 +94,61 @@ fn create_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
     options.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    options.open(path)?.write_all(data)
+    let mut file = options.open(path)?;
+    let written = write_all(&mut file, data).and_then(|()| {
+        #[cfg(test)]
+        fault::note("sync file");
+        file.sync_all()
+    });
+    if written.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    written
+}
+
+fn write_all(file: &mut std::fs::File, data: &[u8]) -> std::io::Result<()> {
+    #[cfg(test)]
+    if fault::write_fails_part_way() {
+        file.write_all(data.get(..data.len() / 2).unwrap_or_default())?;
+        return Err(std::io::Error::other("no space left on device"));
+    }
+    file.write_all(data)
+}
+
+/// Asks the system to keep a folder's names through a power cut. Fails when it tried and couldn't
+/// (a failing disk); a platform or file system that doesn't sync folders is left to what it
+/// promises on its own.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    fault::note_synced(dir);
+    match try_sync(dir) {
+        Err(e)
+            if !matches!(
+                e.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            Err(e)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn try_sync(dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    fault::folder_sync()?;
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// A temporary file's name, as every client makes it: `.<16 hex>.tmp`.
+fn temporary(name: &str) -> bool {
+    name.strip_prefix('.')
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+        .is_some_and(|hex| hex.len() == 16 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
 }
 
 /// Two snapshots of one source covering the same kinds: the newer says all the older did.
@@ -158,43 +217,122 @@ impl Spool {
         format!("{ms:015}-{sequence:06}.json")
     }
 
-    /// Writes `data` under a temporary name, then hard-links it to the next name, which fails if
-    /// another process took that name first; then it looks again. So no two processes take one
-    /// name, and no reader sees half a file.
-    fn publish(&self, data: &[u8], now_ms: i64) -> Result<(), Problem> {
+    /// Writes the request `data` (whose Idempotency-Key is `key`) so that it outlasts a power cut:
+    /// under a temporary name, synced, then hard-linked to the next name, then the folder synced.
+    /// Only after this returns is anything the request replaces removed. If the folder can't be
+    /// synced the request is taken back, so the caller is told and what was waiting still waits.
+    fn publish(&self, data: &[u8], key: &str, now_ms: i64) -> Result<(), Problem> {
+        let name = match self.write_request(data, now_ms) {
+            // The temporary file was gone before it had its name: another process swept it as
+            // left behind (this one was paused that long, or the clock jumped). Once more.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.write_request(data, now_ms),
+            written => written,
+        }
+        .map_err(|e| self.problem(format!("can't be written: {e}")))?;
+        if let Err(e) = sync_dir(&self.dir) {
+            self.drop_same(&name, Some(key));
+            return Err(self.problem(format!("can't be written: the folder can't be synced: {e}")));
+        }
+        #[cfg(test)]
+        fault::after_publish();
+        Ok(())
+    }
+
+    /// Writes `data` under a temporary name and syncs it, then hard-links it to the next name,
+    /// which fails if another process took that name first; then it looks again. So no two
+    /// processes take one name, and no reader sees half a file. Answers the name.
+    fn write_request(&self, data: &[u8], now_ms: i64) -> std::io::Result<String> {
         let temporary = self.path(&format!(".{}.tmp", random_hex(8)));
-        create_file(&temporary, data).map_err(|e| self.problem(format!("can't be written: {e}")))?;
+        create_file(&temporary, data)?;
         let published = self.link(&temporary, now_ms);
+        #[cfg(test)]
+        fault::note("remove temporary");
         let _ = std::fs::remove_file(&temporary);
         published
     }
 
-    fn link(&self, temporary: &Path, now_ms: i64) -> Result<(), Problem> {
-        for _ in 0..NAME_TRIES {
-            let name = self.path(&self.next_name(now_ms));
-            #[cfg(test)]
-            fault::before_publish(&name);
-            match std::fs::hard_link(temporary, &name) {
-                Ok(()) => return Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(self.problem(format!("can't be written: {e}"))),
+    /// Removes temporary files a process left when it stopped mid-write: nothing lists or sends
+    /// them, so they would only pile up.
+    fn sweep(&self, now_ms: i64) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            if !temporary(&entry.file_name().to_string_lossy()) {
+                continue;
+            }
+            let written = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|since| i64::try_from(since.as_millis()).ok());
+            if written.is_some_and(|at| now_ms - at > STALE_TEMPORARY_MS) {
+                let _ = std::fs::remove_file(entry.path());
             }
         }
-        Err(self.problem(format!(
-            "can't be written: another process took each of {NAME_TRIES} names in a row"
+    }
+
+    fn link(&self, temporary: &Path, now_ms: i64) -> std::io::Result<String> {
+        for _ in 0..NAME_TRIES {
+            let name = self.next_name(now_ms);
+            let path = self.path(&name);
+            #[cfg(test)]
+            fault::before_publish(&path, temporary);
+            match std::fs::hard_link(temporary, &path) {
+                Ok(()) => {
+                    #[cfg(test)]
+                    fault::note("publish");
+                    return Ok(name);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::other(format!(
+            "another process took each of {NAME_TRIES} names in a row"
         )))
     }
 
-    /// Makes the folder for this user only (mode 700); one that is already there keeps its mode.
+    /// Makes the folder, and any folder above it that is missing, for this user only (mode 700),
+    /// and syncs the folder each is in, so they outlast a power cut too. One that is already
+    /// there keeps its mode.
     fn make_dir(&self) -> std::io::Result<()> {
-        if self.dir.is_dir() {
-            return Ok(());
+        // The folder a folder is in; `.` for a bare name, and the root is in itself.
+        fn above(dir: &Path) -> &Path {
+            match dir.parent() {
+                Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
+                Some(parent) => parent,
+                None => dir,
+            }
+        }
+        let mut missing = Vec::new();
+        let mut dir = self.dir.as_path();
+        while !dir.is_dir() && above(dir) != dir {
+            missing.push(dir);
+            dir = above(dir);
+        }
+        // The deepest folder that is there may have been made a moment ago by another process
+        // that hasn't synced it yet; whatever is above it was synced before it was made. So it is
+        // synced into its folder here too, every time: no call is answered `queued` on a folder
+        // that isn't kept. One above the spool that was already there may not be readable.
+        match sync_dir(above(dir)) {
+            Err(e) if e.kind() != std::io::ErrorKind::PermissionDenied => return Err(e),
+            _ => {}
         }
         let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true);
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-        builder.create(&self.dir)
+        for made in missing.into_iter().rev() {
+            match builder.create(made) {
+                // Another process made it just first; it is synced below all the same.
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+            sync_dir(above(made))?;
+        }
+        Ok(())
     }
 
     fn path(&self, name: &str) -> PathBuf {
@@ -212,8 +350,21 @@ impl Spool {
         fits.then_some(value)
     }
 
-    fn drop_file(&self, name: &str) {
-        let _ = std::fs::remove_file(self.path(name));
+    /// The Idempotency-Key of the request a file holds now; none when it is gone or doesn't read
+    /// as one.
+    fn key_of(&self, name: &str) -> Option<String> {
+        self.read(name)?.get("key")?.as_str().map(str::to_string)
+    }
+
+    /// Removes a file only while it still holds the request that was read. Another process may
+    /// have sent and removed that one, and a new request taken its name (after the clock stepped
+    /// back): that one stays.
+    fn drop_same(&self, name: &str, key: Option<&str>) {
+        if self.key_of(name).as_deref() == key {
+            #[cfg(test)]
+            fault::note("remove replaced");
+            let _ = std::fs::remove_file(self.path(name));
+        }
     }
 
     /// Writes a file under a temporary name, then renames it over `name`, so no reader sees half
@@ -243,13 +394,21 @@ impl Spool {
         }
         self.make_dir()
             .map_err(|e| self.problem(format!("can't be made: {e}")))?;
-        // Removed only once the new file is written, so a failed write loses nothing.
-        let (replaced, names): (Vec<String>, Vec<String>) = self.names().into_iter().partition(|name| {
-            path == SNAPSHOTS
-                && self
-                    .read(name)
-                    .is_some_and(|old| old["path"] == SNAPSHOTS && same_snapshot(&old["body"], body))
-        });
+        self.sweep(now_ms);
+        // Removed only once the new file is written and synced, so a failed write or a power cut
+        // loses nothing; and each by the key it held, so a new request under its name stays.
+        let mut replaced: Vec<(String, Option<String>)> = Vec::new();
+        let mut names = Vec::new();
+        for name in self.names() {
+            let same = (path == SNAPSHOTS)
+                .then(|| self.read(&name))
+                .flatten()
+                .filter(|old| old["path"] == SNAPSHOTS && same_snapshot(&old["body"], body));
+            match same {
+                Some(old) => replaced.push((name, old["key"].as_str().map(str::to_string))),
+                None => names.push(name),
+            }
+        }
         let mut files: Vec<(String, u64)> = names
             .into_iter()
             .map(|n| {
@@ -263,16 +422,17 @@ impl Spool {
         {
             let (name, size) = files.remove(0);
             total -= size;
-            evicted.push(name);
+            let held = self.key_of(&name);
+            evicted.push((name, held));
         }
-        self.publish(data.as_bytes(), now_ms)?;
-        for old in replaced.iter().chain(&evicted) {
-            self.drop_file(old);
+        self.publish(data.as_bytes(), key, now_ms)?;
+        for (old, held) in replaced.iter().chain(&evicted) {
+            self.drop_same(old, held.as_deref());
         }
         Ok(evicted.len())
     }
 
-    /// Past 24 hours, or a snapshot past what `sent_at` allows.
+    /// Past 23 hours, or a snapshot past what `sent_at` allows.
     fn expired(request: &Value, now_ms: i64) -> bool {
         let queued_at = request["queued_at"].as_i64().unwrap_or(0);
         if now_ms - queued_at > MAX_AGE_MS {
@@ -287,6 +447,10 @@ impl Spool {
     pub fn flush(&self, http: &Http, now_ms: i64) -> Flushed {
         // Two snapshots of one source and kinds can both be here for a moment (a newer one is written
         // before the older one it replaces is removed): sending the older, then the newer, is right.
+        self.sweep(now_ms);
+        // The clock goes on while a long flush runs: each request is aged as it comes up.
+        let started = std::time::Instant::now();
+        let now = || now_ms.saturating_add(i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX));
         let names = self.names();
         let mut done = Flushed {
             sent: 0,
@@ -298,18 +462,20 @@ impl Spool {
             let Some(request) = self.read(name) else {
                 if self.path(name).exists() {
                     done.dropped += 1;
-                    self.drop_file(name);
+                    self.drop_same(name, None);
                 }
                 continue;
             };
-            if Self::expired(&request, now_ms) {
-                done.dropped += 1;
-                self.drop_file(name);
-                continue;
-            }
             let path = request["path"].as_str().unwrap_or_default();
             let key = request["key"].as_str().unwrap_or_default();
+            if Self::expired(&request, now()) {
+                done.dropped += 1;
+                self.drop_same(name, Some(key));
+                continue;
+            }
             let answer = http.once(path, &request["body"].to_string(), key);
+            #[cfg(test)]
+            fault::after_send(&self.path(name));
             if answer.as_ref().map_or(true, |a| retryable(a.status)) {
                 done.left = names.len() - index;
                 done.problem = Some(match answer {
@@ -318,7 +484,9 @@ impl Spool {
                 });
                 return done;
             }
-            self.drop_file(name);
+            // Only while it is still this request: another flush may have sent it, and a new one
+            // have its name.
+            self.drop_same(name, Some(key));
             match answer {
                 Ok(answer) if answer.ok() => done.sent += 1,
                 _ => done.dropped += 1,
@@ -353,8 +521,65 @@ pub mod fault {
 
     thread_local! {
         static FAIL_WRITE: Cell<bool> = const { Cell::new(false) };
+        static FAIL_PART_WAY: Cell<bool> = const { Cell::new(false) };
         static TAKE_NAME: RefCell<Option<String>> = const { RefCell::new(None) };
         static MAX_BYTES: Cell<Option<u64>> = const { Cell::new(None) };
+        static STEPS: RefCell<Option<Vec<&'static str>>> = const { RefCell::new(None) };
+        static AFTER_PUBLISH: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+        static AFTER_SEND: RefCell<Option<String>> = const { RefCell::new(None) };
+        static SWEEP_TEMPORARY: Cell<bool> = const { Cell::new(false) };
+        static FOLDER_SYNC: Cell<Option<std::io::ErrorKind>> = const { Cell::new(None) };
+        static SYNCED: RefCell<Option<Vec<std::path::PathBuf>>> = const { RefCell::new(None) };
+    }
+
+    /// From now on this thread's spool notes each step it takes; `steps` gives them and stops.
+    pub fn record_steps() {
+        STEPS.with(|steps| *steps.borrow_mut() = Some(Vec::new()));
+    }
+
+    pub fn steps() -> Vec<&'static str> {
+        STEPS.with(|steps| steps.borrow_mut().take().unwrap_or_default())
+    }
+
+    pub(super) fn note(step: &'static str) {
+        STEPS.with(|steps| {
+            if let Some(steps) = steps.borrow_mut().as_mut() {
+                steps.push(step);
+            }
+        });
+    }
+
+    /// The next file the spool writes on this thread gets half its bytes, then fails, as on a
+    /// disk that fills while it is written.
+    pub fn fail_next_write_part_way() {
+        FAIL_PART_WAY.with(|fail| fail.set(true));
+    }
+
+    pub(super) fn write_fails_part_way() -> bool {
+        FAIL_PART_WAY.with(|fail| fail.replace(false))
+    }
+
+    /// Runs once, after the next request file is published and before what it replaces is removed.
+    pub fn after_next_publish(then: impl FnOnce() + 'static) {
+        AFTER_PUBLISH.with(|after| *after.borrow_mut() = Some(Box::new(then)));
+    }
+
+    pub(super) fn after_publish() {
+        if let Some(then) = AFTER_PUBLISH.with(|after| after.borrow_mut().take()) {
+            then();
+        }
+    }
+
+    /// After the next request a flush sends, and before it removes the file, another process has
+    /// sent and removed that file and a new request, `contents`, has taken its name.
+    pub fn retake_name_after_next_send(contents: String) {
+        AFTER_SEND.with(|after| *after.borrow_mut() = Some(contents));
+    }
+
+    pub(super) fn after_send(path: &Path) {
+        if let Some(contents) = AFTER_SEND.with(|after| after.borrow_mut().take()) {
+            let _ = std::fs::write(path, contents);
+        }
     }
 
     /// The spool's byte limit, on this thread, is `bytes`.
@@ -372,13 +597,53 @@ pub mod fault {
         TAKE_NAME.with(|take| *take.borrow_mut() = Some(contents));
     }
 
-    pub(super) fn before_publish(path: &Path) {
+    pub(super) fn before_publish(path: &Path, temporary: &Path) {
         let request = path
             .file_name()
             .is_some_and(|name| !name.to_string_lossy().starts_with('.'));
         if let Some(contents) = TAKE_NAME.with(|take| request.then(|| take.borrow_mut().take()).flatten()) {
             let _ = std::fs::write(path, contents);
         }
+        if SWEEP_TEMPORARY.with(|sweep| sweep.replace(false)) {
+            let _ = std::fs::remove_file(temporary);
+        }
+    }
+
+    /// Another process, whose clock says the next temporary file is old, removes it as left
+    /// behind, between this one writing it and giving it its name.
+    pub fn sweep_next_temporary() {
+        SWEEP_TEMPORARY.with(|sweep| sweep.set(true));
+    }
+
+    /// From now on, on this thread, syncing a folder fails as on a failing disk (`Other`), or as
+    /// on a file system that doesn't sync folders (`Unsupported`). `None` ends it.
+    pub fn fail_folder_sync(kind: Option<std::io::ErrorKind>) {
+        FOLDER_SYNC.with(|fail| fail.set(kind));
+    }
+
+    pub(super) fn folder_sync() -> std::io::Result<()> {
+        match FOLDER_SYNC.with(Cell::get) {
+            None => Ok(()),
+            Some(kind) => Err(std::io::Error::new(kind, "the folder can't be synced")),
+        }
+    }
+
+    /// From now on this thread's spool notes each folder it syncs; `synced` gives them and stops.
+    pub fn record_synced() {
+        SYNCED.with(|synced| *synced.borrow_mut() = Some(Vec::new()));
+    }
+
+    pub fn synced() -> Vec<std::path::PathBuf> {
+        SYNCED.with(|synced| synced.borrow_mut().take().unwrap_or_default())
+    }
+
+    pub(super) fn note_synced(dir: &Path) {
+        note("sync folder");
+        SYNCED.with(|synced| {
+            if let Some(synced) = synced.borrow_mut().as_mut() {
+                synced.push(dir.to_path_buf());
+            }
+        });
     }
 
     /// The next file the spool writes on this thread fails, as on a full disk.
