@@ -6,7 +6,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, s
 import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, join, relative } from "node:path";
 import { after, afterEach, before, beforeEach, test } from "node:test";
 import * as client from "../beacon_client.ts";
 import * as assistant from "./gen/assistant_kinds.ts";
@@ -564,6 +564,157 @@ test("a request is synced to disk before what it replaces is removed", async () 
   }
   assert.equal(sent.queued, true, sent.problem ?? "");
   assert.deepEqual(steps, ["sync file", "publish", "remove temporary", "sync folder", "remove replaced"]);
+});
+
+// A file system on which syncing a folder fails with `code`; files sync as usual.
+function failingFolderSync(code: string): () => void {
+  const realFs = client.runtime.fs;
+  client.runtime.fs = async () => {
+    const fs = await realFs.call(client.runtime);
+    return {
+      ...fs,
+      open: async (path: string, flags: "wx" | "r", mode?: number) => {
+        const file = await fs.open(path, flags, mode);
+        if (flags !== "r") return file;
+        return {
+          writeFile: (data: string) => file.writeFile(data),
+          sync: async () => {
+            throw Object.assign(new Error(`${code}: fsync`), { code });
+          },
+          close: () => file.close(),
+        };
+      },
+    };
+  };
+  return () => {
+    client.runtime.fs = realFs;
+  };
+}
+
+test("a folder that can't be synced keeps what was waiting and says so", { skip: process.platform === "win32" }, async () => {
+  useSpool();
+  const realNow = Date.now;
+  Date.now = () => clock;
+  let restore = (): void => {};
+  let sent: client.Sent | undefined;
+  try {
+    refuse();
+    await client.snapshot("backup", [client.entry("backup.space", { facts: { used_percent: 96 } })]);
+    restore = failingFolderSync("EIO");
+    refuse(1);
+    sent = await client.snapshot("backup", []);
+  } finally {
+    Date.now = realNow;
+    restore();
+  }
+  assert.deepEqual([sent.ok, sent.queued], [false, false]);
+  assert.match(sent.problem ?? "", /can't be written/);
+  // The older snapshot still waits, and the one that isn't known to be on disk was taken back.
+  assert.equal(bodies().length, 1);
+  assert.equal((bodies()[0]?.["firing"] as unknown[]).length, 1);
+  assert.deepEqual(
+    readdirSync(spool).filter((n) => n.startsWith(".")),
+    [],
+  );
+});
+
+test("a file system that doesn't sync folders still queues", { skip: process.platform === "win32" }, async () => {
+  useSpool();
+  const restore = failingFolderSync("EINVAL");
+  let sent: client.Sent | undefined;
+  try {
+    refuse();
+    sent = await client.send("backup.space", { key: "mine" });
+  } finally {
+    restore();
+  }
+  assert.equal(sent.queued, true, sent.problem ?? "");
+  assert.deepEqual(
+    bodies().map((b) => b["key"]),
+    ["mine"],
+  );
+});
+
+test("folders the spool makes are private and synced into their parents", { skip: process.platform === "win32" }, async () => {
+  useSpool();
+  const root = join(spool, "..");
+  const nested = join(root, "state", "beacon", "spool");
+  process.env.BEACON_SPOOL_DIR = nested;
+  const synced: string[] = [];
+  const realSync = client.runtime.syncFolder;
+  client.runtime.syncFolder = async function (this: typeof client.runtime, fs, folder) {
+    synced.push(relative(root, folder) || ".");
+    await realSync.call(this, fs, folder);
+  };
+  const umask = process.umask(0o022);
+  let sent: client.Sent | undefined;
+  try {
+    refuse();
+    sent = await client.send("backup.space", { key: "mine" });
+  } finally {
+    process.umask(umask);
+    client.runtime.syncFolder = realSync;
+  }
+  assert.equal(sent.queued, true, sent.problem ?? "");
+  // Each new folder's parent, top down, then the spool itself once the request has its name.
+  assert.deepEqual(synced, [".", "state", join("state", "beacon"), join("state", "beacon", "spool")]);
+  for (const made of ["state", join("state", "beacon"), join("state", "beacon", "spool")]) {
+    assert.equal(statSync(join(root, made)).mode & 0o777, 0o700, made);
+  }
+});
+
+test("a temporary file swept while it is written is written again", async () => {
+  useSpool();
+  const realFs = client.runtime.fs;
+  let swept = false;
+  client.runtime.fs = async () => {
+    const fs = await realFs.call(client.runtime);
+    return {
+      ...fs,
+      link: async (from: string, to: string) => {
+        if (!swept) {
+          // Another process, whose clock says this file is old, removes it as left behind.
+          swept = true;
+          rmSync(from);
+        }
+        await fs.link(from, to);
+      },
+    };
+  };
+  let sent: client.Sent | undefined;
+  try {
+    refuse();
+    sent = await client.send("backup.space", { key: "mine" });
+  } finally {
+    client.runtime.fs = realFs;
+  }
+  assert.equal(sent.queued, true, sent.problem ?? "");
+  assert.deepEqual(
+    bodies().map((b) => b["key"]),
+    ["mine"],
+  );
+  assert.deepEqual(
+    readdirSync(spool).filter((n) => n.startsWith(".")),
+    [],
+  );
+});
+
+test("a request ages from its first try, not from when it was queued", async () => {
+  useSpool();
+  const firstTry = clock;
+  const realAttempt = client.runtime.attempt;
+  client.runtime.attempt = async function (this: typeof client.runtime, path: string, data: string, key: string) {
+    const answer = await realAttempt.call(this, path, data, key);
+    clock += 60 * 60 * 1000;
+    return answer;
+  };
+  try {
+    refuse();
+    await client.send("backup.space", { key: "mine" });
+  } finally {
+    client.runtime.attempt = realAttempt;
+  }
+  assert.equal(spooled()[0]?.["queued_at"], firstTry);
 });
 
 test("a write that fails part way leaves no temporary file", async () => {

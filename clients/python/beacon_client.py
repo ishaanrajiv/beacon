@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 # --- runtime start ---
+import errno
 import json
 import os
 import re
@@ -252,10 +253,12 @@ class _Runtime:
             flushed = self.flush()
             if flushed.left:
                 sent = Sent(ok=False, status=0, outcome=None, item=None, problem=flushed.problem)
-                return self.finish(self.queue(spool, path, key, body, sent))
+                return self.finish(self.queue(spool, path, key, body, sent, self.now_ms()))
+        # A request ages from its first try: Beacon may have taken that one and only the answer been lost.
+        tried = self.now_ms()
         sent = self.attempt_all(path, json.dumps(body).encode(), key)
         if spool is not None and self.retryable(sent.status):
-            sent = self.queue(spool, path, key, body, sent)
+            sent = self.queue(spool, path, key, body, sent, tried)
         return self.finish(sent)
 
     def finish(self, sent: Sent) -> Sent:
@@ -301,11 +304,27 @@ class _Runtime:
             ms, sequence = ms + 1, 0
         return f"{ms:015d}-{sequence:06d}.json"
 
-    def publish(self, spool: str, data: bytes, now: int) -> None:
+    def publish(self, spool: str, data: bytes, key: str, now: int) -> None:
+        """Writes the request `data` (whose Idempotency-Key is `key`) so that it outlasts a power cut: under
+        a temporary name, synced, then hard-linked to the next name, then the folder synced. Only after this
+        returns is anything the request replaces removed. If the folder can't be synced the request is taken
+        back and this raises, so the caller is told and what was waiting still waits."""
+        try:
+            name = self.write(spool, data, now)
+        except FileNotFoundError:
+            # The temporary file was gone before it had its name: another process swept it as left
+            # behind (this one was paused that long, or the clock jumped). Once more.
+            name = self.write(spool, data, now)
+        try:
+            self.sync_folder(spool)
+        except OSError:
+            self.drop_same(spool, name, key)
+            raise
+
+    def write(self, spool: str, data: bytes, now: int) -> str:
         """Writes `data` under a temporary name and syncs it, then hard-links it to the next name, which fails
         if another process took that name first; then it looks again. So no two processes take one name, and
-        no reader sees half a file. The folder is synced last, so the file outlasts a power cut before
-        anything it replaces is removed. The temporary name is removed however this ends."""
+        no reader sees half a file. The temporary name is removed however this ends. Answers the name."""
         temporary = f".{secrets.token_hex(8)}.tmp"
         made = False
         try:
@@ -316,30 +335,45 @@ class _Runtime:
                 file.flush()
                 os.fsync(file.fileno())
             for _ in range(SPOOL_NAME_TRIES):
+                name = self.next_name(spool, now)
                 try:
-                    os.link(os.path.join(spool, temporary), os.path.join(spool, self.next_name(spool, now)))
-                    break
+                    os.link(os.path.join(spool, temporary), os.path.join(spool, name))
+                    return name
                 except FileExistsError:
                     continue
-            else:
-                raise OSError(f"another process took each of {SPOOL_NAME_TRIES} names in a row")
+            raise OSError(f"another process took each of {SPOOL_NAME_TRIES} names in a row")
         finally:
             if made:
                 self.drop(spool, temporary)
-        self.sync_folder(spool)
 
-    def sync_folder(self, spool: str) -> None:
-        """Asks the system to keep the folder's names through a power cut; a platform that can't is left be."""
-        try:
-            folder = os.open(spool, os.O_RDONLY)
-        except OSError:
+    def sync_folder(self, folder: str) -> None:
+        """Asks the system to keep a folder's names through a power cut. Raises when it tried and failed (a
+        failing disk); a platform or file system that doesn't sync folders is left to what it promises."""
+        if os.name != "posix":
             return
+        opened = os.open(folder, os.O_RDONLY)
         try:
-            os.fsync(folder)
-        except OSError:
-            pass  # Not every file system syncs a folder; the file itself was synced.
+            os.fsync(opened)
+        except OSError as error:
+            if error.errno not in (errno.EINVAL, errno.ENOTSUP, errno.ENOSYS):
+                raise
         finally:
-            os.close(folder)
+            os.close(opened)
+
+    def make_folder(self, spool: str) -> None:
+        """Makes the spool, and any folder above it that is missing, for this user only (mode 700), and
+        syncs the folder each was made in, so they outlast a power cut too. One already there keeps its mode."""
+        missing: list[str] = []
+        folder = os.path.abspath(spool)
+        while not os.path.isdir(folder) and os.path.dirname(folder) != folder:
+            missing.append(folder)
+            folder = os.path.dirname(folder)
+        for folder in reversed(missing):
+            try:
+                os.mkdir(folder, 0o700)
+            except FileExistsError:
+                continue  # Another process made it just first.
+            self.sync_folder(os.path.dirname(folder))
 
     def sweep(self, spool: str, now: int) -> None:
         """Removes temporary files a process left when it stopped mid-write: nothing lists or sends them."""
@@ -411,10 +445,11 @@ class _Runtime:
         )
         return a.get("source") == b.get("source") and same_kinds
 
-    def queue(self, spool: str, path: str, key: str, body: Mapping[str, object], sent: Sent) -> Sent:
-        """Writes the request to the spool and answers `queued`; a spool that can't be written leaves `sent` as it was."""
+    def queue(self, spool: str, path: str, key: str, body: Mapping[str, object], sent: Sent, tried: int) -> Sent:
+        """Writes the request, first tried at `tried`, to the spool and answers `queued`; a spool that can't
+        be written leaves `sent` as it was."""
         now = self.now_ms()
-        data = json.dumps({"path": path, "key": key, "queued_at": now, "body": dict(body)}).encode()
+        data = json.dumps({"path": path, "key": key, "queued_at": tried, "body": dict(body)}).encode()
         why = sent.problem or f"Beacon answered {sent.status}"
         if len(data) > SPOOL_MAX_BYTES:
             # It could never fit, and making room for it would drop everything waiting: drop it alone.
@@ -425,8 +460,7 @@ class _Runtime:
             )
             return Sent(ok=False, status=sent.status, outcome=None, item=None, problem=problem)
         try:
-            # Made for this user only; a folder that is already there keeps its mode.
-            os.makedirs(spool, mode=0o700, exist_ok=True)
+            self.make_folder(spool)
             self.sweep(spool, now)
             names = self.spooled(spool)
             # Removed only once the new file is written and synced, so a failed write or a power cut
@@ -444,7 +478,7 @@ class _Runtime:
                 oldest = names.pop(0)
                 evicted.append((oldest, self.key_of(spool, oldest)))
                 sizes.pop(0)
-            self.publish(spool, data, now)
+            self.publish(spool, data, key, now)
         except OSError as error:
             problem = f"{why}\n  and the spool {spool} can't be written: {error}"
             return Sent(ok=False, status=sent.status, outcome=None, item=None, problem=problem)

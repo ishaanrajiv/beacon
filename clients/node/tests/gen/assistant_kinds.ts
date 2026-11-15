@@ -45,7 +45,7 @@ export interface Flushed {
 
 /** The parts of `node:fs/promises` the spool uses, typed here so the file needs no `@types/node`. */
 interface SpoolFs {
-  mkdir(path: string, options: { recursive: true; mode: number }): Promise<unknown>;
+  mkdir(path: string, options: { mode: number }): Promise<unknown>;
   readdir(path: string): Promise<string[]>;
   readFile(path: string, encoding: "utf8"): Promise<string>;
   open(path: string, flags: "wx" | "r", mode?: number): Promise<SpoolFile>;
@@ -215,11 +215,13 @@ class BeaconRuntime {
       const flushed = await this.flush();
       if (flushed.left > 0) {
         const waiting = { ok: false, status: 0, outcome: null, item: null, problem: flushed.problem, queued: false };
-        return this.finish(await this.queue(spool, path, key, body, waiting));
+        return this.finish(await this.queue(spool, path, key, body, waiting, this.now()));
       }
     }
+    // A request ages from its first try: Beacon may have taken that one and only the answer been lost.
+    const tried = this.now();
     let sent = await this.attemptAll(path, JSON.stringify(body), key);
-    if (spool !== undefined && this.retryable(sent.status)) sent = await this.queue(spool, path, key, body, sent);
+    if (spool !== undefined && this.retryable(sent.status)) sent = await this.queue(spool, path, key, body, sent, tried);
     return this.finish(sent);
   }
 
@@ -281,12 +283,35 @@ class BeaconRuntime {
   }
 
   /**
+   * Writes the request `data` (whose Idempotency-Key is `key`) so that it outlasts a power cut: under a
+   * temporary name, synced, then hard-linked to the next name, then the folder synced. Only after this
+   * resolves is anything the request replaces removed. If the folder can't be synced the request is taken
+   * back and this rejects, so the caller is told and what was waiting still waits.
+   */
+  async publish(fs: SpoolFs, spool: string, data: string, key: string, now: number): Promise<void> {
+    let name: string;
+    try {
+      name = await this.write(fs, spool, data, now);
+    } catch (error) {
+      if ((error as { code?: unknown }).code !== "ENOENT") throw error;
+      // The temporary file was gone before it had its name: another process swept it as left
+      // behind (this one was paused that long, or the clock jumped). Once more.
+      name = await this.write(fs, spool, data, now);
+    }
+    try {
+      await this.syncFolder(fs, spool);
+    } catch (error) {
+      await this.dropSame(fs, spool, name, key);
+      throw error;
+    }
+  }
+
+  /**
    * Writes `data` under a temporary name and syncs it, then hard-links it to the next name, which fails
    * if another process took that name first; then it looks again. So no two processes take one name, and
-   * no reader sees half a file. The folder is synced last, so the file outlasts a power cut before
-   * anything it replaces is removed. The temporary name is removed however this ends.
+   * no reader sees half a file. The temporary name is removed however this ends. Answers the name.
    */
-  async publish(fs: SpoolFs, spool: string, data: string, now: number): Promise<void> {
+  async write(fs: SpoolFs, spool: string, data: string, now: number): Promise<string> {
     const temporary = `.${this.idempotencyKey().slice(0, 16)}.tmp`;
     let made = false;
     try {
@@ -299,36 +324,64 @@ class BeaconRuntime {
       } finally {
         await file.close();
       }
-      let published = false;
-      for (let tries = 0; tries < SPOOL_NAME_TRIES && !published; tries++) {
+      for (let tries = 0; tries < SPOOL_NAME_TRIES; tries++) {
+        const name = await this.nextName(fs, spool, now);
         try {
-          await fs.link(`${spool}/${temporary}`, `${spool}/${await this.nextName(fs, spool, now)}`);
-          published = true;
+          await fs.link(`${spool}/${temporary}`, `${spool}/${name}`);
+          return name;
         } catch (error) {
           if ((error as { code?: unknown }).code !== "EEXIST") throw error;
         }
       }
-      if (!published) throw new Error(`another process took each of ${SPOOL_NAME_TRIES} names in a row`);
+      throw new Error(`another process took each of ${SPOOL_NAME_TRIES} names in a row`);
     } finally {
       if (made) await this.drop(fs, spool, temporary);
     }
-    await this.syncFolder(fs, spool);
   }
 
-  /** Asks the system to keep the folder's names through a power cut; a platform that can't is left be. */
-  async syncFolder(fs: SpoolFs, spool: string): Promise<void> {
-    let folder: SpoolFile;
+  /**
+   * Asks the system to keep a folder's names through a power cut. Rejects when it tried and failed (a
+   * failing disk); a platform or file system that doesn't sync folders is left to what it promises.
+   */
+  async syncFolder(fs: SpoolFs, folder: string): Promise<void> {
+    const platform = (globalThis as { process?: { platform?: string } }).process?.platform;
+    if (platform === "win32") return;
+    const opened = await fs.open(folder, "r");
     try {
-      folder = await fs.open(spool, "r");
-    } catch {
-      return;
-    }
-    try {
-      await folder.sync();
-    } catch {
-      // Not every file system syncs a folder; the file itself was synced.
+      await opened.sync();
+    } catch (error) {
+      const code = (error as { code?: unknown }).code;
+      if (code !== "EINVAL" && code !== "ENOTSUP" && code !== "ENOSYS") throw error;
     } finally {
-      await folder.close();
+      await opened.close();
+    }
+  }
+
+  /**
+   * Makes the spool, and any folder above it that is missing, for this user only (mode 700), and syncs
+   * the folder each was made in, so they outlast a power cut too. One already there keeps its mode.
+   */
+  async makeFolder(fs: SpoolFs, spool: string): Promise<void> {
+    // The folder a folder is in, by either separator; `.` for a bare name.
+    const parent = (folder: string): string => {
+      const cut = Math.max(folder.lastIndexOf("/"), folder.lastIndexOf("\\"));
+      return cut < 0 ? "." : cut === 0 ? folder.slice(0, 1) : folder.slice(0, cut);
+    };
+    const missing: string[] = [];
+    let folder = spool.replace(/[\\/]+$/, "") || spool;
+    while (!(await this.exists(fs, folder)) && parent(folder) !== folder) {
+      missing.push(folder);
+      folder = parent(folder);
+    }
+    for (const made of missing.reverse()) {
+      try {
+        await fs.mkdir(made, { mode: 0o700 });
+      } catch (error) {
+        // Another process made it just first.
+        if ((error as { code?: unknown }).code === "EEXIST") continue;
+        throw error;
+      }
+      await this.syncFolder(fs, parent(made));
     }
   }
 
@@ -403,10 +456,13 @@ class BeaconRuntime {
     return a["source"] === b["source"] && kinds(a["kinds"]) === kinds(b["kinds"]);
   }
 
-  /** Writes the request to the spool and answers `queued`; a spool that can't be written leaves `sent` as it was. */
-  async queue(spool: string, path: string, key: string, body: Record<string, unknown>, sent: Sent): Promise<Sent> {
+  /**
+   * Writes the request, first tried at `tried`, to the spool and answers `queued`; a spool that can't be
+   * written leaves `sent` as it was.
+   */
+  async queue(spool: string, path: string, key: string, body: Record<string, unknown>, sent: Sent, tried: number): Promise<Sent> {
     const now = this.now();
-    const data = JSON.stringify({ path, key, queued_at: now, body });
+    const data = JSON.stringify({ path, key, queued_at: tried, body });
     const bytes = new TextEncoder().encode(data).byteLength;
     const why = sent.problem ?? `Beacon answered ${sent.status}`;
     if (bytes > SPOOL_LIMITS.bytes) {
@@ -418,8 +474,7 @@ class BeaconRuntime {
     let dropped = 0;
     try {
       const fs = await this.fs();
-      // Made for this user only; a folder that is already there keeps its mode.
-      await fs.mkdir(spool, { recursive: true, mode: 0o700 });
+      await this.makeFolder(fs, spool);
       await this.sweep(fs, spool, now);
       let names = await this.spooled(fs, spool);
       // Removed only once the new file is written and synced, so a failed write or a power cut
@@ -441,7 +496,7 @@ class BeaconRuntime {
         evicted.push([oldest, await this.keyOf(fs, spool, oldest)]);
         total -= sizes.shift() ?? 0;
       }
-      await this.publish(fs, spool, data, now);
+      await this.publish(fs, spool, data, key, now);
       for (const [old, held] of [...replaced, ...evicted]) await this.dropSame(fs, spool, old, held);
       dropped = evicted.length;
       this.droppedTotal += dropped;

@@ -235,6 +235,7 @@ folder, the emitters and the `beacon` command keep it instead:
 - **Bounded.** A file waits at most 23 hours, then is dropped. That is an hour inside Beacon's default
   24-hour idempotency window, which began when Beacon first took the request: before the file was
   written, when only the answer was lost. Sent again after the window, it would be recorded twice.
+  A flush ages each file as it reaches it, not once at its start.
   The folder holds at most 1,000 files and 8 MB (8,388,608 bytes of the files as written, UTF-8):
   queuing one more drops the oldest first, once the new one is written. A request larger than the
   whole 8 MB on its own is not kept and drops nothing: it is counted as dropped, and the answer is
@@ -252,20 +253,26 @@ those two numbers, compared as numbers. No lock file is needed to keep that orde
   name's `ms` is the later of its clock and that one's; its sequence is one more than that one's
   when the `ms` is the same, else 0; past 999999 it is the next `ms` with sequence 0. So a new file
   never sorts before one already there, whatever process wrote it, and a clock that steps back
-  doesn't reorder. `queued_at` in the file is the writer's clock, which ages it; the name only
-  orders it.
+  doesn't reorder. `queued_at` in the file is the writer's clock when the request was first tried
+  (not when it was written here, which is after the retries), and ages it; the name only orders it.
 - **Publishing.** The request is written to a temporary name, `.<16 hex>.tmp`, and synced to disk,
   then hard-linked to its name, which fails if that name exists, and the temporary name removed. So
   two processes can't take one name, and a reader never sees half a file. A writer whose name was
   taken first lists again and tries the next, up to 20 times, then answers that the spool can't be
   written. The folder must be on a file system with hard links.
 - **Kept through a power cut.** After the link the folder is synced too, and only then is anything
-  the new file replaces or pushes out removed. So a call answered `queued` is on disk, and a power
-  cut between the steps leaves the older file, the newer, or both, never neither. A file system
-  that can't sync a folder is left to what it promises on its own.
+  the new file replaces or pushes out removed. So a power cut between the steps leaves the older
+  file, the newer, or both, never neither. If the folder can't be synced (a failing disk) the new
+  file is taken back and the answer is the one for a spool that can't be written: what was waiting
+  still waits. A folder the spool makes, with any above it that were missing, is synced into the
+  folder it was made in. This holds where folders can be synced: a file system that answers that
+  it doesn't do that, and Windows, are left to what they promise on their own, and there a call
+  answered `queued` may not outlast a power cut.
 - **Temporary files.** A write that fails (a full disk) removes its temporary file before it
   answers. One left by a process that stopped mid-write is removed, once it is 10 minutes old, by
-  the next call that queues or flushes; nothing lists or sends it meanwhile.
+  the next call that queues or flushes; nothing lists or sends it meanwhile. Age is all that says
+  a file was left: a writer paused that long, or a clock that jumps forward, can lose its
+  temporary file to another process while it writes. It then writes the file again, once.
 - **Removing.** A file is removed only while it still holds the request that was read: the same
   Idempotency-Key. Two flushes at once can each send one request, which Beacon records once; if
   the first then removes the file and a writer whose clock stepped back gives a new request that
@@ -273,7 +280,7 @@ those two numbers, compared as numbers. No lock file is needed to keep that orde
   so this narrows that case to the instant between them; it doesn't lock the folder.
 - **Older names.** Files named `<ms>-<sequence>-<hex>.json` by earlier versions are still read,
   ordered by their `(ms, sequence)` among the rest, and sent.
-- **Modes.** The files hold notification text, so a folder the spool makes is mode `700`, and
+- **Modes.** The files hold notification text, so every folder the spool makes is mode `700`, and
   every file it writes (temporary and final, and the command's `.kinds-<source>.json`) is created
   mode `600`, whatever the umask. A folder that is already there keeps its mode. A platform without
   Unix modes gets its defaults.

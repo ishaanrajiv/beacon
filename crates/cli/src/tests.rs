@@ -1051,6 +1051,67 @@ fn a_spooled_request_is_synced_to_disk_before_what_it_replaces_is_removed() {
 }
 
 #[test]
+fn a_spool_folder_that_cant_be_synced_keeps_what_was_waiting_and_says_so() {
+    let dir = scratch("spool-sync-fails");
+    snapshot_while_away(&dir, &["--fire", "backup.space used_percent=96"]);
+    crate::spool::fault::fail_folder_sync(Some(std::io::ErrorKind::Other));
+    let backup = example("backup");
+    let (code, text) = refused(&[
+        "snapshot",
+        "backup",
+        "--decls",
+        &backup,
+        "--spool",
+        dir.to_str().unwrap(),
+        "--server",
+        NOBODY,
+    ]);
+    crate::spool::fault::fail_folder_sync(None);
+    assert_eq!(code, 3);
+    assert!(text.contains("the folder can't be synced"), "{text}");
+    // The older snapshot still waits, and the one not known to be on disk was taken back.
+    let [kept] = spooled(&dir).try_into().unwrap();
+    assert_eq!(kept["body"]["firing"].as_array().map(Vec::len), Some(1));
+}
+
+#[test]
+fn a_file_system_that_doesnt_sync_folders_still_spools() {
+    let dir = scratch("spool-sync-unsupported");
+    crate::spool::fault::fail_folder_sync(Some(std::io::ErrorKind::Unsupported));
+    send_while_away(&dir, "mine");
+    crate::spool::fault::fail_folder_sync(None);
+    assert_eq!(spooled_keys(&dir), ["mine"]);
+}
+
+#[test]
+fn folders_the_spool_makes_are_synced_into_their_parents() {
+    let root = scratch("spool-nested");
+    let nested = root.join("state").join("beacon").join("spool");
+    crate::spool::fault::record_synced();
+    send_while_away(&nested, "mine");
+    // Each new folder's parent, top down, then the spool itself once the request has its name.
+    assert_eq!(
+        crate::spool::fault::synced(),
+        [
+            root.clone(),
+            root.join("state"),
+            root.join("state").join("beacon"),
+            nested.clone()
+        ]
+    );
+    assert_eq!(spooled_keys(&nested), ["mine"]);
+}
+
+#[test]
+fn a_temporary_file_swept_while_it_is_written_is_written_again() {
+    let dir = scratch("spool-swept");
+    crate::spool::fault::sweep_next_temporary();
+    send_while_away(&dir, "mine");
+    assert_eq!(spooled_keys(&dir), ["mine"]);
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+}
+
+#[test]
 fn a_spool_write_that_fails_part_way_leaves_no_temporary_file() {
     let dir = scratch("spool-part-way");
     crate::spool::fault::fail_next_write_part_way();

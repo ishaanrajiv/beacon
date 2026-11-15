@@ -525,6 +525,93 @@ class SpoolTest(unittest.TestCase):
         self.assertTrue(sent.queued, sent.problem)
         self.assertEqual(steps, ["sync file", "publish", "remove temporary", "sync folder", "remove replaced"])
 
+    def failing_folder_sync(self, code: int) -> Callable[[int], None]:
+        real_fsync = os.fsync
+
+        def fsync(fd: int) -> None:
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(code, os.strerror(code))
+            real_fsync(fd)
+
+        return fsync
+
+    @unittest.skipUnless(os.name == "posix", "folders are synced on Unix")
+    def test_a_folder_that_cant_be_synced_keeps_what_was_waiting_and_says_so(self) -> None:
+        with mock.patch("time.time", return_value=self.clock / 1000):
+            self.refuse()
+            beacon_client.snapshot("backup", [beacon_client.entry("backup.space", facts={"used_percent": 96})])
+            self.refuse(1)
+            with mock.patch("os.fsync", self.failing_folder_sync(errno.EIO)):
+                sent = beacon_client.snapshot("backup", [])
+        self.assertEqual((sent.ok, sent.queued), (False, False))
+        self.assertIn("can't be written", sent.problem or "")
+        # The older snapshot still waits, and the one that isn't known to be on disk was taken back.
+        [kept] = self.files()
+        self.assertEqual(len(cast("list[object]", cast("dict[str, object]", kept["body"])["firing"])), 1)
+        self.assertEqual([n for n in os.listdir(self.spool) if n.startswith(".")], [])
+
+    @unittest.skipUnless(os.name == "posix", "folders are synced on Unix")
+    def test_a_file_system_that_doesnt_sync_folders_still_queues(self) -> None:
+        self.refuse()
+        with mock.patch("os.fsync", self.failing_folder_sync(errno.EINVAL)):
+            sent = beacon_client.send("backup.space", key="mine")
+        self.assertTrue(sent.queued, sent.problem)
+        self.assertEqual(self.keys(), ["mine"])
+
+    @unittest.skipUnless(os.name == "posix", "Unix file modes and folder syncs")
+    def test_folders_the_spool_makes_are_private_and_synced_into_their_parents(self) -> None:
+        nested = os.path.join(self.folder.name, "state", "beacon", "spool")
+        os.environ["BEACON_SPOOL_DIR"] = nested
+        synced: list[str] = []
+        real_sync = beacon_client._Runtime.sync_folder  # pyright: ignore[reportPrivateUsage] - the test watches which folders are synced
+
+        def sync_folder(runtime: Any, folder: str) -> None:
+            synced.append(os.path.relpath(folder, self.folder.name))
+            real_sync(runtime, folder)
+
+        umask = os.umask(0o022)
+        try:
+            self.refuse()
+            with mock.patch.object(beacon_client._Runtime, "sync_folder", sync_folder):  # pyright: ignore[reportPrivateUsage] - as above
+                sent = beacon_client.send("backup.space", key="mine")
+        finally:
+            os.umask(umask)
+        self.assertTrue(sent.queued, sent.problem)
+        # Each new folder's parent, top down, then the spool itself once the request has its name.
+        self.assertEqual(synced, [".", "state", os.path.join("state", "beacon"), os.path.join("state", "beacon", "spool")])
+        for made in ("state", os.path.join("state", "beacon"), os.path.join("state", "beacon", "spool")):
+            self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.folder.name, made)).st_mode), 0o700, made)
+
+    def test_a_temporary_file_swept_while_it_is_written_is_written_again(self) -> None:
+        real_link = os.link
+        swept: list[str] = []
+
+        def link(src: str, dst: str) -> None:
+            if not swept:
+                # Another process, whose clock says this file is old, removes it as left behind.
+                swept.append(src)
+                os.remove(src)
+            real_link(src, dst)
+
+        self.refuse()
+        with mock.patch("os.link", link):
+            sent = beacon_client.send("backup.space", key="mine")
+        self.assertTrue(sent.queued, sent.problem)
+        self.assertEqual(self.keys(), ["mine"])
+        self.assertEqual([n for n in os.listdir(self.spool) if n.startswith(".")], [])
+
+    def test_a_request_ages_from_its_first_try_not_from_when_it_was_queued(self) -> None:
+        first_try = self.clock
+
+        def an_hour_passes(_seconds: float) -> None:
+            self.clock += 60 * 60 * 1000
+
+        self.refuse()
+        with mock.patch("time.sleep", an_hour_passes):
+            beacon_client.send("backup.space", key="mine")
+        [spooled] = self.files()
+        self.assertEqual(spooled["queued_at"], first_try)
+
     def test_a_write_that_fails_part_way_leaves_no_temporary_file(self) -> None:
         real_open = open
 
