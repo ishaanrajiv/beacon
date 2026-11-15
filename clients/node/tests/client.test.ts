@@ -563,7 +563,8 @@ test("a request is synced to disk before what it replaces is removed", async () 
     client.runtime.fs = realFs;
   }
   assert.equal(sent.queued, true, sent.problem ?? "");
-  assert.deepEqual(steps, ["sync file", "publish", "remove temporary", "sync folder", "remove replaced"]);
+  // First the folder the spool is in (another process may have just made the spool), then the request.
+  assert.deepEqual(steps, ["sync folder", "sync file", "publish", "remove temporary", "sync folder", "remove replaced"]);
 });
 
 // A file system on which syncing a folder fails with `code`; files sync as usual.
@@ -642,9 +643,9 @@ test("folders the spool makes are private and synced into their parents", { skip
   process.env.BEACON_SPOOL_DIR = nested;
   const synced: string[] = [];
   const realSync = client.runtime.syncFolder;
-  client.runtime.syncFolder = async function (this: typeof client.runtime, fs, folder) {
+  client.runtime.syncFolder = async function (this: typeof client.runtime, fs, folder, ours) {
     synced.push(relative(root, folder) || ".");
-    await realSync.call(this, fs, folder);
+    await realSync.call(this, fs, folder, ours);
   };
   const umask = process.umask(0o022);
   let sent: client.Sent | undefined;
@@ -656,11 +657,58 @@ test("folders the spool makes are private and synced into their parents", { skip
     client.runtime.syncFolder = realSync;
   }
   assert.equal(sent.queued, true, sent.problem ?? "");
-  // Each new folder's parent, top down, then the spool itself once the request has its name.
-  assert.deepEqual(synced, [".", "state", join("state", "beacon"), join("state", "beacon", "spool")]);
+  // The folder the deepest existing one is in, each new folder's parent, top down, then the spool
+  // itself once the request has its name.
+  assert.deepEqual(synced, ["..", ".", "state", join("state", "beacon"), join("state", "beacon", "spool")]);
   for (const made of ["state", join("state", "beacon"), join("state", "beacon", "spool")]) {
     assert.equal(statSync(join(root, made)).mode & 0o777, 0o700, made);
   }
+});
+
+test("a spool another process just made is synced into its folder too", { skip: process.platform === "win32" }, async () => {
+  useSpool();
+  // Another process made the spool and hasn't synced it into its folder yet. This one can't tell,
+  // so it does: a call never answers `queued` on a folder a power cut would lose.
+  mkdirSync(spool, { mode: 0o700 });
+  const root = join(spool, "..");
+  const synced: string[] = [];
+  const realSync = client.runtime.syncFolder;
+  client.runtime.syncFolder = async function (this: typeof client.runtime, fs, folder, ours) {
+    synced.push(relative(root, folder) || ".");
+    await realSync.call(this, fs, folder, ours);
+  };
+  let sent: client.Sent | undefined;
+  try {
+    refuse();
+    sent = await client.send("backup.space", { key: "mine" });
+  } finally {
+    client.runtime.syncFolder = realSync;
+  }
+  assert.equal(sent.queued, true, sent.problem ?? "");
+  assert.deepEqual(synced, [".", "spool"]);
+});
+
+test("a backslash in a folder's name is part of the name, not a separator", { skip: process.platform === "win32" }, async () => {
+  useSpool();
+  const root = join(spool, "..");
+  process.env.BEACON_SPOOL_DIR = `${root}/with\\slash/spool`;
+  refuse();
+  const sent = await client.send("backup.space", { key: "mine" });
+  assert.equal(sent.queued, true, sent.problem ?? "");
+  assert.deepEqual(readdirSync(root).sort(), ["with\\slash"]);
+  assert.deepEqual(readdirSync(`${root}/with\\slash`), ["spool"]);
+});
+
+test("a spool path through a missing folder and back is made", async () => {
+  useSpool();
+  process.env.BEACON_SPOOL_DIR = `${join(spool, "..")}/missing/../spool`;
+  refuse();
+  const sent = await client.send("backup.space", { key: "mine" });
+  assert.equal(sent.queued, true, sent.problem ?? "");
+  assert.deepEqual(
+    bodies().map((b) => b["key"]),
+    ["mine"],
+  );
 });
 
 test("a temporary file swept while it is written is written again", async () => {

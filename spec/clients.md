@@ -262,12 +262,15 @@ those two numbers, compared as numbers. No lock file is needed to keep that orde
   written. The folder must be on a file system with hard links.
 - **Kept through a power cut.** After the link the folder is synced too, and only then is anything
   the new file replaces or pushes out removed. So a power cut between the steps leaves the older
-  file, the newer, or both, never neither. If the folder can't be synced (a failing disk) the new
-  file is taken back and the answer is the one for a spool that can't be written: what was waiting
-  still waits. A folder the spool makes, with any above it that were missing, is synced into the
-  folder it was made in. This holds where folders can be synced: a file system that answers that
-  it doesn't do that, and Windows, are left to what they promise on their own, and there a call
-  answered `queued` may not outlast a power cut.
+  file, the newer, or both, never neither. If the folder can't be synced (a failing disk) the
+  answer is the one for a spool that can't be written and what was waiting still waits; the new
+  file is taken back if it still can be, and if not it stays and is sent later, so a caller that
+  sends again may be recorded twice. A folder the spool makes, with any above it that were missing,
+  is synced into the folder it is in; and on every call so is the deepest folder that was already
+  there, since another process may have made it a moment before and not synced it yet. This holds
+  where folders can be synced: a file system that answers that it doesn't do that, and Windows,
+  are left to what they promise on their own, and there a call answered `queued` may not outlast
+  a power cut.
 - **Temporary files.** A write that fails (a full disk) removes its temporary file before it
   answers. One left by a process that stopped mid-write is removed, once it is 10 minutes old, by
   the next call that queues or flushes; nothing lists or sends it meanwhile. Age is all that says

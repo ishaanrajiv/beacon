@@ -523,7 +523,8 @@ class SpoolTest(unittest.TestCase):
             with mock.patch("os.fsync", fsync), mock.patch("os.link", link), mock.patch("os.remove", remove):
                 sent = beacon_client.snapshot("backup", [])
         self.assertTrue(sent.queued, sent.problem)
-        self.assertEqual(steps, ["sync file", "publish", "remove temporary", "sync folder", "remove replaced"])
+        # First the folder the spool is in (another process may have just made the spool), then the request.
+        self.assertEqual(steps, ["sync folder", "sync file", "publish", "remove temporary", "sync folder", "remove replaced"])
 
     def failing_folder_sync(self, code: int) -> Callable[[int], None]:
         real_fsync = os.fsync
@@ -565,9 +566,9 @@ class SpoolTest(unittest.TestCase):
         synced: list[str] = []
         real_sync = beacon_client._Runtime.sync_folder  # pyright: ignore[reportPrivateUsage] - the test watches which folders are synced
 
-        def sync_folder(runtime: Any, folder: str) -> None:
+        def sync_folder(runtime: Any, folder: str, ours: bool = True) -> None:
             synced.append(os.path.relpath(folder, self.folder.name))
-            real_sync(runtime, folder)
+            real_sync(runtime, folder, ours)
 
         umask = os.umask(0o022)
         try:
@@ -577,10 +578,36 @@ class SpoolTest(unittest.TestCase):
         finally:
             os.umask(umask)
         self.assertTrue(sent.queued, sent.problem)
-        # Each new folder's parent, top down, then the spool itself once the request has its name.
-        self.assertEqual(synced, [".", "state", os.path.join("state", "beacon"), os.path.join("state", "beacon", "spool")])
+        # The folder the deepest existing one is in, each new folder's parent, top down, then the
+        # spool itself once the request has its name.
+        self.assertEqual(synced, ["..", ".", "state", os.path.join("state", "beacon"), os.path.join("state", "beacon", "spool")])
         for made in ("state", os.path.join("state", "beacon"), os.path.join("state", "beacon", "spool")):
             self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.folder.name, made)).st_mode), 0o700, made)
+
+    @unittest.skipUnless(os.name == "posix", "folders are synced on Unix")
+    def test_a_spool_another_process_just_made_is_synced_into_its_folder_too(self) -> None:
+        # Another process made the spool and hasn't synced it into its folder yet. This one can't
+        # tell, so it does: a call never answers `queued` on a folder a power cut would lose.
+        os.mkdir(self.spool, 0o700)
+        synced: list[str] = []
+        real_sync = beacon_client._Runtime.sync_folder  # pyright: ignore[reportPrivateUsage] - the test watches which folders are synced
+
+        def sync_folder(runtime: Any, folder: str, ours: bool = True) -> None:
+            synced.append(os.path.relpath(folder, self.folder.name))
+            real_sync(runtime, folder, ours)
+
+        self.refuse()
+        with mock.patch.object(beacon_client._Runtime, "sync_folder", sync_folder):  # pyright: ignore[reportPrivateUsage] - as above
+            sent = beacon_client.send("backup.space", key="mine")
+        self.assertTrue(sent.queued, sent.problem)
+        self.assertEqual(synced, [".", "spool"])
+
+    def test_a_spool_path_through_a_missing_folder_and_back_is_made(self) -> None:
+        os.environ["BEACON_SPOOL_DIR"] = os.path.join(self.folder.name, "missing", "..", "spool")
+        self.refuse()
+        sent = beacon_client.send("backup.space", key="mine")
+        self.assertTrue(sent.queued, sent.problem)
+        self.assertEqual(self.keys(), ["mine"])
 
     def test_a_temporary_file_swept_while_it_is_written_is_written_again(self) -> None:
         real_link = os.link

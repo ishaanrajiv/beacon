@@ -1037,9 +1037,12 @@ fn a_spooled_request_is_synced_to_disk_before_what_it_replaces_is_removed() {
     snapshot_while_away(&dir, &["--fire", "backup.space used_percent=96"]);
     crate::spool::fault::record_steps();
     snapshot_while_away(&dir, &[]);
+    // First the folder the spool is in (another process may have just made the spool), then the
+    // request.
     assert_eq!(
         crate::spool::fault::steps(),
         [
+            "sync folder",
             "sync file",
             "publish",
             "remove temporary",
@@ -1089,10 +1092,12 @@ fn folders_the_spool_makes_are_synced_into_their_parents() {
     let nested = root.join("state").join("beacon").join("spool");
     crate::spool::fault::record_synced();
     send_while_away(&nested, "mine");
-    // Each new folder's parent, top down, then the spool itself once the request has its name.
+    // The folder the deepest existing one is in, each new folder's parent, top down, then the
+    // spool itself once the request has its name.
     assert_eq!(
         crate::spool::fault::synced(),
         [
+            root.parent().unwrap().to_path_buf(),
             root.clone(),
             root.join("state"),
             root.join("state").join("beacon"),
@@ -1100,6 +1105,26 @@ fn folders_the_spool_makes_are_synced_into_their_parents() {
         ]
     );
     assert_eq!(spooled_keys(&nested), ["mine"]);
+}
+
+#[test]
+fn a_spool_another_process_just_made_is_synced_into_its_folder_too() {
+    // Another process made the spool and hasn't synced it into its folder yet. This one can't
+    // tell, so it does: a call is never answered `queued` on a folder a power cut would lose.
+    let root = scratch("spool-just-made");
+    let spool = root.join("spool");
+    std::fs::create_dir(&spool).unwrap();
+    crate::spool::fault::record_synced();
+    send_while_away(&spool, "mine");
+    assert_eq!(crate::spool::fault::synced(), [root.clone(), spool.clone()]);
+    assert_eq!(spooled_keys(&spool), ["mine"]);
+}
+
+#[test]
+fn a_spool_path_through_a_missing_folder_and_back_is_made() {
+    let root = scratch("spool-dotdot");
+    send_while_away(&root.join("missing").join("..").join("spool"), "mine");
+    assert_eq!(spooled_keys(&root.join("spool")), ["mine"]);
 }
 
 #[test]

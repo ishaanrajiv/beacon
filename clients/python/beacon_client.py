@@ -346,12 +346,18 @@ class _Runtime:
             if made:
                 self.drop(spool, temporary)
 
-    def sync_folder(self, folder: str) -> None:
+    def sync_folder(self, folder: str, ours: bool = True) -> None:
         """Asks the system to keep a folder's names through a power cut. Raises when it tried and failed (a
-        failing disk); a platform or file system that doesn't sync folders is left to what it promises."""
+        failing disk); a platform or file system that doesn't sync folders is left to what it promises. A
+        folder that isn't `ours` (one above the spool that was already there) may not be readable: left be."""
         if os.name != "posix":
             return
-        opened = os.open(folder, os.O_RDONLY)
+        try:
+            opened = os.open(folder, os.O_RDONLY)
+        except PermissionError:
+            if ours:
+                raise
+            return
         try:
             os.fsync(opened)
         except OSError as error:
@@ -362,18 +368,26 @@ class _Runtime:
 
     def make_folder(self, spool: str) -> None:
         """Makes the spool, and any folder above it that is missing, for this user only (mode 700), and
-        syncs the folder each was made in, so they outlast a power cut too. One already there keeps its mode."""
+        syncs the folder each is in, so they outlast a power cut too. One already there keeps its mode."""
+
+        def above(folder: str) -> str:
+            return os.path.dirname(folder) or os.curdir
+
         missing: list[str] = []
-        folder = os.path.abspath(spool)
-        while not os.path.isdir(folder) and os.path.dirname(folder) != folder:
+        folder = spool.rstrip(os.sep + (os.altsep or "")) or spool
+        while not os.path.isdir(folder) and above(folder) != folder:
             missing.append(folder)
-            folder = os.path.dirname(folder)
+            folder = above(folder)
+        # The deepest folder that is there may have been made a moment ago by another process that
+        # hasn't synced it yet; whatever is above it was synced before it was made. So it is synced
+        # into its folder here too, every time: no call answers `queued` on a folder that isn't kept.
+        self.sync_folder(above(folder), ours=False)
         for folder in reversed(missing):
             try:
                 os.mkdir(folder, 0o700)
             except FileExistsError:
-                continue  # Another process made it just first.
-            self.sync_folder(os.path.dirname(folder))
+                pass  # Another process made it just first; it is synced below all the same.
+            self.sync_folder(above(folder))
 
     def sweep(self, spool: str, now: int) -> None:
         """Removes temporary files a process left when it stopped mid-write: nothing lists or sends them."""

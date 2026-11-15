@@ -341,12 +341,19 @@ class BeaconRuntime {
 
   /**
    * Asks the system to keep a folder's names through a power cut. Rejects when it tried and failed (a
-   * failing disk); a platform or file system that doesn't sync folders is left to what it promises.
+   * failing disk); a platform or file system that doesn't sync folders is left to what it promises. A
+   * folder that isn't `ours` (one above the spool that was already there) may not be readable: left be.
    */
-  async syncFolder(fs: SpoolFs, folder: string): Promise<void> {
-    const platform = (globalThis as { process?: { platform?: string } }).process?.platform;
-    if (platform === "win32") return;
-    const opened = await fs.open(folder, "r");
+  async syncFolder(fs: SpoolFs, folder: string, ours = true): Promise<void> {
+    if (this.windows()) return;
+    let opened: SpoolFile;
+    try {
+      opened = await fs.open(folder, "r");
+    } catch (error) {
+      const code = (error as { code?: unknown }).code;
+      if (!ours && (code === "EACCES" || code === "EPERM")) return;
+      throw error;
+    }
     try {
       await opened.sync();
     } catch (error) {
@@ -357,31 +364,40 @@ class BeaconRuntime {
     }
   }
 
+  windows(): boolean {
+    return (globalThis as { process?: { platform?: string } }).process?.platform === "win32";
+  }
+
   /**
    * Makes the spool, and any folder above it that is missing, for this user only (mode 700), and syncs
-   * the folder each was made in, so they outlast a power cut too. One already there keeps its mode.
+   * the folder each is in, so they outlast a power cut too. One already there keeps its mode.
    */
   async makeFolder(fs: SpoolFs, spool: string): Promise<void> {
-    // The folder a folder is in, by either separator; `.` for a bare name.
-    const parent = (folder: string): string => {
-      const cut = Math.max(folder.lastIndexOf("/"), folder.lastIndexOf("\\"));
-      return cut < 0 ? "." : cut === 0 ? folder.slice(0, 1) : folder.slice(0, cut);
+    // The folder a folder is in; `.` for a bare name. A backslash separates only on Windows.
+    const cut = (folder: string): number =>
+      this.windows() ? Math.max(folder.lastIndexOf("/"), folder.lastIndexOf("\\")) : folder.lastIndexOf("/");
+    const above = (folder: string): string => {
+      const at = cut(folder);
+      return at < 0 ? "." : at === 0 ? folder.slice(0, 1) : folder.slice(0, at);
     };
     const missing: string[] = [];
-    let folder = spool.replace(/[\\/]+$/, "") || spool;
-    while (!(await this.exists(fs, folder)) && parent(folder) !== folder) {
+    let folder = spool.replace(this.windows() ? /[\\/]+$/ : /\/+$/, "") || spool;
+    while (!(await this.exists(fs, folder)) && above(folder) !== folder) {
       missing.push(folder);
-      folder = parent(folder);
+      folder = above(folder);
     }
+    // The deepest folder that is there may have been made a moment ago by another process that
+    // hasn't synced it yet; whatever is above it was synced before it was made. So it is synced
+    // into its folder here too, every time: no call answers `queued` on a folder that isn't kept.
+    await this.syncFolder(fs, above(folder), false);
     for (const made of missing.reverse()) {
       try {
         await fs.mkdir(made, { mode: 0o700 });
       } catch (error) {
-        // Another process made it just first.
-        if ((error as { code?: unknown }).code === "EEXIST") continue;
-        throw error;
+        // Another process made it just first; it is synced below all the same.
+        if ((error as { code?: unknown }).code !== "EEXIST") throw error;
       }
-      await this.syncFolder(fs, parent(made));
+      await this.syncFolder(fs, above(made));
     }
   }
 

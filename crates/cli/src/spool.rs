@@ -295,30 +295,42 @@ impl Spool {
     }
 
     /// Makes the folder, and any folder above it that is missing, for this user only (mode 700),
-    /// and syncs the folder each was made in, so they outlast a power cut too. One that is
-    /// already there keeps its mode.
+    /// and syncs the folder each is in, so they outlast a power cut too. One that is already
+    /// there keeps its mode.
     fn make_dir(&self) -> std::io::Result<()> {
+        // The folder a folder is in; `.` for a bare name, and the root is in itself.
+        fn above(dir: &Path) -> &Path {
+            match dir.parent() {
+                Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
+                Some(parent) => parent,
+                None => dir,
+            }
+        }
         let mut missing = Vec::new();
         let mut dir = self.dir.as_path();
-        while !dir.is_dir() {
+        while !dir.is_dir() && above(dir) != dir {
             missing.push(dir);
-            match dir.parent() {
-                Some(parent) if !parent.as_os_str().is_empty() => dir = parent,
-                _ => break,
-            }
+            dir = above(dir);
+        }
+        // The deepest folder that is there may have been made a moment ago by another process
+        // that hasn't synced it yet; whatever is above it was synced before it was made. So it is
+        // synced into its folder here too, every time: no call is answered `queued` on a folder
+        // that isn't kept. One above the spool that was already there may not be readable.
+        match sync_dir(above(dir)) {
+            Err(e) if e.kind() != std::io::ErrorKind::PermissionDenied => return Err(e),
+            _ => {}
         }
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
         for made in missing.into_iter().rev() {
             match builder.create(made) {
+                // Another process made it just first; it is synced below all the same.
                 Ok(()) => {}
-                // Another process made it just first.
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(e) => return Err(e),
             }
-            let parent = made.parent().filter(|parent| !parent.as_os_str().is_empty());
-            sync_dir(parent.unwrap_or(Path::new(".")))?;
+            sync_dir(above(made))?;
         }
         Ok(())
     }
