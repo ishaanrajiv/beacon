@@ -70,7 +70,8 @@ answer has the error body above and closes the connection.
 | `503` | 64 connections are open already. It carries `Retry-After: 5`. |
 
 - A connection carries many requests, one after another, and is closed after 60 idle seconds.
-  A response has to be taken within 30 seconds.
+  A whole response, from its first byte to its last, has to be taken within 30 seconds, as does
+  a `100 Continue`; a caller still taking it then is hung up on.
 - `HEAD` is answered as `GET` without the body. `Expect: 100-continue` is answered before the body
   is read.
 - Every answer carries `Cache-Control: no-cache`; a `304` has no body and no `Content-Length`.
