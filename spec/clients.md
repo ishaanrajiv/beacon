@@ -227,12 +227,15 @@ folder, the emitters and the `beacon` command keep it instead:
   (`spec/delivery.md`, "Idempotency").
 - **Snapshots.** A snapshot keeps its `sent_at`. A new snapshot replaces any waiting one of the
   same source covering the same kinds (the same `kinds`, or both none): it says all the older one
-  did. The new one is written first and the older removed after, so a write that fails loses
-  neither; for that moment both wait, and a flush sends the older, then the newer, which is right.
+  did. The new one is written and synced first and the older removed after, so a write that fails
+  or a power cut loses neither; for that moment both wait, and a flush sends the older, then the
+  newer, which is right.
   One of other kinds stays, in order. A waiting snapshot is dropped, not sent, once its `sent_at`
   is more than 5 minutes old (Beacon would refuse it, `spec/api.md`).
-- **Bounded.** A file waits at most 24 hours (Beacon's idempotency window), then is dropped. The
-  folder holds at most 1,000 files and 8 MB (8,388,608 bytes of the files as written, UTF-8):
+- **Bounded.** A file waits at most 23 hours, then is dropped. That is an hour inside Beacon's default
+  24-hour idempotency window, which began when Beacon first took the request: before the file was
+  written, when only the answer was lost. Sent again after the window, it would be recorded twice.
+  The folder holds at most 1,000 files and 8 MB (8,388,608 bytes of the files as written, UTF-8):
   queuing one more drops the oldest first, once the new one is written. A request larger than the
   whole 8 MB on its own is not kept and drops nothing: it is counted as dropped, and the answer is
   the one for a spool that can't be written (`ok` false, `queued` false; the command exits `3`),
@@ -251,11 +254,23 @@ those two numbers, compared as numbers. No lock file is needed to keep that orde
   never sorts before one already there, whatever process wrote it, and a clock that steps back
   doesn't reorder. `queued_at` in the file is the writer's clock, which ages it; the name only
   orders it.
-- **Publishing.** The request is written to a temporary name starting with `.`, then hard-linked
-  to its name, which fails if that name exists, and the temporary name removed. So two processes
-  can't take one name, and a reader never sees half a file. A writer whose name was taken first
-  lists again and tries the next, up to 20 times, then answers that the spool can't be written.
-  The folder must be on a file system with hard links.
+- **Publishing.** The request is written to a temporary name, `.<16 hex>.tmp`, and synced to disk,
+  then hard-linked to its name, which fails if that name exists, and the temporary name removed. So
+  two processes can't take one name, and a reader never sees half a file. A writer whose name was
+  taken first lists again and tries the next, up to 20 times, then answers that the spool can't be
+  written. The folder must be on a file system with hard links.
+- **Kept through a power cut.** After the link the folder is synced too, and only then is anything
+  the new file replaces or pushes out removed. So a call answered `queued` is on disk, and a power
+  cut between the steps leaves the older file, the newer, or both, never neither. A file system
+  that can't sync a folder is left to what it promises on its own.
+- **Temporary files.** A write that fails (a full disk) removes its temporary file before it
+  answers. One left by a process that stopped mid-write is removed, once it is 10 minutes old, by
+  the next call that queues or flushes; nothing lists or sends it meanwhile.
+- **Removing.** A file is removed only while it still holds the request that was read: the same
+  Idempotency-Key. Two flushes at once can each send one request, which Beacon records once; if
+  the first then removes the file and a writer whose clock stepped back gives a new request that
+  name, the second finds another key there and leaves it. The check and the removal are two steps,
+  so this narrows that case to the instant between them; it doesn't lock the folder.
 - **Older names.** Files named `<ms>-<sequence>-<hex>.json` by earlier versions are still read,
   ordered by their `(ms, sequence)` among the rest, and sent.
 - **Modes.** The files hold notification text, so a folder the spool makes is mode `700`, and

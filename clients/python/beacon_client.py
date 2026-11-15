@@ -22,12 +22,17 @@ DEFAULT_URL = "http://127.0.0.1:8210"
 # The spool's limits (spec/clients.md, "The spool").
 SPOOL_MAX_FILES = 1000
 SPOOL_MAX_BYTES = 8 * 1024 * 1024
-SPOOL_MAX_AGE_MS = 24 * 60 * 60 * 1000
+# An hour inside the server's 24-hour idempotency window, which began when Beacon first took the
+# request: that can be before it was queued here, when only the answer was lost.
+SPOOL_MAX_AGE_MS = 23 * 60 * 60 * 1000
+# A temporary file this old was left by a process that stopped mid-write.
+SPOOL_STALE_TEMPORARY_MS = 10 * 60 * 1000
 SNAPSHOT_MAX_AGE_MS = 5 * 60 * 1000
 SPOOL_LAST_SEQUENCE = 999_999
 SPOOL_NAME_TRIES = 20
 # `<ms>-<sequence>.json`, or the older `<ms>-<sequence>-<hex>.json`.
 _SPOOL_NAME = re.compile(r"(\d{15})-(\d{6})(?:-[0-9a-f]+)?\.json")
+_SPOOL_TEMPORARY = re.compile(r"\.[0-9a-f]{16}\.tmp")
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _MS = timedelta(milliseconds=1)
 
@@ -297,23 +302,60 @@ class _Runtime:
         return f"{ms:015d}-{sequence:06d}.json"
 
     def publish(self, spool: str, data: bytes, now: int) -> None:
-        """Writes `data` under a temporary name, then hard-links it to the next name, which fails if another
-        process took that name first; then it looks again. So no two processes take one name, and no reader
-        sees half a file."""
-        temporary = os.path.join(spool, f".{secrets.token_hex(8)}.tmp")
-        # Readable by this user only: it holds notification text. A hard link shares the mode.
-        with open(temporary, "xb", opener=lambda name, flags: os.open(name, flags, 0o600)) as file:
-            file.write(data)
+        """Writes `data` under a temporary name and syncs it, then hard-links it to the next name, which fails
+        if another process took that name first; then it looks again. So no two processes take one name, and
+        no reader sees half a file. The folder is synced last, so the file outlasts a power cut before
+        anything it replaces is removed. The temporary name is removed however this ends."""
+        temporary = f".{secrets.token_hex(8)}.tmp"
+        made = False
         try:
+            # Readable by this user only: it holds notification text. A hard link shares the mode.
+            with open(os.path.join(spool, temporary), "xb", opener=lambda name, flags: os.open(name, flags, 0o600)) as file:
+                made = True
+                file.write(data)
+                file.flush()
+                os.fsync(file.fileno())
             for _ in range(SPOOL_NAME_TRIES):
                 try:
-                    os.link(temporary, os.path.join(spool, self.next_name(spool, now)))
-                    return
+                    os.link(os.path.join(spool, temporary), os.path.join(spool, self.next_name(spool, now)))
+                    break
                 except FileExistsError:
                     continue
-            raise OSError(f"another process took each of {SPOOL_NAME_TRIES} names in a row")
+            else:
+                raise OSError(f"another process took each of {SPOOL_NAME_TRIES} names in a row")
         finally:
-            self.drop(spool, os.path.basename(temporary))
+            if made:
+                self.drop(spool, temporary)
+        self.sync_folder(spool)
+
+    def sync_folder(self, spool: str) -> None:
+        """Asks the system to keep the folder's names through a power cut; a platform that can't is left be."""
+        try:
+            folder = os.open(spool, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(folder)
+        except OSError:
+            pass  # Not every file system syncs a folder; the file itself was synced.
+        finally:
+            os.close(folder)
+
+    def sweep(self, spool: str, now: int) -> None:
+        """Removes temporary files a process left when it stopped mid-write: nothing lists or sends them."""
+        try:
+            names = os.listdir(spool)
+        except OSError:
+            return
+        for name in names:
+            if _SPOOL_TEMPORARY.fullmatch(name) is None:
+                continue
+            try:
+                written = int(os.stat(os.path.join(spool, name)).st_mtime * 1000)
+            except OSError:
+                continue
+            if now - written > SPOOL_STALE_TEMPORARY_MS:
+                self.drop(spool, name)
 
     def read_spooled(self, spool: str, name: str) -> Mapping[str, object] | None:
         try:
@@ -340,8 +382,19 @@ class _Runtime:
         except OSError:
             pass  # Already gone, or not ours to remove: never an error for the caller.
 
+    def key_of(self, spool: str, name: str) -> str | None:
+        """The Idempotency-Key of the request a file holds now; none when it is gone or doesn't read as one."""
+        request = self.read_spooled(spool, name)
+        return cast(str, request["key"]) if request is not None else None
+
+    def drop_same(self, spool: str, name: str, key: str | None) -> None:
+        """Removes a file only while it still holds the request that was read. Another process may have sent
+        and removed that one, and a new request taken its name (after the clock stepped back): that one stays."""
+        if self.key_of(spool, name) == key:
+            self.drop(spool, name)
+
     def expired(self, request: Mapping[str, object], now: int) -> bool:
-        """Past 24 hours (the server's idempotency window), or a snapshot past what `sent_at` allows."""
+        """Past 23 hours (inside the server's idempotency window), or a snapshot past what `sent_at` allows."""
         queued_at = cast(int, request["queued_at"])
         if now - queued_at > SPOOL_MAX_AGE_MS:
             return True
@@ -374,26 +427,29 @@ class _Runtime:
         try:
             # Made for this user only; a folder that is already there keeps its mode.
             os.makedirs(spool, mode=0o700, exist_ok=True)
+            self.sweep(spool, now)
             names = self.spooled(spool)
-            # Removed only once the new file is written, so a failed write loses nothing.
-            replaced: list[str] = []
+            # Removed only once the new file is written and synced, so a failed write or a power cut
+            # loses nothing; and each by the key it held, so a new request under its name stays.
+            replaced: list[tuple[str, str | None]] = []
             if path == "/v1/snapshots":
                 for name in names:
                     older = self.read_spooled(spool, name)
                     if older is not None and older["path"] == path and self.same_snapshot(self.object(older["body"]), body):
-                        replaced.append(name)
-                names = [name for name in names if name not in replaced]
+                        replaced.append((name, cast(str, older["key"])))
+                names = [name for name in names if all(name != old for old, _ in replaced)]
             sizes = [self.size(spool, name) for name in names]
-            evicted: list[str] = []
+            evicted: list[tuple[str, str | None]] = []
             while names and (len(names) >= SPOOL_MAX_FILES or sum(sizes) + len(data) > SPOOL_MAX_BYTES):
-                evicted.append(names.pop(0))
+                oldest = names.pop(0)
+                evicted.append((oldest, self.key_of(spool, oldest)))
                 sizes.pop(0)
             self.publish(spool, data, now)
         except OSError as error:
             problem = f"{why}\n  and the spool {spool} can't be written: {error}"
             return Sent(ok=False, status=sent.status, outcome=None, item=None, problem=problem)
-        for old in replaced + evicted:
-            self.drop(spool, old)
+        for old, held in replaced + evicted:
+            self.drop_same(spool, old, held)
         dropped = len(evicted)
         self.dropped_total += dropped
         if dropped:
@@ -407,6 +463,7 @@ class _Runtime:
             return Flushed(sent=0, left=0, dropped=0, dropped_total=self.dropped_total, problem=None)
         # Two snapshots of one source and kinds can both be here for a moment (a newer one is written
         # before the older one it replaces is removed): sending the older, then the newer, is right.
+        self.sweep(spool, self.now_ms())
         names = self.spooled(spool)
         sent = dropped = 0
         for index, name in enumerate(names):
@@ -414,7 +471,7 @@ class _Runtime:
             if request is None or self.expired(request, self.now_ms()):
                 if request is not None or os.path.exists(os.path.join(spool, name)):
                     dropped += 1
-                self.drop(spool, name)
+                self.drop_same(spool, name, cast(str, request["key"]) if request is not None else None)
                 continue
             data = json.dumps(request["body"]).encode()
             answer = self.attempt(cast(str, request["path"]), data, cast(str, request["key"]))
@@ -422,7 +479,8 @@ class _Runtime:
                 self.dropped_total += dropped
                 left = len(names) - index
                 return Flushed(sent=sent, left=left, dropped=dropped, dropped_total=self.dropped_total, problem=answer.problem)
-            self.drop(spool, name)
+            # Only while it is still this request: another flush may have sent it, and a new one have its name.
+            self.drop_same(spool, name, cast(str, request["key"]))
             if answer.ok:
                 sent += 1
             else:

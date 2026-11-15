@@ -374,10 +374,11 @@ class SpoolTest(unittest.TestCase):
         flushed = beacon_client.flush()
         self.assertEqual((flushed.sent, flushed.left, flushed.dropped), (1, 0, 1))
 
-    def test_after_24_hours_a_request_is_dropped_and_counted(self) -> None:
+    def test_after_23_hours_a_request_is_dropped_and_counted(self) -> None:
         self.refuse()
         beacon_client.send("backup.space")
-        self.clock += 24 * 60 * 60 * 1000 + 1
+        # An hour inside Beacon's 24-hour idempotency window, which may have begun before this was queued.
+        self.clock += 23 * 60 * 60 * 1000 + 1
         self.beacon.requests.clear()
         flushed = beacon_client.flush()
         self.assertEqual((flushed.sent, flushed.left, flushed.dropped, flushed.dropped_total), (0, 0, 1, 1))
@@ -498,6 +499,121 @@ class SpoolTest(unittest.TestCase):
         self.assertIn("can't be written", sent.problem or "")
         [kept] = self.files()
         self.assertEqual(len(cast("list[object]", cast("dict[str, object]", kept["body"])["firing"])), 1)
+
+    def test_a_request_is_synced_to_disk_before_what_it_replaces_is_removed(self) -> None:
+        steps: list[str] = []
+        real_fsync, real_link, real_remove = os.fsync, os.link, os.remove
+
+        def fsync(fd: int) -> None:
+            steps.append("sync folder" if stat.S_ISDIR(os.fstat(fd).st_mode) else "sync file")
+            real_fsync(fd)
+
+        def link(src: str, dst: str) -> None:
+            steps.append("publish")
+            real_link(src, dst)
+
+        def remove(path: str) -> None:
+            steps.append("remove temporary" if os.path.basename(path).startswith(".") else "remove replaced")
+            real_remove(path)
+
+        with mock.patch("time.time", return_value=self.clock / 1000):
+            self.refuse()
+            beacon_client.snapshot("backup", [beacon_client.entry("backup.space", facts={"used_percent": 96})])
+            self.refuse(1)
+            with mock.patch("os.fsync", fsync), mock.patch("os.link", link), mock.patch("os.remove", remove):
+                sent = beacon_client.snapshot("backup", [])
+        self.assertTrue(sent.queued, sent.problem)
+        self.assertEqual(steps, ["sync file", "publish", "remove temporary", "sync folder", "remove replaced"])
+
+    def test_a_write_that_fails_part_way_leaves_no_temporary_file(self) -> None:
+        real_open = open
+
+        class Half:
+            def __init__(self, file: Any) -> None:
+                self.file = file
+
+            def __enter__(self) -> "Half":
+                return self
+
+            def __exit__(self, *error: object) -> None:
+                self.file.close()
+
+            def write(self, data: bytes) -> int:
+                self.file.write(data[: len(data) // 2])
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+        def filling_disk(file: str, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+            opened = real_open(file, mode, *args, **kwargs)
+            return Half(opened) if "x" in mode else opened
+
+        self.refuse()
+        with mock.patch("builtins.open", filling_disk):
+            sent = beacon_client.send("backup.space", key="mine")
+        self.assertEqual((sent.ok, sent.queued), (False, False))
+        self.assertIn("can't be written", sent.problem or "")
+        self.assertEqual(os.listdir(self.spool), [])
+
+    def test_a_temporary_file_a_stopped_process_left_is_removed_once_stale(self) -> None:
+        os.makedirs(self.spool)
+
+        def left(name: str, minutes_ago: int) -> str:
+            path = os.path.join(self.spool, name)
+            Path(path).write_text("half a requ")
+            at = (self.clock - minutes_ago * 60 * 1000) / 1000
+            os.utime(path, (at, at))
+            return name
+
+        stale = left(".0123456789abcdef.tmp", 11)
+        being_written = left(".fedcba9876543210.tmp", 1)
+        kinds = left(".kinds-backup.json", 600)
+        beacon_client.flush()
+        self.assertEqual(sorted(os.listdir(self.spool)), sorted([being_written, kinds]))
+        # Queuing sweeps too: a service that only ever sends still clears them.
+        stale = left(stale, 11)
+        self.refuse()
+        beacon_client.send("backup.space", key="mine")
+        self.assertNotIn(stale, os.listdir(self.spool))
+        self.assertEqual(len(self.names()), 1)
+
+    def test_a_flush_leaves_a_new_request_that_took_the_name_of_the_one_it_sent(self) -> None:
+        self.refuse()
+        beacon_client.send("backup.space", key="first")
+        [name] = self.names()
+        real_attempt = beacon_client._Runtime.attempt  # pyright: ignore[reportPrivateUsage] - the test stands between the send and the removal
+
+        def attempt(runtime: Any, path: str, data: bytes, key: str) -> beacon_client.Sent:
+            answer = real_attempt(runtime, path, data, key)
+            # Meanwhile another flush sent and removed the file, and a writer whose clock had
+            # stepped back queued a new request under the same name.
+            request = {"path": "/v1/events", "key": "f" * 32, "queued_at": self.clock, "body": {"kind": "backup.space", "key": "second"}}
+            Path(self.spool, name).write_text(json.dumps(request))
+            return answer
+
+        with mock.patch.object(beacon_client._Runtime, "attempt", attempt):  # pyright: ignore[reportPrivateUsage] - as above
+            flushed = beacon_client.flush()
+        self.assertEqual((flushed.sent, flushed.dropped), (1, 0))
+        self.assertEqual(self.keys(), ["second"])
+        flushed = beacon_client.flush()
+        self.assertEqual((flushed.sent, flushed.left), (1, 0))
+        self.assertEqual([cast("dict[str, object]", r.body)["key"] for r in self.beacon.requests[-2:]], ["first", "second"])
+
+    def test_a_replaced_snapshot_whose_name_a_new_request_took_is_not_removed(self) -> None:
+        with mock.patch("time.time", return_value=self.clock / 1000):
+            self.refuse()
+            beacon_client.snapshot("backup", [beacon_client.entry("backup.space", facts={"used_percent": 96})])
+            [name] = self.names()
+            real_link = os.link
+
+            def link(src: str, dst: str) -> None:
+                real_link(src, dst)
+                Path(self.spool, name).write_text(self.request_text("theirs"))
+
+            self.refuse(1)
+            with mock.patch("os.link", link):
+                sent = beacon_client.snapshot("backup", [])
+        self.assertTrue(sent.queued, sent.problem)
+        self.assertEqual(len(self.names()), 2)
+        self.assertEqual(cast("dict[str, object]", self.files()[0]["body"])["key"], "theirs")
 
     def test_the_spool_is_bounded_oldest_dropped_first(self) -> None:
         sent: beacon_client.Sent | None = None

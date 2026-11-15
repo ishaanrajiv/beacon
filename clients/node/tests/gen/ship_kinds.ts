@@ -4,11 +4,21 @@
 
 export const DEFAULT_URL = "http://127.0.0.1:8210";
 /** The spool's limits (spec/clients.md, "The spool"). */
-export const SPOOL_LIMITS = { files: 1000, bytes: 8 * 1024 * 1024, ageMs: 24 * 60 * 60 * 1000, snapshotAgeMs: 5 * 60 * 1000 };
+// `ageMs` is an hour inside the server's 24-hour idempotency window, which began when Beacon first took
+// the request: that can be before it was queued here, when only the answer was lost. A temporary file
+// `staleTemporaryMs` old was left by a process that stopped mid-write.
+export const SPOOL_LIMITS = {
+  files: 1000,
+  bytes: 8 * 1024 * 1024,
+  ageMs: 23 * 60 * 60 * 1000,
+  snapshotAgeMs: 5 * 60 * 1000,
+  staleTemporaryMs: 10 * 60 * 1000,
+};
 const SPOOL_LAST_SEQUENCE = 999_999;
 const SPOOL_NAME_TRIES = 20;
 /** `<ms>-<sequence>.json`, or the older `<ms>-<sequence>-<hex>.json`. */
 const SPOOL_NAME = /^(\d{15})-(\d{6})(?:-[0-9a-f]+)?\.json$/;
+const SPOOL_TEMPORARY = /^\.[0-9a-f]{16}\.tmp$/;
 
 /**
  * What Beacon answered. `ok` is true for a 2xx; otherwise `problem` says what went wrong.
@@ -38,10 +48,17 @@ interface SpoolFs {
   mkdir(path: string, options: { recursive: true; mode: number }): Promise<unknown>;
   readdir(path: string): Promise<string[]>;
   readFile(path: string, encoding: "utf8"): Promise<string>;
-  writeFile(path: string, data: string, options: { flag: "wx"; mode: number }): Promise<void>;
+  open(path: string, flags: "wx" | "r", mode?: number): Promise<SpoolFile>;
   link(from: string, to: string): Promise<void>;
   unlink(path: string): Promise<void>;
-  stat(path: string): Promise<{ size: number }>;
+  stat(path: string): Promise<{ size: number; mtimeMs: number }>;
+}
+
+/** An open file or folder: `sync` asks the system to keep it through a power cut. */
+interface SpoolFile {
+  writeFile(data: string): Promise<void>;
+  sync(): Promise<void>;
+  close(): Promise<void>;
 }
 
 interface Spooled {
@@ -264,26 +281,69 @@ class BeaconRuntime {
   }
 
   /**
-   * Writes `data` under a temporary name, then hard-links it to the next name, which fails if another
-   * process took that name first; then it looks again. So no two processes take one name, and no reader
-   * sees half a file.
+   * Writes `data` under a temporary name and syncs it, then hard-links it to the next name, which fails
+   * if another process took that name first; then it looks again. So no two processes take one name, and
+   * no reader sees half a file. The folder is synced last, so the file outlasts a power cut before
+   * anything it replaces is removed. The temporary name is removed however this ends.
    */
   async publish(fs: SpoolFs, spool: string, data: string, now: number): Promise<void> {
     const temporary = `.${this.idempotencyKey().slice(0, 16)}.tmp`;
-    // Readable by this user only: it holds notification text. A hard link shares the mode.
-    await fs.writeFile(`${spool}/${temporary}`, data, { flag: "wx", mode: 0o600 });
+    let made = false;
     try {
-      for (let tries = 0; tries < SPOOL_NAME_TRIES; tries++) {
+      // Readable by this user only: it holds notification text. A hard link shares the mode.
+      const file = await fs.open(`${spool}/${temporary}`, "wx", 0o600);
+      made = true;
+      try {
+        await file.writeFile(data);
+        await file.sync();
+      } finally {
+        await file.close();
+      }
+      let published = false;
+      for (let tries = 0; tries < SPOOL_NAME_TRIES && !published; tries++) {
         try {
           await fs.link(`${spool}/${temporary}`, `${spool}/${await this.nextName(fs, spool, now)}`);
-          return;
+          published = true;
         } catch (error) {
           if ((error as { code?: unknown }).code !== "EEXIST") throw error;
         }
       }
-      throw new Error(`another process took each of ${SPOOL_NAME_TRIES} names in a row`);
+      if (!published) throw new Error(`another process took each of ${SPOOL_NAME_TRIES} names in a row`);
     } finally {
-      await this.drop(fs, spool, temporary);
+      if (made) await this.drop(fs, spool, temporary);
+    }
+    await this.syncFolder(fs, spool);
+  }
+
+  /** Asks the system to keep the folder's names through a power cut; a platform that can't is left be. */
+  async syncFolder(fs: SpoolFs, spool: string): Promise<void> {
+    let folder: SpoolFile;
+    try {
+      folder = await fs.open(spool, "r");
+    } catch {
+      return;
+    }
+    try {
+      await folder.sync();
+    } catch {
+      // Not every file system syncs a folder; the file itself was synced.
+    } finally {
+      await folder.close();
+    }
+  }
+
+  /** Removes temporary files a process left when it stopped mid-write: nothing lists or sends them. */
+  async sweep(fs: SpoolFs, spool: string, now: number): Promise<void> {
+    let names: string[];
+    try {
+      names = await fs.readdir(spool);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      if (!SPOOL_TEMPORARY.test(name)) continue;
+      const written = await fs.stat(`${spool}/${name}`).then((s) => s.mtimeMs, () => undefined);
+      if (written !== undefined && now - written > SPOOL_LIMITS.staleTemporaryMs) await this.drop(fs, spool, name);
     }
   }
 
@@ -317,7 +377,20 @@ class BeaconRuntime {
     }
   }
 
-  /** Past 24 hours (the server's idempotency window), or a snapshot past what `sent_at` allows. */
+  /** The Idempotency-Key of the request a file holds now; none when it is gone or doesn't read as one. */
+  async keyOf(fs: SpoolFs, spool: string, name: string): Promise<string | undefined> {
+    return (await this.readSpooled(fs, spool, name))?.key;
+  }
+
+  /**
+   * Removes a file only while it still holds the request that was read. Another process may have sent
+   * and removed that one, and a new request taken its name (after the clock stepped back): that one stays.
+   */
+  async dropSame(fs: SpoolFs, spool: string, name: string, key: string | undefined): Promise<void> {
+    if ((await this.keyOf(fs, spool, name)) === key) await this.drop(fs, spool, name);
+  }
+
+  /** Past 23 hours (inside the server's idempotency window), or a snapshot past what `sent_at` allows. */
   expired(request: Spooled, now: number): boolean {
     if (now - request.queued_at > SPOOL_LIMITS.ageMs) return true;
     const sentAt = request.body["sent_at"];
@@ -347,26 +420,29 @@ class BeaconRuntime {
       const fs = await this.fs();
       // Made for this user only; a folder that is already there keeps its mode.
       await fs.mkdir(spool, { recursive: true, mode: 0o700 });
+      await this.sweep(fs, spool, now);
       let names = await this.spooled(fs, spool);
-      // Removed only once the new file is written, so a failed write loses nothing.
-      const replaced: string[] = [];
+      // Removed only once the new file is written and synced, so a failed write or a power cut
+      // loses nothing; and each by the key it held, so a new request under its name stays.
+      const replaced: [string, string | undefined][] = [];
       if (path === "/v1/snapshots") {
         for (const name of names) {
           const older = await this.readSpooled(fs, spool, name);
-          if (older?.path === path && this.sameSnapshot(older.body, body)) replaced.push(name);
+          if (older?.path === path && this.sameSnapshot(older.body, body)) replaced.push([name, older.key]);
         }
-        names = names.filter((name) => !replaced.includes(name));
+        names = names.filter((name) => !replaced.some(([old]) => old === name));
       }
       const sizes: number[] = [];
       for (const name of names) sizes.push(await fs.stat(`${spool}/${name}`).then((s) => s.size, () => 0));
       let total = sizes.reduce((a, b) => a + b, 0);
-      const evicted: string[] = [];
+      const evicted: [string, string | undefined][] = [];
       while (names.length > 0 && (names.length >= SPOOL_LIMITS.files || total + bytes > SPOOL_LIMITS.bytes)) {
-        evicted.push(names.shift() ?? "");
+        const oldest = names.shift() ?? "";
+        evicted.push([oldest, await this.keyOf(fs, spool, oldest)]);
         total -= sizes.shift() ?? 0;
       }
       await this.publish(fs, spool, data, now);
-      for (const old of [...replaced, ...evicted]) await this.drop(fs, spool, old);
+      for (const [old, held] of [...replaced, ...evicted]) await this.dropSame(fs, spool, old, held);
       dropped = evicted.length;
       this.droppedTotal += dropped;
     } catch (error) {
@@ -399,17 +475,19 @@ class BeaconRuntime {
     const fs = await this.fs();
     // Two snapshots of one source and kinds can both be here for a moment (a newer one is written
     // before the older one it replaces is removed): sending the older, then the newer, is right.
+    await this.sweep(fs, spool, this.now());
     const names = await this.spooled(fs, spool);
     for (const [index, name] of names.entries()) {
       const request = await this.readSpooled(fs, spool, name);
       if (request === undefined || this.expired(request, this.now())) {
         if (request !== undefined || (await this.exists(fs, `${spool}/${name}`))) dropped += 1;
-        await this.drop(fs, spool, name);
+        await this.dropSame(fs, spool, name, request?.key);
         continue;
       }
       const answer = await this.attempt(request.path, JSON.stringify(request.body), request.key);
       if (this.retryable(answer.status)) return done(names.length - index, answer.problem);
-      await this.drop(fs, spool, name);
+      // Only while it is still this request: another flush may have sent it, and a new one have its name.
+      await this.dropSame(fs, spool, name, request.key);
       // A refusal (4xx) will never be taken: it doesn't hold up what is behind it.
       if (answer.ok) sent += 1;
       else dropped += 1;
