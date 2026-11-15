@@ -70,6 +70,9 @@ answer has the error body above and closes the connection.
 | `503` | 64 connections are open already. It carries `Retry-After: 5`. |
 
 - A connection carries many requests, one after another, and is closed after 60 idle seconds.
+  `Connection` headers are read as lists, every one of them, in any case: `close` anywhere closes
+  the connection after the answer; otherwise `keep-alive` anywhere keeps it open, even on
+  HTTP/1.0; otherwise HTTP/1.1 stays open and HTTP/1.0 closes.
   A whole response, from its first byte to its last, has to be taken within 30 seconds, as does
   a `100 Continue`; a caller still taking it then is hung up on.
 - `HEAD` is answered as `GET` without the body. `Expect: 100-continue` is answered before the body
