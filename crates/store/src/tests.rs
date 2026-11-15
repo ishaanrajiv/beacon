@@ -3165,6 +3165,28 @@ fn the_views_for_readers_keep_their_columns() {
     );
 }
 
+/// DuckDB's SQLite reader runs a view's SQL itself instead of asking SQLite for its rows, so the
+/// views use only what means the same in both. `CAST(… AS INTEGER)` is 32 bits there, and every
+/// time in milliseconds overflowed it; `json_extract` gives it quoted JSON, so `service` came back
+/// as `"caddy"`, quotes included.
+#[test]
+fn the_views_are_written_for_duckdb_too() {
+    let sql = include_str!("views.sql");
+    let code: String = sql
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_ascii_uppercase();
+    assert!(
+        !code.contains("AS INTEGER"),
+        "an integer column is CAST AS BIGINT"
+    );
+    assert!(!code.contains(" AS INT)"), "an integer column is CAST AS BIGINT");
+    assert!(code.contains("AS BIGINT"));
+    assert!(!code.contains("JSON_EXTRACT"), "a label is read with ->>");
+}
+
 #[test]
 fn the_views_read_what_the_tables_hold() {
     let store = store();

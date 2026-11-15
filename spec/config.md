@@ -118,8 +118,10 @@ as another user; DuckDB's SQLite reader, or `sqlite3 -readonly`). It reads the v
 the tables: the tables are internal and change between versions. A `_v1` view only gains columns,
 at the end; one that would lose, rename or retype a column becomes a `_v2` view beside it, and the
 `_v1` stays. The views are made again at every start. Every column is `INT` (an integer; times are
-milliseconds since 1970 UTC) or `TEXT`, as SQLite reports them, so DuckDB types them without
-`sqlite_all_varchar`. A null is a value the item doesn't have.
+milliseconds since 1970 UTC) or `TEXT`, as SQLite reports them. DuckDB doesn't ask SQLite for a
+view's rows: it runs the view's SQL itself, so the views are written to mean the same in both, and
+there an `INT` column is a `BIGINT` and a `TEXT` one a `VARCHAR`. A null is a value the item
+doesn't have.
 
 `items_v1`, one row per item:
 
