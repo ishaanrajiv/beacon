@@ -62,7 +62,7 @@ answer has the error body above and closes the connection.
 
 | Status | When |
 |---|---|
-| `400` | Not HTTP/1.1 Beacon can read: a bad request line, a method that is not 1 to 16 capital letters, a header line without a colon or with a space in its name, headers that are not UTF-8, a `Content-Length` that is not digits, two different `Content-Length`s, both a length and `Transfer-Encoding`, or a chunk whose size line is not hexadecimal, is over 1 KB, or does not match its data. |
+| `400` | Not HTTP/1.1 Beacon can read: a bad request line, a method that is not 1 to 16 capital letters, a header line without a colon, a header name that is not an RFC 9110 token (letters, digits and a few marks such as `-`, `_` and `.`; no spaces, brackets or letters outside ASCII), a control character other than a tab (a bare CR or LF, NUL, DEL) in the request line, a header, a chunk's size line or a trailer, headers that are not UTF-8, a `Content-Length` that is not digits, two different `Content-Length`s, both a length and `Transfer-Encoding`, or a chunk whose size line is not hexadecimal, is over 1 KB, or does not match its data. |
 | `408` | The headers took more than 10 seconds to arrive, or the body more than 30. |
 | `413` | The body is over `limits.body_bytes`, as in the table above. |
 | `431` | The request line and headers are over 16 KB, or a chunked body's trailers are. |
@@ -74,6 +74,7 @@ answer has the error body above and closes the connection.
   a `100 Continue`; a caller still taking it then is hung up on.
 - `HEAD` is answered as `GET` without the body. `Expect: 100-continue` is answered before the body
   is read.
+- A header's value loses the spaces and tabs around it, and no other characters.
 - Every answer carries `Cache-Control: no-cache`; a `304` has no body and no `Content-Length`.
 - Requests are not queued for a worker: each connection's thread answers its own requests, and
   the store takes them one at a time.
