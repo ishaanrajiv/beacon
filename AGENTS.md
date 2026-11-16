@@ -5,6 +5,26 @@ delivers them to your own iPhone app through Apple's push service. It is maintai
 agents, so its rules are checks that fail with a message saying what to do. Run `scripts/check`
 before every commit.
 
+## This repository is public
+
+Anyone can read everything here: the code, every commit in the history, commit messages, branch
+names, pull requests and their comments. Write as if a stranger reads it, because one will.
+
+- **Never commit a secret**, even for a moment: keys, tokens, passwords, certificates, `.env`
+  files, Apple signing keys (`.p8`) or real team ids, bundle ids and device tokens. Removing it
+  in a later commit does not help; the history keeps it. If one is pushed, say so, and treat it
+  as leaked: it has to be revoked and replaced, not just deleted.
+- **Nothing about the machine Beacon runs on, or its owner.** No real hostnames, IP addresses,
+  domains, usernames, home or data paths (`/home/…`, `/srv/…`), names of other services or
+  projects, or people. Use `example.com`, loopback addresses and made-up names instead.
+- **No real data.** No databases, logs, journal lines, exports or screenshots from a running
+  Beacon. Tests and examples use data made up for them.
+- **The deployment lives elsewhere.** Config, secrets and anything specific to where Beacon is run
+  belong in that deployment's own (private) repository, not here. If a task needs something
+  private to be written down, stop and ask rather than putting it here.
+- **CI's secret scan is a backstop, not a check you can rely on.** It looks for things shaped like
+  keys; it can't tell a real hostname or a personal detail from an example.
+
 ## Layout
 
 | Path | What it is |
@@ -43,9 +63,9 @@ before every commit.
   argument, so every case is tested with a fake clock.
 - **Behaviour has a test.** A bug fix starts with the test that fails. Every validation message
   has a test that triggers it.
-- **Nothing private in the repository.** Examples use made-up services (`backup`, `assistant`,
-  `ship`), `example.com` and loopback addresses. No real hostnames, addresses, domains, product
-  names or people, in code, tests, specs or commit messages.
+- **Nothing private in the repository.** It is public: see "This repository is public" above.
+  Examples use made-up services (`backup`, `assistant`, `ship`),
+  `example.com` and loopback addresses.
 - **The transport is shared.** `crates/server/src/httpd.rs` (reading requests under limits and
   timeouts, the connection cap, the slots, writing answers) is kept byte for byte the same as
   Trail's copy, and a check outside both repositories fails when they differ. Change it in both
