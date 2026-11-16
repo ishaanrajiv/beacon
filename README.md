@@ -1,6 +1,6 @@
 # Beacon
 
-One small server that decides which notifications deserve your attention, and delivers them to
+A self-hosted notification server that decides which events deserve a push, and sends them to
 your own iPhone app through Apple's push service. It is for one person running their own
 services, where most events are worth recording and few are worth a sound.
 
